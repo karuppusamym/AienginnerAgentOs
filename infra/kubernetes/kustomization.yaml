@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: datapilot
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - api.yaml
+  - worker.yaml
+  - web.yaml
+  - disruption-budgets.yaml
+images:
+  - name: datapilot-api
+    newName: registry.example.com/datapilot-api
+    newTag: latest
+  - name: datapilot-web
+    newName: registry.example.com/datapilot-web
+    newTag: latest

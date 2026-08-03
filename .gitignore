@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+data/
+apps/web/.next/
+apps/web/dist/
+apps/web/node_modules/
+apps/web/.wrangler/
+apps/web/.open-next/
+tmp/

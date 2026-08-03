@@ -1,0 +1,15 @@
+databases:
+  - database_name: DataPilot PostgreSQL
+    sqlalchemy_uri: postgresql+psycopg2://datapilot:datapilot-local@postgres:5432/datapilot
+    expose_in_sqllab: true
+    allow_run_async: false
+    allow_file_upload: false
+    extra: |
+      {
+        "metadata_params": {},
+        "engine_params": {
+          "connect_args": {
+            "sslmode": "disable"
+          }
+        }
+      }

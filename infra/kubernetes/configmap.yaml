@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datapilot-config
+data:
+  APP_ENV: production
+  CORS_ORIGINS: https://datapilot.example.com
+  UPLOAD_DIR: /data/uploads
+  REDIS_URL: redis://redis.example.internal:6379/0
+  QDRANT_URL: http://qdrant.example.internal:6333
+  TEMPORAL_ADDRESS: temporal.example.internal:7233
+  TOOL_HTTP_ALLOWLIST: integrations.example.internal
+  OTEL_ENABLED: "true"
+  OTEL_SERVICE_NAME: datapilot-api
+  OTEL_EXPORTER_OTLP_ENDPOINT: https://otel-collector.example.internal/v1/traces

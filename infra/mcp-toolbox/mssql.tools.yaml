@@ -1,0 +1,22 @@
+kind: source
+name: retail-sqlserver
+type: mssql
+host: ${MSSQL_HOST}
+port: ${MSSQL_PORT}
+database: ${MSSQL_DATABASE}
+user: ${MSSQL_USER}
+password: ${MSSQL_PASSWORD}
+---
+kind: tool
+name: get_account
+type: mssql-sql
+source: retail-sqlserver
+description: Return one account by its numeric account identifier for customer servicing.
+statement: |
+  SELECT TOP 1 account_id, customer_id, account_type, status
+  FROM accounts
+  WHERE account_id = @account_id
+parameters:
+  - name: account_id
+    type: integer
+    description: Numeric account identifier

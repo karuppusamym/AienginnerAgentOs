@@ -1,0 +1,19 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "datapilot-external-token",
+      "description": "DataPilot external-client bearer token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "datapilot-governed-data": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${input:datapilot-external-token}"
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datapilot-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: datapilot-api}
+  template:
+    metadata:
+      labels: {app: datapilot-api}
+    spec:
+      containers:
+        - name: api
+          image: datapilot-api
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: datapilot-config}
+            - secretRef: {name: datapilot-runtime}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: 8000}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: 8000}
+            initialDelaySeconds: 20
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datapilot-api
+spec:
+  selector: {app: datapilot-api}
+  ports: [{port: 8000, targetPort: 8000}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: datapilot-api
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: datapilot-api}
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}

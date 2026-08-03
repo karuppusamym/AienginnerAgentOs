@@ -1,0 +1,35 @@
+{
+  "name": "datapilot-web",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "npm run build && node --test tests/app-source.test.mjs"
+  },
+  "dependencies": {
+    "@superset-ui/embedded-sdk": "^0.4.0",
+    "lucide-react": "^1.28.0",
+    "next": "^16.2.12",
+    "react": "19.2.6",
+    "react-dom": "19.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "5.9.3"
+  },
+  "type": "module",
+  "optionalDependencies": {
+    "lightningcss-win32-x64-msvc": "^1.33.0"
+  },
+  "overrides": {
+    "postcss": "8.5.25",
+    "sharp": "0.35.3"
+  }
+}

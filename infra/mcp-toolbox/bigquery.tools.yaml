@@ -1,0 +1,23 @@
+kind: source
+name: retail-bigquery
+type: bigquery
+project: ${BIGQUERY_PROJECT}
+writeMode: blocked
+allowedDatasets:
+  - ${BIGQUERY_DATASET}
+maxQueryResultRows: 200
+---
+kind: tool
+name: get_account
+type: bigquery-sql
+source: retail-bigquery
+description: Return one account by its numeric account identifier for customer servicing.
+statement: |
+  SELECT account_id, customer_id, account_type, status
+  FROM `${BIGQUERY_PROJECT}.${BIGQUERY_DATASET}.accounts`
+  WHERE account_id = @account_id
+  LIMIT 1
+parameters:
+  - name: account_id
+    type: integer
+    description: Numeric account identifier

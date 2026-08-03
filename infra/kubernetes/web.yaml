@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datapilot-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: datapilot-web}
+  template:
+    metadata:
+      labels: {app: datapilot-web}
+    spec:
+      containers:
+        - name: web
+          image: datapilot-web
+          ports: [{containerPort: 3000}]
+          env:
+            - name: NEXT_PUBLIC_API_URL
+              value: https://api.datapilot.example.com
+          readinessProbe:
+            httpGet: {path: /, port: 3000}
+          livenessProbe:
+            httpGet: {path: /, port: 3000}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: datapilot-web
+spec:
+  selector: {app: datapilot-web}
+  ports: [{port: 80, targetPort: 3000}]

@@ -1,0 +1,23 @@
+kind: source
+name: retail-oracle
+type: oracle
+host: ${ORACLE_HOST}
+port: ${ORACLE_PORT}
+serviceName: ${ORACLE_SERVICE_NAME}
+user: ${ORACLE_USER}
+password: ${ORACLE_PASSWORD}
+---
+kind: tool
+name: get_account
+type: oracle-sql
+source: retail-oracle
+description: Return one account by its numeric account identifier for customer servicing.
+statement: |
+  SELECT account_id, customer_id, account_type, status
+  FROM accounts
+  WHERE account_id = :1
+  FETCH FIRST 1 ROW ONLY
+parameters:
+  - name: account_id
+    type: integer
+    description: Numeric account identifier

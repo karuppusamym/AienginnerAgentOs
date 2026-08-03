@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datapilot-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: datapilot-worker}
+  template:
+    metadata:
+      labels: {app: datapilot-worker}
+    spec:
+      containers:
+        - name: worker
+          image: datapilot-api
+          command: [python, -m, app.worker]
+          envFrom:
+            - configMapRef: {name: datapilot-config}
+            - secretRef: {name: datapilot-runtime}
+          resources:
+            requests: {cpu: 300m, memory: 768Mi}
+            limits: {cpu: "2", memory: 3Gi}
