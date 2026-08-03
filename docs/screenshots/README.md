@@ -10,3 +10,4 @@ These screenshots capture representative DataPilot UI pages from the local insta
 - toolregistry.png
 - agents.png
 - admin.png
+- current-view.png
