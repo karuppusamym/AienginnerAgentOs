@@ -83,6 +83,14 @@ The analytics profile also runs an idempotent bootstrap service that creates the
 `core.accounts` dataset, account count and distribution charts, a recent-account
 table, the dashboard layout, and the allowed DataPilot embed domains.
 
+Generated SQL is not merely copied into the editor: save a local PostgreSQL SQL
+artifact, or save a notebook containing a SQL cell, then choose **Publish to
+Superset**. DataPilot validates the immutable saved version locally, creates an
+approval request, and only after approval registers that exact query as a
+Superset virtual dataset and updates the embedded dashboard. External-connector
+SQL remains executable only through its governed connector/query-tool path; it
+is not silently published through the local Superset connection.
+
 ## Run without Docker
 
 API:

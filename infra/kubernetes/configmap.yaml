@@ -7,6 +7,10 @@ data:
   CORS_ORIGINS: https://datapilot.example.com
   UPLOAD_DIR: /data/uploads
   REDIS_URL: redis://redis.example.internal:6379/0
+  EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE: "60"
+  CONNECTOR_MAX_CONCURRENT_CONNECTIONS: "8"
+  DB_POOL_SIZE: "5"
+  DB_POOL_MAX_OVERFLOW: "3"
   QDRANT_URL: http://qdrant.example.internal:6333
   TEMPORAL_ADDRESS: temporal.example.internal:7233
   TOOL_HTTP_ALLOWLIST: integrations.example.internal

@@ -76,6 +76,34 @@ def ensure_project_columns(engine: Engine) -> None:
             ):
                 if column_name not in query_tool_columns:
                     connection.execute(text(f"ALTER TABLE query_tools ADD COLUMN {column_name} {definition}"))
+        if "data_assets" in existing_tables:
+            asset_columns = {column["name"] for column in inspector.get_columns("data_assets")}
+            for column_name, definition in (
+                ("owner", "VARCHAR(160)"),
+                ("sensitivity", "VARCHAR(32) NOT NULL DEFAULT 'unclassified'"),
+                ("freshness_sla_hours", "INTEGER"),
+                ("metadata_status", "VARCHAR(32) NOT NULL DEFAULT 'scanned'"),
+            ):
+                if column_name not in asset_columns:
+                    connection.execute(text(f"ALTER TABLE data_assets ADD COLUMN {column_name} {definition}"))
+        if "semantic_metrics" in existing_tables:
+            metric_columns = {column["name"] for column in inspector.get_columns("semantic_metrics")}
+            if "asset_id" not in metric_columns:
+                connection.execute(text("ALTER TABLE semantic_metrics ADD COLUMN asset_id VARCHAR(36)"))
+        if "learning_suggestions" in existing_tables:
+            suggestion_columns = {column["name"] for column in inspector.get_columns("learning_suggestions")}
+            if "occurrence_count" not in suggestion_columns:
+                connection.execute(text("ALTER TABLE learning_suggestions ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1"))
+            if "severity" not in suggestion_columns:
+                connection.execute(text("ALTER TABLE learning_suggestions ADD COLUMN severity VARCHAR(16) NOT NULL DEFAULT 'normal'"))
+        if "agent_definitions" in existing_tables:
+            agent_columns = {column["name"] for column in inspector.get_columns("agent_definitions")}
+            if "query_tool_names" not in agent_columns:
+                connection.execute(text("ALTER TABLE agent_definitions ADD COLUMN query_tool_names JSON"))
+        if "agent_versions" in existing_tables:
+            agent_version_columns = {column["name"] for column in inspector.get_columns("agent_versions")}
+            if "query_tool_names" not in agent_version_columns:
+                connection.execute(text("ALTER TABLE agent_versions ADD COLUMN query_tool_names JSON"))
 
 
 def backfill_project_columns(engine: Engine, project_id: str) -> None:

@@ -1,0 +1,56 @@
+<mxfile host="app.diagrams.net" agent="datapilot-gen" version="24.0.0">
+  <diagram name="DataPilot Deployment Architecture" id="datapilot-deployment-architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+<mxCell id="ns" value="Namespace: datapilot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#999999;verticalAlign=top;fontSize=13;fontStyle=1;dashed=1;" vertex="1" parent="1"><mxGeometry x="20" y="20" width="1500" height="860" as="geometry"/></mxCell>
+<mxCell id="ingress" value="Ingress / OpenShift Route
+(TLS terminates here)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="620" y="60" width="260" height="60" as="geometry"/></mxCell>
+<mxCell id="web_svc" value="Service: datapilot-web
+(ClusterIP)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="300" y="160" width="220" height="50" as="geometry"/></mxCell>
+<mxCell id="api_svc" value="Service: datapilot-api
+(ClusterIP)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="620" y="160" width="220" height="50" as="geometry"/></mxCell>
+<mxCell id="web_deploy" value="Deployment: datapilot-web
+HPA 2-6 replicas · non-root · runAsNonRoot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="300" y="240" width="260" height="70" as="geometry"/></mxCell>
+<mxCell id="api_deploy" value="Deployment: datapilot-api
+HPA 2-8 replicas · non-root · readiness+liveness probes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="620" y="240" width="280" height="70" as="geometry"/></mxCell>
+<mxCell id="worker_deploy" value="Deployment: datapilot-worker
+HPA 2-10 replicas · PDB · liveness probe" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="960" y="240" width="280" height="70" as="geometry"/></mxCell>
+<mxCell id="pg_svc" value="StatefulSet/Managed: PostgreSQL
+control plane + staged data" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;boundedLbl=1;" vertex="1" parent="1"><mxGeometry x="300" y="380" width="260" height="65" as="geometry"/></mxCell>
+<mxCell id="redis_svc" value="Managed: Redis
+rate limiting + cache" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;boundedLbl=1;" vertex="1" parent="1"><mxGeometry x="600" y="380" width="220" height="65" as="geometry"/></mxCell>
+<mxCell id="qdrant_svc" value="Managed: Qdrant
+vector index" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;boundedLbl=1;" vertex="1" parent="1"><mxGeometry x="860" y="380" width="220" height="65" as="geometry"/></mxCell>
+<mxCell id="temporal_svc" value="Temporal service + UI
+(durable workflow engine)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="1120" y="380" width="240" height="65" as="geometry"/></mxCell>
+<mxCell id="superset_deploy" value="Deployment: superset + superset-bootstrap
+(optional, analytics profile)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1;arcSize=8;" vertex="1" parent="1"><mxGeometry x="620" y="500" width="300" height="65" as="geometry"/></mxCell>
+<mxCell id="secrets" value="Secret manager / mounted Secrets
+connector + provider credentials, never in image" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;align=left;verticalAlign=top;" vertex="1" parent="1"><mxGeometry x="300" y="620" width="320" height="65" as="geometry"/></mxCell>
+<mxCell id="netpol" value="NetworkPolicy — documented gap
+(not yet applied: every pod can reach every other pod)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;dashed=1;" vertex="1" parent="1"><mxGeometry x="660" y="620" width="340" height="65" as="geometry"/></mxCell>
+<mxCell id="otlp" value="OTLP collector / AgentGuard / webhook
+(sanitized telemetry fan-out)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;align=left;verticalAlign=top;" vertex="1" parent="1"><mxGeometry x="1050" y="620" width="320" height="65" as="geometry"/></mxCell>
+<mxCell id="pool_note" value="Pool sizing: (8 api + 10 worker) x 8 conns/process = 144
+vs Postgres default max_connections=100 — size before raising maxReplicas" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontSize=11;align=left;verticalAlign=top;" vertex="1" parent="1"><mxGeometry x="300" y="720" width="700" height="60" as="geometry"/></mxCell>
+<mxCell id="e300" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="ingress" target="web_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e301" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="ingress" target="api_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e302" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="web_svc" target="web_deploy"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e303" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_svc" target="api_deploy"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e304" value="internal API calls" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="web_deploy" target="api_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e305" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="pg_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e306" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="redis_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e307" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="qdrant_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e308" value="start workflow" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="temporal_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e309" value="dispatch activity" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="temporal_svc" target="worker_deploy"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e310" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="worker_deploy" target="pg_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e311" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="worker_deploy" target="qdrant_svc"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e312" value="guest token / embed" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="superset_deploy"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e313" value="env: / mounted refs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="secrets"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+<mxCell id="e314" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=11;endArrow=block;elbow=vertical;" edge="1" parent="1" source="api_deploy" target="otlp"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

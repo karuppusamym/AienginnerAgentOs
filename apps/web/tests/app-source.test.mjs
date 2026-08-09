@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
 const root = new URL("../", import.meta.url);
@@ -12,7 +12,15 @@ test("ships DataPilot product metadata", async () => {
 });
 
 test("includes core governed product workflows", async () => {
-  const page = await readFile(new URL("app/page.tsx", root), "utf8");
+  // Product views are intentionally split into domain components.  Inspect the
+  // rendered application source as a whole instead of coupling this smoke test
+  // to the former single-file page implementation.
+  const components = new URL("app/components/", root);
+  const componentFiles = (await readdir(components)).filter((name) => name.endsWith(".tsx"));
+  const page = [
+    await readFile(new URL("app/page.tsx", root), "utf8"),
+    ...await Promise.all(componentFiles.map((name) => readFile(new URL(`app/components/${name}`, root), "utf8"))),
+  ].join("\n");
   for (const workflow of [
     "Local file ingestion",
     "Grounded SQL workspace",

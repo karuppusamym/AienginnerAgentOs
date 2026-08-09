@@ -1,0 +1,37 @@
+kind: source
+name: payment-sqlserver
+type: mssql
+host: ${MSSQL_HOST}
+port: ${MSSQL_PORT}
+database: ${MSSQL_DATABASE}
+user: ${MSSQL_USER}
+password: ${MSSQL_PASSWORD}
+---
+kind: tool
+name: payments.by_status
+type: mssql-sql
+source: payment-sqlserver
+description: Return bounded payment records for a selected payment status.
+statement: |
+  SELECT TOP 50 payment_id, order_id, payment_date, method, amount, status
+  FROM demo.payment_summary
+  WHERE status = @status
+  ORDER BY payment_date DESC, payment_id DESC
+parameters:
+  - name: status
+    type: string
+    description: Payment status such as settled or pending
+---
+kind: tool
+name: payments.total_since
+type: mssql-sql
+source: payment-sqlserver
+description: Return the total payment amount since a supplied date.
+statement: |
+  SELECT SUM(amount) AS total_amount, COUNT(*) AS payment_count
+  FROM demo.payment_summary
+  WHERE payment_date >= @minimum_date
+parameters:
+  - name: minimum_date
+    type: string
+    description: Inclusive ISO date, for example 2026-03-01

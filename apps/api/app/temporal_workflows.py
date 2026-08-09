@@ -27,6 +27,17 @@ class ScheduledIngestionWorkflow:
         )
 
 
+@workflow.defn(name="datapilot-external-extraction")
+class ExternalExtractionWorkflow:
+    @workflow.run
+    async def run(self, extraction_id: str, actor_id: str | None = None) -> dict:
+        return await workflow.execute_activity(
+            "execute_external_extraction",
+            args=[extraction_id, actor_id],
+            start_to_close_timeout=timedelta(minutes=5),
+        )
+
+
 @workflow.defn(name="datapilot-metadata-scan")
 class MetadataScanWorkflow:
     @workflow.run

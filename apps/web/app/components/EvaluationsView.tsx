@@ -1,0 +1,122 @@
+import {
+  Activity,
+  AlertCircle,
+  Archive,
+  Bot,
+  BookOpen,
+  Boxes,
+  Braces,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleGauge,
+  Clock3,
+  CalendarClock,
+  Code2,
+  Database,
+  FileSpreadsheet,
+  FileUp,
+  FlaskConical,
+  Gauge,
+  GitBranch,
+  GitCompare,
+  KeyRound,
+  Layers3,
+  LayoutDashboard,
+  LogOut,
+  Menu,
+  MessageSquare,
+  Network,
+  PanelLeftClose,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Send,
+  Server,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  UserPlus,
+  Users,
+  X,
+  XCircle,
+} from "lucide-react";
+import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, ApiError, SessionUser } from "../lib/api";
+import type {
+  NavKey,
+  Overview,
+  Recommendation,
+  SecurityCategoryKey,
+  SecurityOverview,
+  Dataset,
+  Connector,
+  ModelProvider,
+  Project,
+  AgentVersion,
+  AgentDefinition,
+  ToolVersion,
+  ToolDefinition,
+  SemanticMetric,
+  SemanticJoinPolicy,
+  PipelineDefinition,
+  Incident,
+  Job,
+  Approval,
+  IngestedFile,
+  MappingColumn,
+  LoadMode,
+  IngestionMapping,
+  QualityRun,
+  QualityRule,
+  SQLResult,
+  SQLExecutionResult,
+  SearchResult,
+  Artifact,
+  ArtifactVersion,
+  IngestionSchedule,
+  MappingOption,
+  ArtifactComment,
+  EvaluationSet,
+  NotebookCellData,
+  Notebook,
+  Conversation,
+  ConversationMessage,
+  ExternalClient,
+  QueryTool,
+  QueryToolDraft,
+  RelationOption,
+  QueryToolUsage,
+  QueryToolRegistrySummary,
+  PromptArtifact,
+  RetentionPolicy,
+  SchemaDrift,
+  ModelUsage,
+} from "../types";
+import {
+  navItems,
+  TOUR_STORAGE_KEY,
+  defaultTourSteps,
+  connectorLabels,
+  connectorDialectForType,
+  statusTone,
+} from "../lib/constants";
+import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+
+
+export function EvaluationsView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [sets, setSets] = useState<EvaluationSet[]>([]);
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<EvaluationSet | null>(null);
+  const [running, setRunning] = useState<string | null>(null);
+  const [form, setForm] = useState({ name: "SQL grounding baseline", description: "Regression checks for governed SQL generation", case_name: "Account growth", question: "Show monthly deposit account growth", case_type: "sql_generation" as "sql_generation" | "agent_run", dialect: "postgres", expected_tables: "core.accounts", required_tokens: "select, limit", expected_agents: "Planner, Metadata, Policy", expected_tools: "catalog.search", expects_approval: "auto" });
+  const load = useCallback(() => api<EvaluationSet[]>("/evaluations").then(setSets), []);
+  useEffect(() => { load(); }, [load]);
+  function openForm(item?: EvaluationSet) { const first = item?.cases[0]; setEditing(item || null); setForm(item ? { name: item.name, description: item.description || "", case_name: first?.name || "Case", question: first?.question || "", case_type: first?.case_type || "sql_generation", dialect: first?.dialect || "postgres", expected_tables: first?.expected_tables.join(", ") || "", required_tokens: first?.required_sql_tokens.join(", ") || "", expected_agents: first?.expected_agents?.join(", ") || "Planner, Metadata, Policy", expected_tools: first?.expected_tools?.join(", ") || "", expects_approval: first?.expects_approval === true ? "yes" : first?.expects_approval === false ? "no" : "auto" } : { name: "SQL grounding baseline", description: "Regression checks for governed SQL generation", case_name: "Account growth", question: "Show monthly deposit account growth", case_type: "sql_generation", dialect: "postgres", expected_tables: "core.accounts", required_tokens: "select, limit", expected_agents: "Planner, Metadata, Policy", expected_tools: "catalog.search", expects_approval: "auto" }); setShowForm(true); }
+  async function create(event: FormEvent) { event.preventDefault(); try { await api(editing ? `/evaluations/${editing.id}` : "/evaluations", { method: editing ? "PUT" : "POST", body: JSON.stringify({ name: form.name, description: form.description, cases: [{ name: form.case_name, question: form.question, case_type: form.case_type, dialect: form.dialect, expected_tables: form.expected_tables.split(",").map((item) => item.trim()).filter(Boolean), required_sql_tokens: form.required_tokens.split(",").map((item) => item.trim()).filter(Boolean), expected_agents: form.expected_agents.split(",").map((item) => item.trim()).filter(Boolean), expected_tools: form.expected_tools.split(",").map((item) => item.trim()).filter(Boolean), expects_approval: form.expects_approval === "auto" ? null : form.expects_approval === "yes" }] }) }); setShowForm(false); setEditing(null); await load(); notify(editing ? "Evaluation version updated" : "Evaluation set created"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not save evaluation", "error"); } }
+  async function run(id: string) { setRunning(id); try { const result = await api<{ score: number; status: string }>(`/evaluations/${id}/run`, { method: "POST", body: JSON.stringify({}) }); await load(); notify(`Evaluation ${result.status}: ${result.score}%`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Evaluation failed", "error"); } finally { setRunning(null); } }
+  async function remove(item: EvaluationSet) { if (!window.confirm(`Delete evaluation "${item.name}" and all replay results?`)) return; try { await api(`/evaluations/${item.id}`, { method: "DELETE" }); await load(); notify("Evaluation deleted"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Evaluation could not be deleted", "error"); } }
+  return <div className="view-stack"><div className="view-header"><div><h2>Evaluation and replay</h2><p>Measure SQL grounding against expected sources and required query traits.</p></div><button className="primary-button" onClick={() => openForm()}><Plus size={17} />New evaluation</button></div><section className="surface evaluation-list"><div className="table-header evaluation-grid"><span>Evaluation</span><span>Cases</span><span>Latest score</span><span>Status</span><span /></div>{sets.map((item) => <div className="data-row evaluation-grid" key={item.id}><span><strong>{item.name}</strong><small>{item.description}</small></span><span>{item.cases.length}</span><strong>{item.latest_run ? `${item.latest_run.score}%` : "-"}</strong><StatusPill value={item.latest_run?.status || "not_run"} /><span className="row-actions"><button className="icon-button" title="Edit evaluation" onClick={() => openForm(item)}><Settings size={16} /></button><button className="secondary-button" onClick={() => run(item.id)} disabled={running === item.id}>{running === item.id ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Replay</button><button className="icon-button" title="Delete evaluation" onClick={() => remove(item)}><XCircle size={16} /></button></span></div>)}</section>{showForm && <Modal title={editing ? "Edit evaluation" : "Create evaluation"} onClose={() => { setShowForm(false); setEditing(null); }}><form className="modal-form" onSubmit={create}><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Description<input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label><label>Case name<input value={form.case_name} onChange={(event) => setForm({ ...form, case_name: event.target.value })} required /></label><label>Question<textarea value={form.question} onChange={(event) => setForm({ ...form, question: event.target.value })} rows={3} required /></label><div className="form-grid"><label>Dialect<select value={form.dialect} onChange={(event) => setForm({ ...form, dialect: event.target.value })}><option value="postgres">PostgreSQL</option><option value="sqlserver">SQL Server</option><option value="oracle">Oracle</option><option value="teradata">Teradata</option><option value="bigquery">BigQuery</option></select></label><label>Expected tables<input value={form.expected_tables} onChange={(event) => setForm({ ...form, expected_tables: event.target.value })} /></label></div><label>Required SQL tokens<input value={form.required_tokens} onChange={(event) => setForm({ ...form, required_tokens: event.target.value })} /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => { setShowForm(false); setEditing(null); }}>Cancel</button><button className="primary-button"><FlaskConical size={17} />{editing ? "Save" : "Create"}</button></div></form></Modal>}</div>;
+}

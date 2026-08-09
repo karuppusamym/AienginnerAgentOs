@@ -46,6 +46,28 @@ async def start_scheduled_ingestion_workflow(
     return workflow_id
 
 
+async def start_external_extraction_workflow(
+    extraction_id: str,
+    actor_id: str | None = None,
+    run_key: str | None = None,
+) -> str | None:
+    address = os.getenv("TEMPORAL_ADDRESS", "").strip()
+    if not address:
+        return None
+    from temporalio.client import Client
+
+    client = await Client.connect(address)
+    suffix = run_key or __import__("uuid").uuid4().hex
+    workflow_id = f"datapilot-extraction-{extraction_id}-{suffix}"
+    await client.start_workflow(
+        "datapilot-external-extraction",
+        args=[extraction_id, actor_id],
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    return workflow_id
+
+
 async def start_metadata_scan_workflow(connector_id: str, job_id: str, actor_id: str) -> str | None:
     address = os.getenv("TEMPORAL_ADDRESS", "").strip()
     if not address:

@@ -31,6 +31,8 @@ from app.governance import record_governance_event, record_model_generation
 from app.main import app, audit
 from app.model_runtime import test_provider as invoke_provider_test
 from app.models import SupersetProjectDashboard
+from app.pii import annotate_columns, protect_rows
+from app.staging import execute_parameterized_read_only
 from app.superset_client import _build_rls_rules
 
 
@@ -184,6 +186,137 @@ class DataPilotApiTests(unittest.TestCase):
         payload = response.json()
         self.assertIn("/datapilot/editor-login?token=", payload["url"])
         self.assertEqual(payload["expires_in"], 30)
+
+    def test_saved_sql_and_notebook_can_be_approved_for_superset_publication(self) -> None:
+        artifact = self.client.post(
+            "/artifacts",
+            headers=self.headers,
+            json={
+                "name": "Approved query",
+                "artifact_type": "sql",
+                "content": "SELECT 1 AS value",
+                "metadata": {"dialect": "postgres", "connector_id": None},
+            },
+        )
+        self.assertEqual(artifact.status_code, 201)
+        requested = self.client.post(
+            "/analytics/publish-sql",
+            headers=self.headers,
+            json={"artifact_id": artifact.json()["id"], "name": "One row analytics"},
+        )
+        self.assertEqual(requested.status_code, 202)
+        approval_id = requested.json()["approval_id"]
+        artifact_id = artifact.json()["id"]
+        pending = self.client.get("/approvals", headers=self.headers).json()
+        approval = next(item for item in pending if item["id"] == approval_id)
+        self.assertEqual(approval["action_type"], "publish_superset_query")
+
+        # Before approval, the artifact has no dedicated analytics dashboard yet.
+        not_yet = self.client.get(f"/analytics/queries/{artifact_id}", headers=self.headers)
+        self.assertEqual(not_yet.status_code, 200)
+        self.assertFalse(not_yet.json()["published"])
+
+        dedicated_slug = f"datapilot-query-{artifact_id}"[:140]
+        with patch(
+            "app.main.get_embed_configuration",
+            return_value={
+                "embedded_id": "query-embed-1", "superset_domain": "http://localhost:8088",
+                "dashboard_id": 91, "dashboard_slug": dedicated_slug,
+                "dashboard_title": "One row analytics", "dataset_relation": "staging.dp_query",
+                "superset_dataset_id": 92, "chart_ids": [93, 94], "chart_count": 2,
+                "access_mode": "dashboard_scope", "rls_column": None,
+            },
+        ) as mocked:
+            decision = self.client.post(
+                f"/approvals/{approval_id}/decision", headers=self.headers,
+                json={"decision": "approved", "note": "Reviewed local query"},
+            )
+        self.assertEqual(decision.status_code, 200)
+        self.assertEqual(decision.json()["job_status"], "SUCCEEDED")
+        self.assertEqual(mocked.call_count, 1)
+        published_dataset = mocked.call_args.args[2]
+        self.assertEqual(published_dataset["sql"], "SELECT 1 AS value")
+        self.assertEqual(published_dataset["asset_type"], "virtual_query")
+        # The dashboard identity passed to Superset must be derived from the
+        # source artifact, not the project alone — otherwise every published
+        # query collides on the same slug as the project's primary dashboard
+        # and silently overwrites it. This was a real bug: both previously
+        # resolved to `datapilot-project-{slug}`.
+        dashboard_key = mocked.call_args.args[3]
+        self.assertEqual(dashboard_key, f"query-{artifact_id}")
+        self.assertNotIn("datapilot-project-", dashboard_key)
+
+        published = self.client.get(f"/analytics/queries/{artifact_id}", headers=self.headers)
+        self.assertEqual(published.status_code, 200)
+        published_body = published.json()
+        self.assertTrue(published_body["published"])
+        self.assertEqual(published_body["dashboard_title"], "One row analytics")
+
+        with patch("app.routers.analytics.create_guest_token", return_value={"token": "guest-token-abc"}) as guest_mocked, \
+             patch("app.main.get_embed_configuration", return_value={
+                 "embedded_id": "query-embed-1", "superset_domain": "http://localhost:8088",
+                 "dashboard_id": 91, "dashboard_slug": dedicated_slug, "dashboard_title": "One row analytics",
+                 "dataset_relation": "staging.dp_query", "superset_dataset_id": 92, "chart_ids": [93, 94],
+                 "chart_count": 2, "access_mode": "dashboard_scope", "rls_column": None,
+             }):
+            token_response = self.client.post(f"/analytics/queries/{artifact_id}/guest-token", headers=self.headers)
+        self.assertEqual(token_response.status_code, 200)
+        self.assertEqual(token_response.json()["token"], "guest-token-abc")
+        self.assertEqual(guest_mocked.call_args.args[-1], f"query-{artifact_id}")
+
+    def test_high_risk_tool_cannot_be_registered_or_edited_without_approval_gate(self) -> None:
+        created = self.client.post(
+            "/tools",
+            headers=self.headers,
+            json={
+                "name": "critical.integration.test",
+                "category": "integration",
+                "description": "Test tool asserting the risk/approval invariant",
+                "risk_level": "critical",
+                "enabled": True,
+                "requires_approval": False,
+                "implementation_type": "http",
+                "endpoint": "https://internal.example.com/tool",
+                "http_method": "POST",
+                "parameter_schema": {"type": "object", "properties": {}},
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        # requires_approval must be forced True server-side for a critical tool,
+        # regardless of what the caller submitted — previously these two fields
+        # were independent and a critical tool could run with zero approval.
+        self.assertTrue(created.json()["requires_approval"])
+
+        tool_id = created.json()["id"]
+        downgraded = self.client.put(
+            f"/tools/{tool_id}",
+            headers=self.headers,
+            json={
+                "name": "critical.integration.test",
+                "category": "integration",
+                "description": "Attempted downgrade",
+                "risk_level": "critical",
+                "enabled": True,
+                "requires_approval": False,
+            },
+        )
+        self.assertEqual(downgraded.status_code, 200)
+        self.assertTrue(downgraded.json()["requires_approval"])
+
+    def test_agent_run_approval_evidence_reports_a_real_catalog_count(self) -> None:
+        response = self.client.post(
+            "/agents/runs",
+            headers=self.headers,
+            json={"objective": "please delete the stale rows", "autonomy_level": 2},
+        )
+        self.assertEqual(response.status_code, 201)
+        job_id = response.json()["job_id"]
+        job = self.client.get(f"/jobs/{job_id}", headers=self.headers).json()
+        catalog_evidence = next(item for item in job["evidence"] if item["type"] == "catalog")
+        actual_catalog_size = self.client.get("/datasets", headers=self.headers).json()
+        # The label must not be the old hardcoded "3 assets considered" text;
+        # it should reflect a real, computed count of the project catalog.
+        self.assertIn(f"{len(actual_catalog_size)} assets in project catalog", catalog_evidence["label"])
 
     def test_connector_secret_json_is_resolved_from_environment(self) -> None:
         with patch.dict(
@@ -341,6 +474,293 @@ class DataPilotApiTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201)
         self.assertEqual(created.json()["tags"], ["accounts", "customer-service"])
+
+    def test_agent_can_be_bound_to_a_published_query_tool_and_executes_it(self) -> None:
+        from app.database import SessionLocal
+        from app.models import Job
+        from app.temporal_activities import _execute_bound_tools
+
+        query_tool = self.client.post(
+            "/query-tools",
+            headers=self.headers,
+            json={
+                "name": "diagnostics.one_row",
+                "description": "Return a constant row for orchestration smoke tests.",
+                "purpose": "Verify agent-bound SQL query tools execute end to end.",
+                "data_source": "DataPilot local staging",
+                "line_of_business": "Platform",
+                "owner": "Platform Engineering",
+                "tags": ["diagnostics"],
+                "sql_template": "SELECT 1 AS n",
+                "parameter_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "allowed_relations": [],
+            },
+        )
+        self.assertEqual(query_tool.status_code, 201, query_tool.text)
+        tool_id = query_tool.json()["id"]
+        published = self.client.post(f"/query-tools/{tool_id}/publish", headers=self.headers)
+        self.assertEqual(published.status_code, 200)
+
+        rejected = self.client.post(
+            "/agents",
+            headers=self.headers,
+            json={
+                "name": "SQL Tool Runner Rejected",
+                "purpose": "x",
+                "instructions": "x",
+                "tool_names": [],
+                "query_tool_names": ["does.not.exist"],
+            },
+        )
+        self.assertEqual(rejected.status_code, 400)
+
+        agent = self.client.post(
+            "/agents",
+            headers=self.headers,
+            json={
+                "name": "SQL Tool Runner",
+                "purpose": "Executes bound governed SQL query tools.",
+                "instructions": "Invoke the bound query tool and report the row.",
+                "tool_names": [],
+                "query_tool_names": ["diagnostics.one_row"],
+            },
+        )
+        self.assertEqual(agent.status_code, 201, agent.text)
+        self.assertEqual(agent.json()["query_tool_names"], ["diagnostics.one_row"])
+
+        fetched = self.client.get(f"/agents/{agent.json()['id']}", headers=self.headers)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual([tool["name"] for tool in fetched.json()["query_tools"]], ["diagnostics.one_row"])
+
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        me = self.client.get("/auth/me", headers=self.headers).json()
+        with SessionLocal() as db:
+            job = Job(
+                project_id=current_project["id"],
+                title="Bound query tool smoke test",
+                job_type="agent_run",
+                status="RUNNING",
+                progress=10,
+                plan=[],
+                evidence=[],
+                outputs=[],
+                created_by=me["id"],
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            evidence, logs, outputs = _execute_bound_tools(
+                db, job, [{"agent": "SQL Tool Runner", "action": "run"}], "objective"
+            )
+
+        self.assertTrue(any(item["type"] == "query_tool" for item in evidence), evidence)
+        self.assertTrue(any(item["type"] == "query_tool_result" for item in outputs), outputs)
+
+        # Retire this smoke-test tool so it doesn't skew registry-summary counts
+        # asserted by other tests sharing this class's database/session.
+        retired = self.client.post(f"/query-tools/{tool_id}/retire", headers=self.headers)
+        self.assertEqual(retired.status_code, 200)
+
+    def test_newly_wired_builtin_tool_handlers_execute_for_real(self) -> None:
+        """The five tools seed.py names on the SQL Analyst/Pipeline/Quality
+        agents (sql.generate, file.profile, quality.run, pipeline.stage,
+        schedule.run) used to have no ToolVersion/handler at all -- an agent
+        bound to them could never actually invoke them. This exercises each
+        one for real through the same registry path an agent uses."""
+        tools_by_name = {tool["name"]: tool["id"] for tool in self.client.get("/tools", headers=self.headers).json()}
+        for name in ("sql.generate", "file.profile", "quality.run", "pipeline.stage", "schedule.run"):
+            self.assertIn(name, tools_by_name, f"{name} should be seeded with a working version")
+
+        generated = self.client.post(
+            f"/tools/{tools_by_name['sql.generate']}/execute",
+            headers=self.headers,
+            json={"parameters": {"query": "new deposit accounts by month"}},
+        )
+        self.assertEqual(generated.status_code, 201, generated.text)
+        self.assertIn("SELECT", generated.json()["result"]["sql"])
+
+        uploaded = self.client.post(
+            "/files/ingest",
+            headers=self.headers,
+            data={"stage_to_postgres": "false"},
+            files={"file": ("agent_tool_smoke.csv", b"event_id,amount\n1,10.5\n2,20.0\n", "text/csv")},
+        ).json()
+        mapping = self.client.post(
+            f"/files/{uploaded['id']}/schema",
+            headers=self.headers,
+            json={
+                "name": "Agent tool smoke mapping",
+                "target_table": "agent_tool_smoke_events",
+                "columns": [
+                    {"source_name": "event_id", "target_name": "event_id", "target_type": "integer", "nullable": False},
+                    {"source_name": "amount", "target_name": "amount", "target_type": "number", "nullable": False},
+                ],
+            },
+        ).json()
+
+        profiled = self.client.post(
+            f"/tools/{tools_by_name['file.profile']}/execute",
+            headers=self.headers,
+            json={"parameters": {"file_id": uploaded["id"]}},
+        )
+        self.assertEqual(profiled.status_code, 201, profiled.text)
+        self.assertEqual(profiled.json()["result"]["filename"], "agent_tool_smoke.csv")
+
+        stage_request = self.client.post(
+            f"/tools/{tools_by_name['pipeline.stage']}/execute",
+            headers=self.headers,
+            json={"parameters": {"file_id": uploaded["id"], "mapping_id": mapping["id"], "load_mode": "append"}},
+        )
+        self.assertEqual(stage_request.status_code, 201)
+        self.assertEqual(stage_request.json()["status"], "WAITING_FOR_APPROVAL")
+        approved_stage = self.client.post(
+            f"/approvals/{stage_request.json()['approval_id']}/decision",
+            headers=self.headers,
+            json={"decision": "approved", "note": "Approved for tool-handler smoke test"},
+        )
+        self.assertEqual(approved_stage.status_code, 200, approved_stage.text)
+        executions = self.client.get("/tools/executions", headers=self.headers).json()
+        staged_execution = next(item for item in executions if item["id"] == stage_request.json()["id"])
+        self.assertEqual(staged_execution["status"], "SUCCEEDED", staged_execution)
+        relation = staged_execution["result"]["relation"]
+        row_check = self.client.post(
+            "/sql/execute", headers=self.headers, json={"sql": f"SELECT COUNT(*) AS row_count FROM {relation}", "dialect": "postgres"},
+        )
+        self.assertEqual(row_check.json()["rows"][0]["row_count"], 2)
+
+        asset_id = staged_execution["result"]["asset_id"]
+        rule = self.client.post(
+            "/quality/rules",
+            headers=self.headers,
+            json={"asset_id": asset_id, "name": "amount is not null", "rule_type": "not_null", "column_name": "amount", "config": {}, "severity": "error"},
+        ).json()
+        quality_result = self.client.post(
+            f"/tools/{tools_by_name['quality.run']}/execute",
+            headers=self.headers,
+            json={"parameters": {"rule_id": rule["id"]}},
+        )
+        self.assertEqual(quality_result.status_code, 201, quality_result.text)
+        self.assertEqual(quality_result.json()["result"]["status"], "passed", quality_result.json())
+
+        scheduled = self.client.post(
+            "/schedules",
+            headers=self.headers,
+            json={"name": "Agent tool smoke schedule", "mapping_id": mapping["id"], "cron": "0 * * * *", "load_mode": "append"},
+        )
+        self.assertEqual(scheduled.status_code, 201)
+        self.client.post(
+            f"/approvals/{scheduled.json()['approval_id']}/decision",
+            headers=self.headers,
+            json={"decision": "approved", "note": "Approved for tool-handler smoke test"},
+        )
+        blocked_before_approval = self.client.post(
+            f"/tools/{tools_by_name['schedule.run']}/execute",
+            headers=self.headers,
+            json={"parameters": {"schedule_id": scheduled.json()["id"]}},
+        )
+        self.assertEqual(blocked_before_approval.status_code, 201)
+        self.assertEqual(blocked_before_approval.json()["status"], "WAITING_FOR_APPROVAL")
+        run_after_approval = self.client.post(
+            f"/approvals/{blocked_before_approval.json()['approval_id']}/decision",
+            headers=self.headers,
+            json={"decision": "approved", "note": "Approved for tool-handler smoke test"},
+        )
+        self.assertEqual(run_after_approval.status_code, 200, run_after_approval.text)
+        executions_after = self.client.get("/tools/executions", headers=self.headers).json()
+        schedule_execution = next(item for item in executions_after if item["id"] == blocked_before_approval.json()["id"])
+        self.assertEqual(schedule_execution["status"], "SUCCEEDED", schedule_execution)
+        self.assertEqual(schedule_execution["result"]["loaded_rows"], 2)
+
+    def test_llm_parameter_fill_is_guarded_and_grounded(self) -> None:
+        """The deterministic parameter heuristic in _parameters_for_tool()
+        only grounds identifiers explicitly present (as a UUID or matched
+        relation name) in the objective text -- so a tool like
+        dataset.profile (requires asset_id) is silently skipped whenever the
+        objective describes what's wanted without quoting the exact table or
+        id. This exercises the guarded LLM fallback that picks up from
+        there: it must still land on a real, project-scoped row to be
+        accepted, and a hallucinated id must be discarded, not executed."""
+        from unittest.mock import patch
+        from app.database import SessionLocal
+        from app.model_runtime import ProviderGenerationResult
+        from app.models import DataAsset, Job
+        from app.temporal_activities import _execute_bound_tools
+
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        me = self.client.get("/auth/me", headers=self.headers).json()
+        fake_provider = SimpleNamespace(provider_type="openai_compatible", id="fake-provider-id", default_model="fake-model", name="Fake Provider")
+        objective = "profile the widget catalog table for a data quality review"
+
+        with SessionLocal() as db:
+            asset = DataAsset(
+                project_id=current_project["id"], source_name="LLM fill smoke test",
+                schema_name="analytics", table_name="llm_fill_target", asset_type="view",
+                row_count=10, columns=[{"name": "id", "type": "integer"}],
+            )
+            db.add(asset)
+            db.flush()
+            asset_id = asset.id
+            job = Job(project_id=current_project["id"], title="LLM parameter fill smoke test", job_type="agent_run", status="RUNNING", progress=10, plan=[], evidence=[], outputs=[], created_by=me["id"])
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            with patch("app.temporal_activities.generate_text", return_value=ProviderGenerationResult(content=json.dumps({"asset_id": asset_id}), latency_ms=5)):
+                evidence, logs, outputs = _execute_bound_tools(
+                    db, job, [{"agent": "Metadata", "action": "Profile the relevant dataset"}], objective, fake_provider,
+                )
+
+        dataset_profile_evidence = [item for item in evidence if item.get("tool") == "dataset.profile"]
+        self.assertTrue(dataset_profile_evidence, evidence)
+        self.assertEqual(dataset_profile_evidence[0]["parameter_source"], "model")
+        self.assertEqual(dataset_profile_evidence[0]["parameters"]["asset_id"], asset_id)
+
+        with SessionLocal() as db:
+            job2 = Job(project_id=current_project["id"], title="LLM parameter fill rejection smoke test", job_type="agent_run", status="RUNNING", progress=10, plan=[], evidence=[], outputs=[], created_by=me["id"])
+            db.add(job2)
+            db.commit()
+            db.refresh(job2)
+            with patch("app.temporal_activities.generate_text", return_value=ProviderGenerationResult(content=json.dumps({"asset_id": "00000000-0000-0000-0000-000000000000"}), latency_ms=5)):
+                evidence2, logs2, outputs2 = _execute_bound_tools(
+                    db, job2, [{"agent": "Metadata", "action": "Profile the relevant dataset"}], objective, fake_provider,
+                )
+        self.assertFalse([item for item in evidence2 if item.get("tool") == "dataset.profile"], evidence2)
+
+    def test_seeded_sql_analyst_agent_autonomously_generates_sql(self) -> None:
+        """Before sql.generate had a builtin handler, the seeded 'SQL Analyst'
+        agent's bounded tool loop would silently skip it (no ToolVersion to
+        run) and could only ever search/preview, never actually draft SQL.
+        This exercises the real bounded-orchestration path (the one
+        POST /agents/runs uses) end to end for that agent."""
+        from app.database import SessionLocal
+        from app.models import Job
+        from app.temporal_activities import _execute_bound_tools
+
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        me = self.client.get("/auth/me", headers=self.headers).json()
+        with SessionLocal() as db:
+            job = Job(
+                project_id=current_project["id"],
+                title="SQL Analyst autonomy smoke test",
+                job_type="agent_run",
+                status="RUNNING",
+                progress=10,
+                plan=[],
+                evidence=[],
+                outputs=[],
+                created_by=me["id"],
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            evidence, logs, outputs = _execute_bound_tools(
+                db, job, [{"agent": "SQL Analyst", "action": "Draft read-only SQL for the objective"}],
+                "new deposit accounts by month",
+            )
+
+        sql_generate_outputs = [item for item in outputs if item.get("tool") == "sql.generate"]
+        self.assertTrue(sql_generate_outputs, outputs)
+        self.assertEqual(sql_generate_outputs[0]["type"], "tool_result")
+        self.assertIn("SELECT", sql_generate_outputs[0]["data"]["sql"] if isinstance(sql_generate_outputs[0]["data"], dict) else "")
 
     def test_generic_governance_event_excludes_sensitive_metadata(self) -> None:
         captured = []
@@ -1131,6 +1551,43 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertTrue(any(call.args[0] == "sql_guardrail" for call in recorded.call_args_list))
 
+    def test_pii_columns_are_annotated_and_query_values_are_masked(self) -> None:
+        columns = annotate_columns([
+            {"name": "email", "type": "text"},
+            {"name": "card_number", "type": "text"},
+            {"name": "order_total", "type": "number"},
+        ])
+        self.assertEqual(columns[0]["pii_category"], "email")
+        self.assertEqual(columns[1]["sensitivity"], "pii")
+        protected, protected_columns = protect_rows(
+            ["email", "card_number", "order_total"],
+            [{"email": "bharath@example.com", "card_number": "4111 1111 1111 1111", "order_total": 10}],
+        )
+        self.assertEqual(protected_columns, ["email", "card_number"])
+        self.assertEqual(protected[0]["email"], "b***@example.com")
+        self.assertEqual(protected[0]["card_number"], "****1111")
+        self.assertEqual(protected[0]["order_total"], 10)
+
+    def test_configured_policy_and_analytics_agents_and_safe_parameter_builder(self) -> None:
+        agents = {item["name"]: item for item in self.client.get("/agents", headers=self.headers).json()}
+        self.assertIn("Policy", agents)
+        self.assertIn("Analytics", agents)
+        self.assertTrue(agents["Policy"]["policy"]["deterministic_authority"])
+        tools = {item["name"]: item for item in self.client.get("/tools", headers=self.headers).json()}
+        for name in ("sql.generate", "file.profile", "quality.run", "pipeline.stage", "schedule.run"):
+            self.assertGreaterEqual(tools[name]["current_version"], 1, name)
+
+        from app.temporal_activities import _parameters_for_tool, _plan_requires_deterministic_approval
+
+        generated = _parameters_for_tool(
+            {"type": "object", "required": ["query", "limit"], "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}},
+            "Show account activity",
+        )
+        self.assertEqual(generated, {"query": "Show account activity", "limit": 10})
+        self.assertIsNone(_parameters_for_tool({"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string"}}}, "Profile the selected dataset"))
+        self.assertTrue(_plan_requires_deterministic_approval([{"agent": "Pipeline", "action": "publish the generated view"}]))
+        self.assertFalse(_plan_requires_deterministic_approval([{"agent": "Analytics", "action": "explain the read-only result"}]))
+
     def test_artifact_versions_are_durable(self) -> None:
         first = self.client.post(
             "/artifacts",
@@ -1503,6 +1960,14 @@ class DataPilotApiTests(unittest.TestCase):
         )
         lineage = self.client.get("/lineage?relation=account_operations", headers=self.headers)
         self.assertEqual(len(lineage.json()["edges"]), 1)
+        lineage_graph = self.client.get(
+            "/lineage/graph?relation=account_operations&direction=upstream&depth=2",
+            headers=self.headers,
+        )
+        self.assertEqual(lineage_graph.status_code, 200)
+        self.assertEqual(lineage_graph.json()["relation"], "account_operations")
+        self.assertEqual(lineage_graph.json()["edges"][0]["depth"], 1)
+        self.assertEqual(lineage_graph.json()["edges"][0]["direction"], "upstream")
         deployment = self.client.post(
             f"/pipelines/{pipeline.json()['id']}/deploy", headers=self.headers
         )
@@ -1856,7 +2321,12 @@ class DataPilotApiTests(unittest.TestCase):
             executed = self.client.post(
                 f"/external-extractions/{extraction.json()['id']}/run", headers=self.headers
             )
-        self.assertEqual(executed.status_code, 201, executed.json())
+        # 202: this endpoint is now Temporal-capable (mirrors POST /schedules/{id}/run)
+        # and falls back to running inline when TEMPORAL_ADDRESS isn't configured, as
+        # it isn't in this test environment -- so this exercises the synchronous
+        # fallback path in extraction_runtime.run_external_extraction_now().
+        self.assertEqual(executed.status_code, 202, executed.json())
+        self.assertIsNone(executed.json()["workflow_id"])
         self.assertEqual(executed.json()["loaded_rows"], 2)
         self.assertEqual(executed.json()["last_watermark"], "2026-01-02T00:00:00Z")
         lineage = self.client.get("/lineage?relation=accounts_source_replica", headers=self.headers)
@@ -2015,6 +2485,129 @@ class DataPilotApiTests(unittest.TestCase):
             json={"resource_type": "external_invocations", "retention_days": 365, "enabled": True},
         )
         self.assertEqual(retention.status_code, 201)
+
+    def test_z_external_query_tool_rate_limiting(self) -> None:
+        try:
+            import fakeredis
+        except ImportError:
+            self.skipTest("fakeredis not installed; rate limiter falls back to fail-open without it")
+        from app import rate_limit
+
+        tool = self.client.post(
+            "/query-tools",
+            headers=self.headers,
+            json={
+                "name": "system.ping",
+                "description": "Trivial constant-result probe used to exercise rate limiting.",
+                "purpose": "Rate-limit smoke test.",
+                "data_source": "Local PostgreSQL staging",
+                "line_of_business": "Platform",
+                "owner": "Platform Engineering",
+                "tags": ["diagnostic"],
+                "sql_template": "SELECT 1 AS ok",
+                "parameter_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "allowed_relations": [],
+                "row_limit": 1,
+                "timeout_seconds": 5,
+            },
+        )
+        self.assertEqual(tool.status_code, 201, tool.json())
+        tool_id = tool.json()["id"]
+        self.assertEqual(self.client.post(f"/query-tools/{tool_id}/publish", headers=self.headers).json()["status"], "published")
+        client = self.client.post(
+            "/external-clients", headers=self.headers,
+            json={"name": "Rate limit probe", "scopes": ["tools:list", "tools:invoke"]},
+        )
+        self.assertEqual(client.status_code, 201)
+        token = client.json()["token"]
+        self.assertEqual(
+            self.client.post(f"/query-tools/{tool_id}/grants", headers=self.headers, json={"external_client_id": client.json()["id"], "enabled": True}).status_code,
+            201,
+        )
+        external_headers = {"Authorization": f"Bearer {token}"}
+
+        rate_limit.configure_client(fakeredis.FakeRedis())
+        try:
+            with patch("app.main.EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", 2):
+                first = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
+                second = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
+                third = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
+            self.assertEqual(first.status_code, 200, first.json())
+            self.assertEqual(second.status_code, 200, second.json())
+            self.assertEqual(third.status_code, 429, third.json())
+            self.assertIn("Retry-After", third.headers)
+        finally:
+            rate_limit.reset_client_cache()
+
+    def test_z_glossary_document_upload_list_grounding_delete(self) -> None:
+        # Empty submission (no file, no text) must be rejected.
+        empty = self.client.post("/glossary", headers=self.headers, data={"title": "Empty"})
+        self.assertEqual(empty.status_code, 400, empty.json())
+
+        created = self.client.post(
+            "/glossary",
+            headers=self.headers,
+            data={
+                "title": "Refund SOP",
+                "text_content": (
+                    "A refund is only valid within 30 days of purchase.\n\n"
+                    "The term ARR means Annual Recurring Revenue, our primary growth metric."
+                ),
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        payload = created.json()
+        self.assertEqual(payload["content_type"], "text")
+        self.assertGreaterEqual(payload["chunks"], 1)
+        document_id = payload["id"]
+
+        listed = self.client.get("/glossary", headers=self.headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertTrue(any(item["id"] == document_id for item in listed.json()))
+
+        # A blank PDF (no extractable text) should be rejected with a clear error,
+        # not silently stored as an empty document.
+        from pypdf import PdfWriter
+
+        buf = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        writer.write(buf)
+        buf.seek(0)
+        blank_pdf = self.client.post(
+            "/glossary",
+            headers=self.headers,
+            data={"title": "Blank PDF"},
+            files={"file": ("sop.pdf", buf, "application/pdf")},
+        )
+        self.assertEqual(blank_pdf.status_code, 400, blank_pdf.json())
+
+        # grounding_context() should surface this document alongside catalog/semantic
+        # matches once it is indexed (QDRANT_URL is unset in tests, so search_documents()
+        # fails open to an empty list here -- this asserts the *key exists* with the
+        # correct shape rather than asserting a nonzero hit count).
+        from app.database import SessionLocal
+        from app.grounding import grounding_context
+        from app.main import current_membership
+        from app.models import User
+
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter(User.email == "admin@datapilot.local").first()
+            membership = current_membership(db, user)
+            context = grounding_context(db, membership.project_id, "What does ARR mean?")
+            self.assertIn("glossary_matches", context)
+            self.assertIsInstance(context["glossary_matches"], list)
+        finally:
+            db.close()
+
+        deleted = self.client.delete(f"/glossary/{document_id}", headers=self.headers)
+        self.assertEqual(deleted.status_code, 200, deleted.json())
+        listed_after = self.client.get("/glossary", headers=self.headers)
+        self.assertFalse(any(item["id"] == document_id for item in listed_after.json()))
+
+        missing = self.client.delete(f"/glossary/{document_id}", headers=self.headers)
+        self.assertEqual(missing.status_code, 404)
 
 
 if __name__ == "__main__":

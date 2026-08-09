@@ -24,6 +24,11 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
 ---
 apiVersion: v1
 kind: Service
@@ -32,3 +37,15 @@ metadata:
 spec:
   selector: {app: datapilot-web}
   ports: [{port: 80, targetPort: 3000}]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: datapilot-web
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: datapilot-web}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}

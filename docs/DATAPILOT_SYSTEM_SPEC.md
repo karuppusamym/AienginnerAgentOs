@@ -67,6 +67,8 @@ The original target is a provider-neutral, local-first AI data-engineering works
 | External access | Fixed read-only query tools, client credentials, per-tool grants, dynamic OpenAPI, and MCP `tools/list`/`tools/call`. |
 | Collaboration and evidence | Versioned artifacts, diffs, comments, reviews, governed notebooks, evaluations, prompt versioning, audit events, and retention-policy approval. |
 | Analytics | Optional embedded Apache Superset with DataPilot-brokered guest access and administrator editor handoff. |
+| Security posture dashboard | `/security-overview` classifies incidents into prompt-injection, PII-exposure, and toxic-content categories via keyword heuristics, and reports a rolling security score, trend delta, time-series buckets, and top risks. Present in API and web UI; not previously listed in this table. |
+| Schema drift detection | `/schema-drift` records and lists detected drift events per connector/relation with an admin/engineer acknowledgment workflow; this is further along than "not yet certified" implied — detection and acknowledgment exist today, independent of live external-connector certification. |
 
 ### 3.3 Intentionally limited or not yet certified
 
@@ -78,6 +80,7 @@ The original target is a provider-neutral, local-first AI data-engineering works
 | Autonomous operation | Bounded, registry-bound, low-risk built-in tool execution only. | Typed planner/executor budgets, simulation, policy tests, and approval-aware evaluation. |
 | Collaboration | Versioned comments and reviews. | Real-time co-editing, conflict resolution, presence, and permission-aware audit model. |
 | General lineage and deployments | Generated pipeline lineage and local PostgreSQL view deployment. | Parser-backed arbitrary SQL lineage and connector-specific deployment/recovery contracts. |
+| Security classification | Incident categorization remains deterministic/keyword-based; governed data paths now annotate PII metadata and mask detected PII in SQL, connector, MCP, query-tool, and notebook results. | Managed content-safety classification, false-positive tuning, column-level policy administration, and formal security certification. |
 
 ### 3.4 Non-goals
 
@@ -421,6 +424,9 @@ The retained supporting documents are:
 | Document | Use it for |
 | --- | --- |
 | [README.md](../README.md) | Fast local startup and repository orientation. |
+| [IMPLEMENTATION_STATUS_MATRIX.md](IMPLEMENTATION_STATUS_MATRIX.md) | Completed / partial / not-completed checklist, reconciled directly against the code and kept current as gaps are found and fixed. |
+| [specs/README.md](specs/README.md) | Per-domain spec pages (one per backend router domain) for a focused read instead of this full document. |
+| [ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md) | Graph-database (Neo4j) recommendation, agentic-harness and self-learning approach, and UI-accessibility direction. |
 | [DATA_CONNECTIONS_LINEAGE_AND_TOOLS_GUIDE.md](DATA_CONNECTIONS_LINEAGE_AND_TOOLS_GUIDE.md) | Plain-language explanation of source connections, PostgreSQL staging, SQL generation/execution boundaries, semantic definitions, MCP tools, pipelines, and lineage. |
 | [ENTERPRISE_READINESS_AND_AGENT_CAPABILITY_ASSESSMENT.md](ENTERPRISE_READINESS_AND_AGENT_CAPABILITY_ASSESSMENT.md) | Implementation-grounded assessment of enterprise readiness, persisted memory, self-learning boundaries, agent harnessing, registry adoption, and usability roadmap. |
 | [DATABASE_MCP_TOOL_REGISTRY_GUIDE.md](DATABASE_MCP_TOOL_REGISTRY_GUIDE.md) | Exact database query-tool, upstream MCP, VS Code, and Google ADK configuration examples. |

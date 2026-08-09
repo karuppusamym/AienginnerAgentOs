@@ -15,6 +15,20 @@ FEATURE_FLAGS = {
     "DISABLE_EMBEDDED_SUPERSET_LOGOUT": True,
 }
 
+# Keep the embedded analytics surface visually aligned with the DataPilot portal.
+APP_NAME = "DataPilot Analytics"
+LOGO_TOOLTIP = "DataPilot Agent OS"
+THEME_DEFAULT = {
+    "token": {
+        "colorPrimary": "#d71e28",
+        "colorSuccess": "#4b6b3c",
+        "colorWarning": "#d7a43b",
+        "colorError": "#b00020",
+        "colorBgLayout": "#f7f3f3",
+        "colorTextBase": "#241719",
+    }
+}
+
 # Embedded dashboard framing is restricted by each dashboard's allowed domains.
 TALISMAN_ENABLED = False
 GUEST_ROLE_NAME = "Gamma"

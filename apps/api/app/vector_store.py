@@ -67,6 +67,24 @@ def index_document(source_id: str, title: str, text: str, payload: dict[str, Any
     return True
 
 
+def delete_document(source_id: str) -> bool:
+    base_url = qdrant_url()
+    if not base_url:
+        return False
+    point_id = str(uuid5(NAMESPACE_URL, f"datapilot:{source_id}"))
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            response = client.post(
+                f"{base_url}/collections/{COLLECTION}/points/delete",
+                params={"wait": "true"},
+                json={"points": [point_id]},
+            )
+            response.raise_for_status()
+        return True
+    except httpx.HTTPError:
+        return False
+
+
 def search_documents(query: str, limit: int = 8) -> list[dict[str, Any]]:
     base_url = qdrant_url()
     if not base_url:

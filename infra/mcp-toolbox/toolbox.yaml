@@ -1,0 +1,120 @@
+kind: source
+name: sqlserver-demo
+type: mssql
+host: sqlserver-demo
+port: 1433
+database: DemoDB
+user: sa
+password: ${MSSQL_SA_PASSWORD}
+---
+kind: source
+name: postgres-demo
+type: postgres
+host: postgres-demo
+port: 5432
+database: demodb
+user: demouser
+password: ${POSTGRES_DEMO_PASSWORD}
+---
+kind: tool
+name: sqlserver.customers.list
+type: mssql-sql
+source: sqlserver-demo
+description: Return a bounded list of customers from the SQL Server demo database. Optionally filter by status (active, inactive, suspended).
+statement: |
+  SELECT TOP 50
+    customer_id, first_name, last_name, email, phone, status, segment
+  FROM demo.customers
+  WHERE @status IS NULL OR status = @status
+  ORDER BY customer_id
+parameters:
+  - name: status
+    type: string
+    description: "Filter by status: active, inactive, or suspended. Leave empty for all."
+---
+kind: tool
+name: sqlserver.orders.by_customer
+type: mssql-sql
+source: sqlserver-demo
+description: Return all orders for a specific customer from the SQL Server demo database.
+statement: |
+  SELECT TOP 50
+    o.order_id, o.customer_id,
+    c.first_name + ' ' + c.last_name AS customer_name,
+    o.order_date, o.status, o.total_amount, o.currency
+  FROM demo.orders o
+  JOIN demo.customers c ON c.customer_id = o.customer_id
+  WHERE o.customer_id = @customer_id
+  ORDER BY o.order_date DESC
+parameters:
+  - name: customer_id
+    type: integer
+    description: Numeric customer identifier
+---
+kind: tool
+name: sqlserver.payments.by_status
+type: mssql-sql
+source: sqlserver-demo
+description: Return payments filtered by payment status from the SQL Server demo database. Valid statuses are settled, pending, refunded.
+statement: |
+  SELECT TOP 50
+    payment_id, order_id, payment_date, method, amount, status, reference
+  FROM demo.payments
+  WHERE status = @status
+  ORDER BY payment_date DESC, payment_id DESC
+parameters:
+  - name: status
+    type: string
+    description: "Payment status: settled, pending, or refunded"
+---
+kind: tool
+name: postgres.customers.lookup
+type: postgres-sql
+source: postgres-demo
+description: Look up a single customer by their numeric ID in the PostgreSQL demo database.
+statement: |
+  SELECT customer_id, first_name, last_name, email, phone, status, segment, created_at
+  FROM demo.customers
+  WHERE customer_id = $1
+parameters:
+  - name: customer_id
+    type: integer
+    description: Numeric customer identifier
+---
+kind: tool
+name: postgres.orders.recent
+type: postgres-sql
+source: postgres-demo
+description: Return the most recent orders from the PostgreSQL demo database. Optionally filter by status.
+statement: |
+  SELECT o.order_id, o.customer_id,
+         c.first_name || ' ' || c.last_name AS customer_name,
+         o.order_date, o.status, o.total_amount, o.currency
+  FROM demo.orders o
+  JOIN demo.customers c ON c.customer_id = o.customer_id
+  WHERE $1::text IS NULL OR o.status = $1
+  ORDER BY o.order_date DESC
+  LIMIT 50
+parameters:
+  - name: status
+    type: string
+    description: "Filter by order status: completed, pending, processing, cancelled. Leave empty for all."
+---
+kind: tool
+name: postgres.payments.summary
+type: postgres-sql
+source: postgres-demo
+description: Return a payment summary grouped by status and method from the PostgreSQL demo database.
+statement: |
+  SELECT
+    status,
+    method,
+    COUNT(*)          AS payment_count,
+    SUM(amount)       AS total_amount,
+    AVG(amount)       AS avg_amount,
+    MIN(payment_date) AS earliest_date,
+    MAX(payment_date) AS latest_date
+  FROM demo.payments
+  GROUP BY status, method
+  ORDER BY total_amount DESC
+parameters: []

@@ -14,6 +14,8 @@ import httpx
 
 from .models import Connector
 from .governance import record_governance_event
+from .pii import annotate_columns, protect_rows
+from .connection_guard import ConnectionLimitExceeded, limit_connector_concurrency
 
 
 class ConnectorRuntimeError(RuntimeError):
@@ -179,6 +181,71 @@ def list_mcp_tools(connector: Connector, timeout_seconds: int = 15) -> list[dict
     return [item for item in tools if isinstance(item, dict)]
 
 
+def _mcp_schema_columns(schema: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    required = set(schema.get("required") or [])
+    columns: list[dict[str, Any]] = []
+    for name, prop in properties.items():
+        prop_type = prop.get("type") if isinstance(prop, dict) else None
+        columns.append(
+            {
+                "name": str(name),
+                "type": str(prop_type or "object"),
+                "nullable": str(name) not in required,
+            }
+        )
+    return columns
+
+
+def discover_mcp_metadata(connector: Connector, timeout_seconds: int = 20) -> MetadataDiscovery:
+    """Catalog what an upstream MCP server exposes as queryable assets.
+
+    An MCP connector has no schema/table introspection endpoint the way a SQL
+    driver does — the server publishes a fixed list of named tools instead.
+    This maps `tools/list` onto the same DataAsset shape a direct-driver scan
+    produces, so MCP-connected sources show up in the catalog, hybrid search,
+    and SQL grounding exactly like a scanned database table. Each tool's
+    output schema (falling back to its input schema) becomes the "columns."
+
+    Closes the gap tracked in docs/IMPLEMENTATION_STATUS_MATRIX.md ("Can
+    metadata be scanned through an MCP-connected source?" was previously No).
+    """
+    tools = list_mcp_tools(connector, timeout_seconds)
+    assets: list[dict[str, Any]] = []
+    for tool in tools:
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            continue
+        output_schema = tool.get("outputSchema") if isinstance(tool.get("outputSchema"), dict) else None
+        input_schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else None
+        columns = _mcp_schema_columns(output_schema) or _mcp_schema_columns(input_schema)
+        tags = ["mcp-tool"]
+        tags.append("has-output-schema" if output_schema else "input-schema-only")
+        tags.extend(_classify_columns(columns))
+        assets.append(
+            {
+                "schema_name": "mcp",
+                "table_name": name,
+                "columns": columns,
+                "tags": tags,
+                "row_count": None,
+                "description_hint": str(tool.get("description") or "").strip() or None,
+            }
+        )
+    return MetadataDiscovery(
+        assets=assets,
+        summary={
+            "schemas": 1 if assets else 0,
+            "tables": len(assets),
+            "columns": sum(len(asset["columns"]) for asset in assets),
+        },
+    )
+
+
 def _normalize_mcp_result(result: dict[str, Any], limit: int, started: float) -> dict[str, Any]:
     if result.get("isError"):
         raise ConnectorRuntimeError("The upstream MCP tool reported an execution error")
@@ -209,13 +276,16 @@ def _normalize_mcp_result(result: dict[str, Any], limit: int, started: float) ->
         rows = [{"result": value}]
         columns = ["result"]
     normalized_rows = [row if isinstance(row, dict) else {"result": row} for row in rows]
+    normalized_columns = [str(column) for column in columns]
+    protected_rows, pii_columns = protect_rows(normalized_columns, normalized_rows[:limit])
     truncated = len(normalized_rows) > limit
     return {
-        "columns": [str(column) for column in columns],
-        "rows": normalized_rows[:limit],
+        "columns": normalized_columns,
+        "rows": protected_rows,
         "row_count": min(len(normalized_rows), limit),
         "truncated": truncated,
         "limit": limit,
+        "protected_columns": pii_columns,
         "duration_ms": round((time.perf_counter() - started) * 1000),
     }
 
@@ -263,7 +333,7 @@ def _group_columns(rows: list[tuple[Any, ...]]) -> MetadataDiscovery:
         {
             "schema_name": schema,
             "table_name": table,
-            "columns": columns,
+            "columns": annotate_columns(columns),
             "tags": _classify_columns(columns),
         }
         for (schema, table), columns in grouped.items()
@@ -564,112 +634,115 @@ def execute_connector_query(
         rows: list[Any]
         columns: list[str]
 
-        if connector.connector_type == "sql_server":
-            import pymssql
+        with limit_connector_concurrency(connector.id):
+            if connector.connector_type == "sql_server":
+                import pymssql
 
-            statement, values = _ordered_parameters(normalized, parameters, "%s")
-            connection = pymssql.connect(
-                server=_required({"host": connector.host}, "host"),
-                user=_required(credentials, "username", "user"),
-                password=_required(credentials, "password"),
-                database=_required({"database": connector.database}, "database"),
-                login_timeout=10,
-                timeout=timeout_seconds,
-                autocommit=True,
-            )
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(statement, tuple(values))
-                    columns = [str(item[0]) for item in cursor.description]
-                    rows = list(cursor.fetchmany(limit + 1))
-            finally:
-                connection.close()
-        elif connector.connector_type == "postgres":
-            import psycopg
+                statement, values = _ordered_parameters(normalized, parameters, "%s")
+                connection = pymssql.connect(
+                    server=_required({"host": connector.host}, "host"),
+                    user=_required(credentials, "username", "user"),
+                    password=_required(credentials, "password"),
+                    database=_required({"database": connector.database}, "database"),
+                    login_timeout=10,
+                    timeout=timeout_seconds,
+                    autocommit=True,
+                )
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(statement, tuple(values))
+                        columns = [str(item[0]) for item in cursor.description]
+                        rows = list(cursor.fetchmany(limit + 1))
+                finally:
+                    connection.close()
+            elif connector.connector_type == "postgres":
+                import psycopg
 
-            statement, values = _ordered_parameters(normalized, parameters, "%s")
-            connection = psycopg.connect(
-                host=_required({"host": connector.host}, "host"),
-                port=int(credentials.get("port", 5432)),
-                user=_required(credentials, "username", "user"),
-                password=_required(credentials, "password"),
-                dbname=_required({"database": connector.database}, "database"),
-                connect_timeout=10,
-                options="-c default_transaction_read_only=on",
-            )
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(f"SET LOCAL statement_timeout = {int(timeout_seconds * 1000)}")
-                    cursor.execute(statement, tuple(values))
-                    columns = [str(item.name) for item in cursor.description]
-                    rows = list(cursor.fetchmany(limit + 1))
-            finally:
-                connection.close()
-        elif connector.connector_type == "oracle":
-            import oracledb
+                statement, values = _ordered_parameters(normalized, parameters, "%s")
+                connection = psycopg.connect(
+                    host=_required({"host": connector.host}, "host"),
+                    port=int(credentials.get("port", 5432)),
+                    user=_required(credentials, "username", "user"),
+                    password=_required(credentials, "password"),
+                    dbname=_required({"database": connector.database}, "database"),
+                    connect_timeout=10,
+                    options="-c default_transaction_read_only=on",
+                )
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(f"SET LOCAL statement_timeout = {int(timeout_seconds * 1000)}")
+                        cursor.execute(statement, tuple(values))
+                        columns = [str(item.name) for item in cursor.description]
+                        rows = list(cursor.fetchmany(limit + 1))
+                finally:
+                    connection.close()
+            elif connector.connector_type == "oracle":
+                import oracledb
 
-            dsn = credentials.get("dsn") or f"{connector.host}/{connector.database}"
-            connection = oracledb.connect(
-                user=_required(credentials, "username", "user"),
-                password=_required(credentials, "password"),
-                dsn=str(dsn),
-            )
-            try:
-                with connection.cursor() as cursor:
-                    cursor.call_timeout = timeout_seconds * 1000
-                    cursor.execute(normalized, parameters)
-                    columns = [str(item[0]).lower() for item in cursor.description]
-                    rows = list(cursor.fetchmany(limit + 1))
-            finally:
-                connection.close()
-        elif connector.connector_type == "teradata":
-            import teradatasql
+                dsn = credentials.get("dsn") or f"{connector.host}/{connector.database}"
+                connection = oracledb.connect(
+                    user=_required(credentials, "username", "user"),
+                    password=_required(credentials, "password"),
+                    dsn=str(dsn),
+                )
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.call_timeout = timeout_seconds * 1000
+                        cursor.execute(normalized, parameters)
+                        columns = [str(item[0]).lower() for item in cursor.description]
+                        rows = list(cursor.fetchmany(limit + 1))
+                finally:
+                    connection.close()
+            elif connector.connector_type == "teradata":
+                import teradatasql
 
-            statement, values = _ordered_parameters(normalized, parameters, "?")
-            connection = teradatasql.connect(
-                host=_required({"host": connector.host}, "host"),
-                user=_required(credentials, "username", "user"),
-                password=_required(credentials, "password"),
-                database=connector.database or "",
-                logmech=str(credentials.get("logmech", "TD2")),
-            )
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute(statement, values)
-                    columns = [str(item[0]) for item in cursor.description]
-                    rows = list(cursor.fetchmany(limit + 1))
-            finally:
-                connection.close()
-        elif connector.connector_type == "bigquery":
-            from google.cloud import bigquery
-            from google.oauth2 import service_account
+                statement, values = _ordered_parameters(normalized, parameters, "?")
+                connection = teradatasql.connect(
+                    host=_required({"host": connector.host}, "host"),
+                    user=_required(credentials, "username", "user"),
+                    password=_required(credentials, "password"),
+                    database=connector.database or "",
+                    logmech=str(credentials.get("logmech", "TD2")),
+                )
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute(statement, values)
+                        columns = [str(item[0]) for item in cursor.description]
+                        rows = list(cursor.fetchmany(limit + 1))
+                finally:
+                    connection.close()
+            elif connector.connector_type == "bigquery":
+                from google.cloud import bigquery
+                from google.oauth2 import service_account
 
-            project = connector.host or credentials.get("project_id")
-            service_account_value = credentials.get("service_account") or credentials
-            auth = (
-                service_account.Credentials.from_service_account_file(service_account_value)
-                if isinstance(service_account_value, str)
-                else service_account.Credentials.from_service_account_info(service_account_value)
-            )
-            client = bigquery.Client(project=project, credentials=auth)
-            query_parameters = []
-            for name, value in parameters.items():
-                parameter_type = "BOOL" if isinstance(value, bool) else "INT64" if isinstance(value, int) else "FLOAT64" if isinstance(value, float) else "STRING"
-                query_parameters.append(bigquery.ScalarQueryParameter(name, parameter_type, value))
-            query_job = client.query(normalized, job_config=bigquery.QueryJobConfig(query_parameters=query_parameters))
-            result = query_job.result(timeout=timeout_seconds, max_results=limit + 1)
-            columns = [field.name for field in result.schema]
-            rows = [tuple(row[column] for column in columns) for row in result]
-        else:
-            raise ConnectorRuntimeError(f"Query execution is not supported for {connector.connector_type}")
+                project = connector.host or credentials.get("project_id")
+                service_account_value = credentials.get("service_account") or credentials
+                auth = (
+                    service_account.Credentials.from_service_account_file(service_account_value)
+                    if isinstance(service_account_value, str)
+                    else service_account.Credentials.from_service_account_info(service_account_value)
+                )
+                client = bigquery.Client(project=project, credentials=auth)
+                query_parameters = []
+                for name, value in parameters.items():
+                    parameter_type = "BOOL" if isinstance(value, bool) else "INT64" if isinstance(value, int) else "FLOAT64" if isinstance(value, float) else "STRING"
+                    query_parameters.append(bigquery.ScalarQueryParameter(name, parameter_type, value))
+                query_job = client.query(normalized, job_config=bigquery.QueryJobConfig(query_parameters=query_parameters))
+                result = query_job.result(timeout=timeout_seconds, max_results=limit + 1)
+                columns = [field.name for field in result.schema]
+                rows = [tuple(row[column] for column in columns) for row in result]
+            else:
+                raise ConnectorRuntimeError(f"Query execution is not supported for {connector.connector_type}")
 
         truncated = len(rows) > limit
+        protected_rows, pii_columns = protect_rows(columns, [dict(zip(columns, row, strict=False)) for row in rows[:limit]])
         result_payload = {
             "columns": columns,
-            "rows": [dict(zip(columns, row, strict=False)) for row in rows[:limit]],
+            "rows": protected_rows,
             "row_count": min(len(rows), limit),
             "truncated": truncated,
             "limit": limit,
+            "protected_columns": pii_columns,
             "duration_ms": round((time.perf_counter() - started) * 1000),
         }
         record_governance_event(
@@ -740,9 +813,7 @@ def discover_metadata(connector: Connector) -> MetadataDiscovery:
     if connector.host == "mock-sqlserver":
         raise ConnectorRuntimeError("The demonstration connector uses its seeded offline catalog")
     if getattr(connector, "connection_mode", "direct") == "mcp":
-        raise ConnectorRuntimeError(
-            "Metadata scanning through MCP is not configured; use a direct connector or publish a dedicated metadata tool"
-        )
+        return discover_mcp_metadata(connector)
     adapter = ADAPTERS.get(connector.connector_type)
     if adapter is None:
         raise ConnectorRuntimeError(f"Metadata discovery is not available for {connector.connector_type}")

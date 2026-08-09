@@ -8,6 +8,7 @@ from .connector_runtime import discover_metadata
 from .database import SessionLocal
 from .governance import record_audit_event, record_governance_event
 from .models import AuditEvent, Connector, DataAsset, Job, SchemaDriftEvent
+from .pii import annotate_columns
 from .vector_store import index_document
 
 
@@ -78,10 +79,10 @@ def execute_metadata_scan(connector_id: str, job_id: str, actor_id: str) -> dict
                         ]
                         if changes:
                             db.add(SchemaDriftEvent(project_id=connector.project_id, connector_id=connector.id, asset_id=asset.id, relation=f"{item['schema_name']}.{item['table_name']}", changes=changes))
-                    asset.columns = item["columns"]
+                    asset.columns = annotate_columns(item["columns"])
                     asset.tags = item.get("tags", [])
                     asset.row_count = item.get("row_count")
-                    asset.description = f"Discovered from {connector.name} in read-only mode."
+                    asset.description = item.get("description_hint") or f"Discovered from {connector.name} in read-only mode."
                     discovered_assets.append(asset)
             connector.status = "healthy"
             connector.last_scanned_at = datetime.now(timezone.utc)

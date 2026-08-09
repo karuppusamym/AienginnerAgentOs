@@ -26,6 +26,15 @@ spec:
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 2Gi}
+          # Satisfies both vanilla-Kubernetes "restricted" PSA and OpenShift's
+          # default "restricted-v2" SCC without modification — the image
+          # itself runs as a fixed non-root UID (see apps/api/Dockerfile);
+          # OCP overrides that UID at admission but keeps this contract.
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
 ---
 apiVersion: v1
 kind: Service

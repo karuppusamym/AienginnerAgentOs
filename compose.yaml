@@ -64,6 +64,8 @@ services:
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@datapilot.local}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-ChangeMe123!}
       REDIS_URL: redis://redis:6379/0
+      EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE: ${EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE:-60}
+      CONNECTOR_MAX_CONCURRENT_CONNECTIONS: ${CONNECTOR_MAX_CONCURRENT_CONNECTIONS:-8}
       QDRANT_URL: http://qdrant:6333
       TEMPORAL_ADDRESS: temporal:7233
       SUPERSET_INTERNAL_URL: http://superset:8088
@@ -72,7 +74,9 @@ services:
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-ChangeMe123!}
       SUPERSET_EDITOR_SSO_SECRET: ${SUPERSET_EDITOR_SSO_SECRET:-datapilot-local-editor-sso-secret-change-me}
       ENABLE_DEMO_DATA: ${ENABLE_DEMO_DATA:-false}
-      TOOL_HTTP_ALLOWLIST: ${TOOL_HTTP_ALLOWLIST:-localhost,127.0.0.1,superset}
+      TOOL_HTTP_ALLOWLIST: ${TOOL_HTTP_ALLOWLIST:-localhost,127.0.0.1,superset,mcp-toolbox}
+      SQLSERVER_DEMO_CREDENTIALS: ${SQLSERVER_DEMO_CREDENTIALS:-{"server":"sqlserver-demo,1433","database":"DemoDB","username":"sa","password":"DataPilot#2026!"}}
+      POSTGRES_DEMO_CREDENTIALS: ${POSTGRES_DEMO_CREDENTIALS:-{"host":"postgres-demo","port":5432,"database":"demodb","username":"demouser","password":"DemoPass#2026!"}}
       OTEL_ENABLED: ${OTEL_ENABLED:-false}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-datapilot-api}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -123,6 +127,7 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
+      - "3000:3000"
       - "3001:3000"
     depends_on:
       api:
@@ -179,9 +184,71 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # ─── Demo SQL Server 2022 ────────────────────────────────────────────────
+  sqlserver-demo:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
+      MSSQL_PID: Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - datapilot_sqlserver:/var/opt/mssql
+      - ./infra/sqlserver-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $${MSSQL_SA_PASSWORD:-DataPilot#2026!} -Q 'SELECT 1' -C -b 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ─── Demo PostgreSQL 16 ───────────────────────────────────────────────────
+  postgres-demo:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: demodb
+      POSTGRES_USER: demouser
+      POSTGRES_PASSWORD: ${POSTGRES_DEMO_PASSWORD:-DemoPass#2026!}
+    ports:
+      - "5434:5432"
+    volumes:
+      - datapilot_postgres_demo:/var/lib/postgresql/data
+      - ./infra/postgres-demo-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demouser -d demodb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ─── Google MCP Toolbox ───────────────────────────────────────────────────
+  mcp-toolbox:
+    image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
+    command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000"]
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
+      POSTGRES_DEMO_PASSWORD: ${POSTGRES_DEMO_PASSWORD:-DemoPass#2026!}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./infra/mcp-toolbox:/config:ro
+    depends_on:
+      sqlserver-demo:
+        condition: service_healthy
+      postgres-demo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "cat /dev/null > /dev/tcp/localhost/5000 && echo ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
 volumes:
   datapilot_postgres:
   datapilot_redis:
   datapilot_qdrant:
   datapilot_uploads:
   datapilot_superset:
+  datapilot_sqlserver:
+  datapilot_postgres_demo:

@@ -1,0 +1,61 @@
+# Example external-exposure objects for DataPilot — NOT included in
+# kustomization.yaml by default, because the correct choice depends on your
+# platform (vanilla Kubernetes vs. OpenShift) and on values only you know
+# (hostname, ingress class, TLS secret/cert-manager issuer). Copy the block
+# you need into your own overlay, fill in the placeholders, and add it to
+# kustomization.yaml's `resources:` list.
+#
+# This closes a real gap in the baseline: as shipped, infra/kubernetes only
+# creates ClusterIP Services for datapilot-api and datapilot-web — nothing
+# routes external traffic to them.
+
+# --- Option A: vanilla Kubernetes / any platform with an Ingress controller ---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datapilot
+  annotations:
+    # Adjust to your ingress controller, e.g. nginx.ingress.kubernetes.io/*
+    # for ingress-nginx, or remove entirely for a controller with sane
+    # defaults. If using cert-manager: cert-manager.io/cluster-issuer: "..."
+    kubernetes.io/tls-acme: "true"
+spec:
+  ingressClassName: nginx  # CHANGE ME
+  tls:
+    - hosts: ["datapilot.example.com"]
+      secretName: datapilot-tls
+  rules:
+    - host: datapilot.example.com  # CHANGE ME
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: datapilot-web, port: {number: 80}}
+    - host: api.datapilot.example.com  # CHANGE ME
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: datapilot-api, port: {number: 8000}}
+
+---
+# --- Option B: OpenShift (OCP) Route — use instead of Option A on OCP ---
+# apiVersion: route.openshift.io/v1
+# kind: Route
+# metadata:
+#   name: datapilot-web
+# spec:
+#   host: datapilot.apps.example-cluster.example.com  # CHANGE ME
+#   to: {kind: Service, name: datapilot-web}
+#   tls: {termination: edge, insecureEdgeTerminationPolicy: Redirect}
+# ---
+# apiVersion: route.openshift.io/v1
+# kind: Route
+# metadata:
+#   name: datapilot-api
+# spec:
+#   host: api.datapilot.apps.example-cluster.example.com  # CHANGE ME
+#   to: {kind: Service, name: datapilot-api}
+#   tls: {termination: edge, insecureEdgeTerminationPolicy: Redirect}

@@ -104,9 +104,19 @@ def _ensure_dataset(
     database_id: int,
     dataset: dict[str, Any],
 ) -> int:
+    virtual_sql = str(dataset.get("sql") or "").strip()
+
     def matches(item: dict[str, Any]) -> bool:
         database = item.get("database") or {}
         database_id_value = database.get("id") if isinstance(database, dict) else None
+        # Virtual datasets are identified by their stable DataPilot name and
+        # exact governed SQL.  A physical relation with the same name must
+        # never be reused for a query publication.
+        if virtual_sql:
+            return (
+                item.get("table_name") == dataset["table_name"]
+                and (database_id_value is None or int(database_id_value) == database_id)
+            )
         return (
             item.get("schema") == dataset["schema_name"]
             and item.get("table_name") == dataset["table_name"]
@@ -119,14 +129,17 @@ def _ensure_dataset(
     )
     if existing:
         return int(existing["id"])
+    create_payload: dict[str, Any] = {
+        "database": database_id,
+        "schema": dataset["schema_name"],
+        "table_name": dataset["table_name"],
+    }
+    if virtual_sql:
+        create_payload["sql"] = virtual_sql
     created = client.post(
         f"{internal_url}/api/v1/dataset/",
         headers={"Authorization": f"Bearer {token}", "X-CSRFToken": csrf_token},
-        json={
-            "database": database_id,
-            "schema": dataset["schema_name"],
-            "table_name": dataset["table_name"],
-        },
+        json=create_payload,
     )
     if created.is_success:
         body = created.json()
@@ -435,8 +448,17 @@ def _ensure_dashboard(
     project_name: str,
     project_slug: str,
     dataset: dict[str, Any],
+    dashboard_key: str | None = None,
 ) -> dict[str, Any]:
-    slug = _dashboard_slug(project_slug)
+    # A dashboard's Superset slug must uniquely identify *what it shows*, not
+    # just the project it belongs to. The project's single primary dashboard
+    # (its mapped/staged dataset) keys off project_slug alone, as before. A
+    # published SQL/notebook query instead passes its own dashboard_key
+    # (derived from the source artifact id) so it provisions a dedicated
+    # dashboard rather than silently overwriting the project's main one —
+    # both previously resolved to the identical `datapilot-project-{slug}`
+    # slug and collided.
+    slug = _dashboard_slug(dashboard_key or project_slug)
     title = _dashboard_title(project_name, dataset)
     dashboards = _list_results(client, token, internal_url, "/api/v1/dashboard/")
     existing = next((item for item in dashboards if item.get("slug") == slug), None)
@@ -538,12 +560,13 @@ def get_embed_configuration(
     project_name: str,
     project_slug: str,
     dataset: dict[str, Any],
+    dashboard_key: str | None = None,
 ) -> dict[str, Any]:
     internal_url, public_url, _, _ = _settings()
     client, token, csrf_token, _ = _admin_session()
     try:
         dashboard = _ensure_dashboard(
-            client, token, csrf_token, internal_url, project_name, project_slug, dataset
+            client, token, csrf_token, internal_url, project_name, project_slug, dataset, dashboard_key
         )
         return {**dashboard, "superset_domain": public_url, "project_slug": project_slug}
     finally:
@@ -557,12 +580,13 @@ def create_guest_token(
     user_id: str,
     _email: str,
     name: str,
+    dashboard_key: str | None = None,
 ) -> dict[str, str]:
     internal_url, _, _, _ = _settings()
     client, token, csrf_token, _ = _admin_session()
     try:
         dashboard = _ensure_dashboard(
-            client, token, csrf_token, internal_url, project_name, project_slug, dataset
+            client, token, csrf_token, internal_url, project_name, project_slug, dataset, dashboard_key
         )
         name_parts = name.strip().split(maxsplit=1)
         response = client.post(

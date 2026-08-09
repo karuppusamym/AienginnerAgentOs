@@ -132,11 +132,49 @@ class SupersetProjectDashboard(Base):
     )
 
 
+class SupersetQueryDashboard(Base):
+    """A dedicated, per-artifact Superset dashboard for a published SQL/notebook query.
+
+    This is intentionally a separate table from ``SupersetProjectDashboard``
+    (which tracks exactly one dashboard per project, used for the project's
+    primary staged/mapped dataset). Each approved query publication gets its
+    own dashboard identity so that publishing a governed SQL or notebook
+    result never overwrites the project's main analytics dashboard — the two
+    previously collided because both were being provisioned under the same
+    Superset dashboard slug, derived only from the project slug.
+    """
+
+    __tablename__ = "superset_query_dashboards"
+    __table_args__ = (UniqueConstraint("project_id", "artifact_id", name="uq_superset_query_dashboard_artifact"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), index=True)
+    artifact_version: Mapped[int] = mapped_column(Integer, default=0)
+    query_name: Mapped[str] = mapped_column(String(160), default="")
+    sql: Mapped[str] = mapped_column(Text, default="")
+    columns: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    dashboard_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dashboard_slug: Mapped[str] = mapped_column(String(160), default="")
+    embedded_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    dashboard_title: Mapped[str] = mapped_column(String(240), default="")
+    superset_dataset_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chart_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    access_mode: Mapped[str] = mapped_column(String(64), default="dashboard_scope")
+    rls_column: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    published_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class SemanticMetric(Base):
     __tablename__ = "semantic_metrics"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    asset_id: Mapped[str | None] = mapped_column(ForeignKey("data_assets.id"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(180))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     formula: Mapped[str] = mapped_column(Text)
@@ -192,6 +230,12 @@ class AgentDefinition(Base):
     autonomy_level: Mapped[int] = mapped_column(Integer, default=2)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     tool_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Names of published QueryTool records (governed SQL tools with business
+    # metadata: purpose/data_source/line_of_business/owner) this agent may
+    # invoke during a bounded run, resolved against the run's project.
+    # Distinct from tool_names, which references the internal ToolDefinition
+    # registry (built-in handlers / allowlisted HTTP).
+    query_tool_names: Mapped[list[str]] = mapped_column(JSON, default=list)
     policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
@@ -219,6 +263,7 @@ class AgentVersion(Base):
         ForeignKey("model_providers.id"), nullable=True
     )
     tool_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    query_tool_names: Mapped[list[str]] = mapped_column(JSON, default=list)
     input_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="draft")
@@ -365,6 +410,8 @@ class LearningSuggestion(Base):
     proposed_change: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, default=1)
+    severity: Mapped[str] = mapped_column(String(16), default="normal")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -389,6 +436,28 @@ class Connector(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class GlossaryDocument(Base):
+    """A business-context document (SOP, glossary, definitions) uploaded to
+    ground SQL generation and conversations. Not tabular data -- see
+    IngestedFile for that. Text is extracted at upload time (PDF via pypdf,
+    or taken directly for .txt/.md), truncated to a bounded size, stored
+    here, and indexed into the vector store so grounding_context() can
+    retrieve relevant passages the same way it retrieves catalog matches.
+    """
+
+    __tablename__ = "glossary_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    source_filename: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    content_type: Mapped[str] = mapped_column(String(16), default="text")
+    extracted_text: Mapped[str] = mapped_column(Text)
+    character_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class DataAsset(Base):
     __tablename__ = "data_assets"
 
@@ -405,6 +474,10 @@ class DataAsset(Base):
     columns: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    sensitivity: Mapped[str] = mapped_column(String(32), default="unclassified")
+    freshness_sla_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_status: Mapped[str] = mapped_column(String(32), default="scanned")
 
 
 class IngestedFile(Base):
@@ -757,6 +830,24 @@ class SQLQueryCache(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class QueryRun(Base):
+    __tablename__ = "query_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    connector_id: Mapped[str | None] = mapped_column(ForeignKey("connectors.id"), nullable=True, index=True)
+    question: Mapped[str] = mapped_column(Text)
+    sql: Mapped[str] = mapped_column(Text)
+    dialect: Mapped[str] = mapped_column(String(32))
+    provider: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    grounding: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="generated")
+    cache_hit: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RetentionPolicy(Base):

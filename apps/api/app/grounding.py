@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import DataAsset, SemanticJoinPolicy, SemanticMetric
+from .models import DataAsset, GlossaryDocument, SemanticJoinPolicy, SemanticMetric
 from .vector_store import search_documents
 
 
@@ -138,6 +138,8 @@ def project_asset_search(db: Session, project_id: str, query: str, limit: int = 
                 asset.description or "",
                 " ".join(asset.tags),
                 " ".join(str(column.get("name", "")) for column in asset.columns),
+                " ".join(str(column.get("business_name", "")) for column in asset.columns),
+                " ".join(str(column.get("description", "")) for column in asset.columns),
             ]
         )
         score = _token_overlap_score(haystack, tokens, normalized_query)
@@ -251,6 +253,47 @@ def semantic_matches(db: Session, project_id: str, query: str, limit: int = 5) -
     return {"metrics": matched_metrics[:limit], "joins": matched_joins[:limit]}
 
 
+def glossary_matches(db: Session, project_id: str, query: str, limit: int = 4) -> list[dict[str, Any]]:
+    """Retrieve grounding passages from uploaded SOP/glossary documents.
+
+    Mirrors project_asset_search's vector-hit pattern but scoped to
+    GlossaryDocument rows for this project instead of DataAsset rows. Each
+    document is chunked and indexed with source_id
+    f"{document_id}:chunk:{n}" and payload source_type="glossary" (see
+    upload_glossary_document in routers/workspace.py). search_documents()
+    has no server-side project filter, so hits are cross-checked here
+    against this project's own GlossaryDocument ids before being surfaced —
+    otherwise a glossary term uploaded in one project could leak into
+    another project's SQL-generation context.
+    """
+    documents = {
+        document.id: document
+        for document in db.scalars(
+            select(GlossaryDocument).where(GlossaryDocument.project_id == project_id)
+        ).all()
+    }
+    if not documents:
+        return []
+    results: list[dict[str, Any]] = []
+    for hit in search_documents(query, limit=max(limit * 4, 12)):
+        if hit.get("source_type") != "glossary":
+            continue
+        document = documents.get(str(hit.get("document_id", "")))
+        if document is None:
+            continue
+        results.append(
+            {
+                "document_id": document.id,
+                "title": document.title,
+                "chunk_index": hit.get("chunk_index", 0),
+                "text": str(hit.get("text", ""))[:1200],
+                "score": round(float(hit.get("score", 0.0)), 4),
+            }
+        )
+    results.sort(key=lambda item: float(item["score"]), reverse=True)
+    return results[:limit]
+
+
 def grounding_context(db: Session, project_id: str, question: str, limit: int = 5) -> dict[str, Any]:
     catalog_matches = project_asset_search(db, project_id, question, limit=limit)
     semantic = semantic_matches(db, project_id, question, limit=limit)
@@ -259,6 +302,7 @@ def grounding_context(db: Session, project_id: str, question: str, limit: int = 
         "vector_hits": [item for item in catalog_matches if item["match_type"] in {"vector", "hybrid"}][:limit],
         "semantic_matches": semantic["metrics"],
         "join_matches": semantic["joins"],
+        "glossary_matches": glossary_matches(db, project_id, question, limit=min(limit, 4)),
     }
 
 
@@ -289,6 +333,15 @@ def grounding_prompt_text(context: dict[str, Any]) -> str:
             + "\n".join(
                 f"- {item['left_relation']} {item['join_type'].upper()} JOIN {item['right_relation']} ON {item['left_column']} = {item['right_column']}"
                 for item in join_matches[:4]
+            )
+        )
+    glossary_hits = context.get("glossary_matches", [])
+    if glossary_hits:
+        sections.append(
+            "Relevant business glossary / SOP passages:\n"
+            + "\n".join(
+                f"- [{item['title']}] {item['text'][:400]}"
+                for item in glossary_hits[:4]
             )
         )
     return "\n\n".join(sections) or "No additional retrieved context."

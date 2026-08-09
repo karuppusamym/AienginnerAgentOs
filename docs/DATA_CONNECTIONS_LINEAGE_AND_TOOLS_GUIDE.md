@@ -68,6 +68,14 @@ So the lineage story is continuous from a user perspective, but implementation d
 - Source asset -> generated target view is tracked through `LineageEdge`.
 - Arbitrary SQL lineage is not generally parsed and persisted for every ad hoc SQL query.
 
+The API preserves the flat `GET /lineage` view and adds
+`GET /lineage/graph?relation=<relation>&direction=upstream|downstream|both&depth=5`.
+The graph endpoint performs bounded multi-hop traversal over physical pipeline
+edges and returns nodes, hop depth, direction, transformations, column
+mappings, and a truncation flag. It is intentionally separate from the
+semantic relationship graph: lineage answers "where did this data flow?" while
+semantic relationships answer "how are these business datasets related?".
+
 ## 5. SQL generation and execution by target
 
 | Target | Can DataPilot generate SQL? | Can DataPilot execute preview? | Notes |
@@ -244,4 +252,3 @@ Use this rule of thumb:
 - Semantic metrics and joins are metadata; they guide generation and pipelines but do not move data by themselves.
 - Pipeline lineage is explicit for generated pipelines; ad hoc SQL lineage is not fully parser-backed.
 - Approvals, jobs, artifacts, audit events, and governance telemetry are part of the product behavior, not optional UI decoration.
-

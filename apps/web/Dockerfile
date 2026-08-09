@@ -20,5 +20,12 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
 RUN npm prune --omit=dev
+
+# Same non-root / group-0 pattern as apps/api/Dockerfile — works unmodified
+# under plain Docker/Kubernetes (fixed UID 1001) and under OpenShift's
+# arbitrary-UID restricted SCC (group 0 stays writable either way).
+RUN chown -R 1001:0 /app && chmod -R g=u /app
+USER 1001:0
+
 EXPOSE 3000
 CMD ["npm", "run", "start"]

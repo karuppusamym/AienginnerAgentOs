@@ -67,6 +67,27 @@ def ensure_control_plane(db: Session) -> None:
         db.flush()
     elif project.default_model_provider_id is None:
         project.default_model_provider_id = provider.id if provider else None
+    if os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"} and not db.scalar(
+        select(DataAsset).where(DataAsset.project_id == project.id, DataAsset.schema_name == "core", DataAsset.table_name == "accounts")
+    ):
+        db.add(DataAsset(
+            project_id=project.id,
+            source_name="DataPilot PostgreSQL",
+            schema_name="core",
+            table_name="accounts",
+            asset_type="table",
+            row_count=8,
+            columns=[
+                {"name": "account_id", "type": "integer", "nullable": False},
+                {"name": "customer_id", "type": "integer", "nullable": False},
+                {"name": "account_type", "type": "varchar", "nullable": False},
+                {"name": "status", "type": "varchar", "nullable": False},
+                {"name": "opened_at", "type": "timestamp", "nullable": False},
+            ],
+            tags=["demo", "certified"],
+            description="Local demo accounts table used by notebooks and embedded analytics.",
+        ))
+        db.flush()
     for user in db.scalars(select(User)).all():
         membership = db.scalar(
             select(ProjectMembership).where(
@@ -136,6 +157,31 @@ def ensure_control_plane(db: Session) -> None:
             {"type": "object", "additionalProperties": False, "required": ["relation"], "properties": {"relation": {"type": "string", "maxLength": 320}}},
             ["catalog:read"],
         ),
+        "sql.generate": (
+            "sql.generate",
+            {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {"query": {"type": "string", "maxLength": 500}, "dialect": {"type": "string", "maxLength": 20}}},
+            ["catalog:read", "query:draft"],
+        ),
+        "file.profile": (
+            "file.profile",
+            {"type": "object", "additionalProperties": False, "required": ["file_id"], "properties": {"file_id": {"type": "string", "maxLength": 36}}},
+            ["files:read"],
+        ),
+        "quality.run": (
+            "quality.run",
+            {"type": "object", "additionalProperties": False, "required": ["rule_id"], "properties": {"rule_id": {"type": "string", "maxLength": 36}}},
+            ["quality:execute"],
+        ),
+        "pipeline.stage": (
+            "pipeline.stage",
+            {"type": "object", "additionalProperties": False, "required": ["file_id", "mapping_id"], "properties": {"file_id": {"type": "string", "maxLength": 36}, "mapping_id": {"type": "string", "maxLength": 36}, "load_mode": {"type": "string", "maxLength": 20}, "key_columns": {"type": "array"}}},
+            ["staging:write"],
+        ),
+        "schedule.run": (
+            "schedule.run",
+            {"type": "object", "additionalProperties": False, "required": ["schedule_id"], "properties": {"schedule_id": {"type": "string", "maxLength": 36}}},
+            ["ingestion:execute"],
+        ),
     }
     for tool_name, (handler, parameter_schema, permissions) in tool_contracts.items():
         tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == tool_name))
@@ -143,18 +189,20 @@ def ensure_control_plane(db: Session) -> None:
             db.add(ToolVersion(tool_id=tool.id, version=1, implementation_type="builtin", handler_name=handler, parameter_schema=parameter_schema, result_schema={"type": "object"}, permissions=permissions, timeout_seconds=30, max_retries=0, status="published", created_by=admin.id))
 
     agents = [
-        ("Planner", "Decomposes requests, selects specialists, and enforces run limits.", ["catalog.search"], 2),
-        ("Metadata", "Scans catalogs, profiles assets, and retrieves grounded context.", ["catalog.search", "dataset.profile", "file.profile", "lineage.query"], 2),
-        ("SQL Analyst", "Generates and validates dialect-aware read-only SQL.", ["catalog.search", "sql.generate", "sql.preview"], 2),
-        ("Pipeline", "Drafts and executes approval-gated local ingestion workflows.", ["file.profile", "pipeline.stage", "schedule.run"], 3),
-        ("Quality", "Profiles data and proposes measurable quality controls.", ["catalog.search", "quality.run"], 2),
-        ("Troubleshooter", "Explains failed jobs and recommends bounded remediation.", ["catalog.search", "job.inspect", "lineage.query"], 1),
+        ("Planner", "Decomposes requests, selects specialists, and enforces run limits.", ["catalog.search"], 2, {"role": "planner"}),
+        ("Metadata", "Scans catalogs, profiles assets, and retrieves grounded context.", ["catalog.search", "dataset.profile", "file.profile", "lineage.query"], 2, {"role": "metadata"}),
+        ("SQL Analyst", "Generates and validates dialect-aware read-only SQL.", ["catalog.search", "sql.generate", "sql.preview"], 2, {"role": "sql_analyst"}),
+        ("Pipeline", "Drafts and executes approval-gated local ingestion workflows.", ["file.profile", "pipeline.stage", "schedule.run"], 3, {"role": "pipeline"}),
+        ("Quality", "Profiles data and proposes measurable quality controls.", ["catalog.search", "quality.run"], 2, {"role": "quality"}),
+        ("Troubleshooter", "Explains failed jobs and recommends bounded remediation.", ["catalog.search", "job.inspect", "lineage.query"], 1, {"role": "troubleshooter"}),
+        ("Policy", "Explains policy decisions while deterministic controls remain authoritative.", ["catalog.search", "job.inspect"], 2, {"role": "policy", "deterministic_authority": True, "writes_require_approval": True}),
+        ("Analytics", "Builds grounded metric and dashboard analyses from approved catalog context.", ["catalog.search", "dataset.profile", "sql.generate", "sql.preview", "lineage.query"], 2, {"role": "analytics", "writes_require_approval": True}),
     ]
-    for name, purpose, tool_names, level in agents:
+    for name, purpose, tool_names, level, policy in agents:
         if not db.scalar(select(AgentDefinition).where(AgentDefinition.name == name)):
-            db.add(AgentDefinition(name=name, purpose=purpose, autonomy_level=level, tool_names=tool_names, policy={"max_iterations": 4, "max_tool_calls": 12, "timeout_seconds": 300, "writes_require_approval": True}))
+            db.add(AgentDefinition(name=name, purpose=purpose, autonomy_level=level, tool_names=tool_names, policy={"max_iterations": 4, "max_tool_calls": 12, "timeout_seconds": 300, **policy}))
     db.flush()
-    for name, purpose, tool_names, level in agents:
+    for name, purpose, tool_names, level, _policy in agents:
         agent = db.scalar(select(AgentDefinition).where(AgentDefinition.name == name))
         if agent and not db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent.id)):
             db.add(AgentVersion(agent_id=agent.id, version=1, instructions=f"You are the {name} specialist in DataPilot. {purpose} Ground decisions in project metadata, emit evidence, respect tool schemas, and stop when approval is required.", model_provider_id=project.default_model_provider_id, tool_names=tool_names, input_schema={"type": "object", "required": ["objective"], "properties": {"objective": {"type": "string"}}}, config={"max_iterations": 4, "max_tool_calls": 12, "timeout_seconds": 300, "autonomy_level": level}, status="published", created_by=admin.id))

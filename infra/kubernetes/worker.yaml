@@ -20,3 +20,29 @@ spec:
           resources:
             requests: {cpu: 300m, memory: 768Mi}
             limits: {cpu: "2", memory: 3Gi}
+          # No HTTP server in this process (it's a Temporal worker loop, not an
+          # API), so liveness is process-presence rather than an HTTP probe.
+          # This does not detect a hung-but-alive event loop — see
+          # ARCHITECTURE_DECISIONS.md for the tracked follow-up (a small
+          # health-check sidecar or heartbeat file would close that gap).
+          livenessProbe:
+            exec: {command: ["pgrep", "-f", "app.worker"]}
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: datapilot-worker
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: datapilot-worker}
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}

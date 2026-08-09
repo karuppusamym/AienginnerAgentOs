@@ -1,0 +1,24 @@
+{
+  "api_url": "http://localhost:8000",
+  "project_id": "0650b5cc-196f-46de-889d-e5404a0b5f14",
+  "connector_ids": [
+    "21cd5927-3475-4792-be1a-74765618d849",
+    "d2d7dc92-e4df-4913-a0e3-796e200412e3",
+    "f9017d75-6711-4824-967e-cc7a26fd4c37",
+    "014ec4fe-43b8-4cc4-92d9-e072c24ac2bd"
+  ],
+  "tool_ids": [
+    "86452d6b-fa2b-4c77-903a-4fb137ec80ec",
+    "7f5508be-28aa-46e4-a211-3945642d320b",
+    "b785eac4-fc37-47ec-9b1b-e3ef92f64738",
+    "68b46e0c-2965-4d90-889e-6fef185a54e2"
+  ],
+  "client_id": "5c1d5b81-4e96-4060-95a2-8035f7dd4d10",
+  "external_token": "dp_f13af3230f634c9c.Uy3PIFqHjPB2Lfre0hu01B0ImeMmMasEh3qAYa3yaMY",
+  "tool_names": [
+    "sqlserver.customers.list",
+    "mcp.sqlserver.payments.by_status",
+    "postgres.orders.recent",
+    "mcp.postgres.payments.summary"
+  ]
+}

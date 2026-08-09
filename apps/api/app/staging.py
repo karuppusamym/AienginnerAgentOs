@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import Boolean, Column, Float, Integer, MetaData, Table, Text, and_, delete, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
+from .pii import protect_rows
 
 
 IDENTIFIER = re.compile(r"[^a-zA-Z0-9_]+")
@@ -200,12 +201,14 @@ def execute_parameterized_read_only(
             transaction.rollback()
             raise
     truncated = len(rows) > limit
+    protected_rows, pii_columns = protect_rows(columns, [dict(zip(columns, row, strict=False)) for row in rows[:limit]])
     return {
         "columns": columns,
-        "rows": [dict(zip(columns, row, strict=False)) for row in rows[:limit]],
+        "rows": protected_rows,
         "row_count": min(len(rows), limit),
         "truncated": truncated,
         "limit": limit,
+        "protected_columns": pii_columns,
     }
 
 
