@@ -3,6 +3,7 @@ name: datapilot
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: datapilot
       POSTGRES_USER: datapilot
@@ -19,6 +20,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "6380:6379"
@@ -32,6 +34,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.14.1
+    restart: unless-stopped
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -45,6 +48,7 @@ services:
 
   temporal:
     image: temporalio/temporal:1.8.1
+    restart: unless-stopped
     command: ["server", "start-dev", "--ip", "0.0.0.0", "--ui-ip", "0.0.0.0", "--ui-port", "8233"]
     ports:
       - "7233:7233"
@@ -53,6 +57,7 @@ services:
   api:
     build:
       context: ./apps/api
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false
@@ -100,6 +105,7 @@ services:
 
   worker:
     image: datapilot-api
+    restart: unless-stopped
     command: ["python", "-m", "app.worker"]
     env_file:
       - path: .env
@@ -122,10 +128,9 @@ services:
   web:
     build:
       context: ./apps/web
-      args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+    restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      INTERNAL_API_URL: http://api:8000
     ports:
       - "3000:3000"
       - "3001:3000"
@@ -138,6 +143,7 @@ services:
       context: ./infra/superset
     image: datapilot-superset
     profiles: ["analytics"]
+    restart: unless-stopped
     environment:
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-datapilot-local-superset-secret-change-me}
       SUPERSET_CONFIG_PATH: /app/datapilot/superset_config.py
@@ -187,6 +193,15 @@ services:
   # ─── Demo SQL Server 2022 ────────────────────────────────────────────────
   sqlserver-demo:
     image: mcr.microsoft.com/mssql/server:2022-latest
+    # The MSSQL image has no Postgres-style auto-exec convention for
+    # /docker-entrypoint-initdb.d — nothing invokes files placed there on its
+    # own. entrypoint.sh (mounted below) starts sqlservr, waits for it to
+    # accept connections, then runs init.sql to create DemoDB. Without this
+    # override the container starts empty: no DemoDB, no demo schema/tables,
+    # and dependents (e.g. MCP Toolbox) fail with "Cannot open database
+    # DemoDB" even though the container itself reports healthy.
+    entrypoint: ["bash", "/docker-entrypoint-initdb.d/entrypoint.sh"]
+    restart: unless-stopped
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
@@ -197,7 +212,10 @@ services:
       - datapilot_sqlserver:/var/opt/mssql
       - ./infra/sqlserver-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $${MSSQL_SA_PASSWORD:-DataPilot#2026!} -Q 'SELECT 1' -C -b 2>/dev/null || exit 1"]
+      # Explicitly check DemoDB (not just that the server accepts logins) so
+      # a broken/skipped init script surfaces as unhealthy instead of being
+      # masked, which is what let this bug hide for so long.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $${MSSQL_SA_PASSWORD:-DataPilot#2026!} -d DemoDB -Q 'SELECT 1' -C -b 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 20
@@ -206,6 +224,7 @@ services:
   # ─── Demo PostgreSQL 16 ───────────────────────────────────────────────────
   postgres-demo:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: demodb
       POSTGRES_USER: demouser
@@ -224,6 +243,7 @@ services:
   # ─── Google MCP Toolbox ───────────────────────────────────────────────────
   mcp-toolbox:
     image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
+    restart: unless-stopped
     command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000"]
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
