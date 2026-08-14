@@ -41,3 +41,21 @@ def selected_model_provider(db: Session, user: User) -> ModelProvider | None:
             ModelProvider.enabled.is_(True),
         )
     ) or db.scalar(select(ModelProvider).where(ModelProvider.enabled.is_(True)).limit(1))
+
+
+def default_embedding_provider(db: Session) -> ModelProvider | None:
+    """Resolve the ModelProvider whose embedding_model should be used for indexing/search.
+
+    Embeddings are stored in a single global Qdrant collection (search_documents()
+    has no per-project filter — see grounding.glossary_matches), so provider
+    selection here is intentionally global rather than per-user/per-project like
+    selected_model_provider(). We just want "the" active provider: prefer the
+    platform default, otherwise the first enabled provider, otherwise none (the
+    caller falls back to the deterministic hash embedding).
+    """
+    return db.scalar(
+        select(ModelProvider).where(
+            ModelProvider.is_default.is_(True),
+            ModelProvider.enabled.is_(True),
+        )
+    ) or db.scalar(select(ModelProvider).where(ModelProvider.enabled.is_(True)).limit(1))

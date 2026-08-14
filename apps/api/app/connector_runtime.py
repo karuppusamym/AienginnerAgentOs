@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .database import engine
+from .staging import execute_parameterized_read_only
 from .models import Connector
 from .governance import record_governance_event
 from .pii import annotate_columns, protect_rows
@@ -132,39 +134,55 @@ def _mcp_request(
         "Content-Type": "application/json",
         **_mcp_headers(connector.secret_reference),
     }
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
-        initialize_response = client.post(
-            endpoint,
-            headers=headers,
-            json={
-                "jsonrpc": "2.0",
-                "id": "datapilot-initialize",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {"name": "DataPilot", "version": "1.0.0"},
+    try:
+        with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
+            initialize_response = client.post(
+                endpoint,
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "datapilot-initialize",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "DataPilot", "version": "1.0.0"},
+                    },
                 },
-            },
-        )
-        initialized = _mcp_json(initialize_response)
-        if "error" in initialized:
-            raise ConnectorRuntimeError(f"MCP initialize failed: {initialized['error']}")
-        session_id = initialize_response.headers.get("mcp-session-id")
-        session_headers = {**headers, **({"Mcp-Session-Id": session_id} if session_id else {})}
-        notification = client.post(
-            endpoint,
-            headers=session_headers,
-            json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-        )
-        if notification.status_code >= 400:
-            notification.raise_for_status()
-        response = client.post(
-            endpoint,
-            headers=session_headers,
-            json={"jsonrpc": "2.0", "id": "datapilot-call", "method": method, "params": params},
-        )
-        payload = _mcp_json(response)
+            )
+            initialized = _mcp_json(initialize_response)
+            if "error" in initialized:
+                raise ConnectorRuntimeError(f"MCP initialize failed: {initialized['error']}")
+            session_id = initialize_response.headers.get("mcp-session-id")
+            session_headers = {**headers, **({"Mcp-Session-Id": session_id} if session_id else {})}
+            notification = client.post(
+                endpoint,
+                headers=session_headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            )
+            if notification.status_code >= 400:
+                notification.raise_for_status()
+            response = client.post(
+                endpoint,
+                headers=session_headers,
+                json={"jsonrpc": "2.0", "id": "datapilot-call", "method": method, "params": params},
+            )
+            payload = _mcp_json(response)
+    except ConnectorRuntimeError:
+        raise
+    except httpx.ConnectError as exc:
+        raise ConnectorRuntimeError(
+            f"Could not reach the MCP server at {endpoint}: {exc}. "
+            "Confirm the MCP Toolbox container is running and reachable on the API's Docker network."
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise ConnectorRuntimeError(f"The MCP server at {endpoint} timed out after {timeout_seconds}s: {exc}") from exc
+    except httpx.HTTPStatusError as exc:
+        raise ConnectorRuntimeError(f"The MCP server at {endpoint} returned HTTP {exc.response.status_code}") from exc
+    except httpx.HTTPError as exc:
+        raise ConnectorRuntimeError(f"MCP request to {endpoint} failed: {type(exc).__name__}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConnectorRuntimeError(f"The MCP server at {endpoint} returned invalid JSON: {exc}") from exc
     if "error" in payload:
         raise ConnectorRuntimeError(f"MCP {method} failed: {payload['error']}")
     result = payload.get("result")
@@ -605,6 +623,30 @@ def execute_connector_query(
     started = time.perf_counter()
     try:
         normalized = _validate_read_only_query(sql)
+        if connector.connector_type == "local_files":
+            result_payload = execute_parameterized_read_only(
+                engine,
+                normalized,
+                parameters,
+                limit,
+                timeout_seconds,
+            )
+            result_payload["duration_ms"] = round((time.perf_counter() - started) * 1000)
+            record_governance_event(
+                "connector_query",
+                connector.connector_type,
+                "succeeded",
+                project_id=connector.project_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                feature=feature,
+                connector_id=connector.id,
+                row_count=result_payload["row_count"],
+                duration_ms=result_payload["duration_ms"],
+                read_only=True,
+            )
+            return result_payload
         if getattr(connector, "connection_mode", "direct") == "mcp":
             result_payload = execute_mcp_tool(
                 connector,

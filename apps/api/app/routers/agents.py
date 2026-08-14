@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -307,8 +307,7 @@ def list_agents(_: User = Depends(get_current_user), db: Session = Depends(get_d
 
 @router.post("/agents", status_code=201)
 def create_agent(payload: AgentDefinitionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     project = require_current_project(db, user)
     if db.scalar(select(AgentDefinition).where(func.lower(AgentDefinition.name) == payload.name.lower())):
         raise HTTPException(status_code=409, detail="An agent with this name already exists")
@@ -450,8 +449,7 @@ def get_agent_scorecard(
 
 @router.put("/agents/{agent_id}")
 def update_agent(agent_id: str, payload: AgentDefinitionUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     agent = db.get(AgentDefinition, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -466,8 +464,7 @@ def update_agent(agent_id: str, payload: AgentDefinitionUpdate, user: User = Dep
 
 @router.post("/agents/{agent_id}/versions", status_code=201)
 def create_agent_version(agent_id: str, payload: AgentVersionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     project = require_current_project(db, user)
     agent = db.get(AgentDefinition, agent_id)
     if agent is None:
@@ -487,8 +484,7 @@ def create_agent_version(agent_id: str, payload: AgentVersionCreate, user: User 
 
 @router.post("/agents/{agent_id}/versions/{version_number}/publish")
 def publish_agent_version(agent_id: str, version_number: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     version = db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent_id, AgentVersion.version == version_number))
     if version is None:
         raise HTTPException(status_code=404, detail="Agent version not found")

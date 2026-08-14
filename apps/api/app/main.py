@@ -147,6 +147,7 @@ def startup() -> None:
                         "table_name": asset.table_name,
                         "tags": asset.tags,
                     },
+                    db=db,
                 )
             except Exception:
                 pass
@@ -250,6 +251,8 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     role: Literal["admin", "engineer", "analyst", "viewer"] | None = None
     active: bool | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
 
 
 class PasswordChange(BaseModel):
@@ -392,7 +395,8 @@ class SQLRequest(BaseModel):
 
 class SQLExecutionRequest(BaseModel):
     sql: str = Field(min_length=1, max_length=100_000)
-    dialect: Literal["postgres"] = "postgres"
+    dialect: Literal["postgres", "sqlserver", "oracle", "teradata", "bigquery"] = "postgres"
+    connector_id: str | None = None
     limit: int = Field(default=500, ge=1, le=1000)
 
 
@@ -658,6 +662,10 @@ class ConversationCreate(BaseModel):
     title: str = Field(default="New analysis", min_length=1, max_length=200)
 
 
+class ConversationRename(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
 class ConversationAsk(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     dialect: Literal["sqlserver", "oracle", "teradata", "bigquery", "postgres"] = "postgres"
@@ -820,19 +828,21 @@ def require_role(user: User, allowed: set[str], detail: str) -> User:
     return user
 
 
-def require_permission(user: User, permission: str, detail: str | None = None) -> User:
+def require_permission(user: User, db: Session, permission: str, detail: str | None = None) -> User:
     """Authorize against the same granular permission map exposed by /auth/me."""
-    if "*" not in project_permissions(user, None) and permission not in project_permissions(user, None):
+    membership = current_membership(db, user)
+    membership_role = membership.role if membership else None
+    if "*" not in project_permissions(user, membership_role) and permission not in project_permissions(user, membership_role):
         raise HTTPException(status_code=403, detail=detail or f"Permission required: {permission}")
     return user
 
 
-def require_data_editor(user: User) -> User:
-    return require_permission(user, "catalog:write", "Catalog write permission required")
+def require_data_editor(user: User, db: Session) -> User:
+    return require_permission(user, db, "catalog:write", "Catalog write permission required")
 
 
-def require_workspace_editor(user: User) -> User:
-    return require_permission(user, "conversation:write", "Workspace write permission required")
+def require_workspace_editor(user: User, db: Session) -> User:
+    return require_permission(user, db, "conversation:write", "Workspace write permission required")
 
 
 def require_project_resource(resource: Any, project: Project, label: str) -> Any:
@@ -1817,7 +1827,7 @@ def require_semantic_maintainer(db: Session, user: User, project_id: str) -> Non
     membership = current_membership(db, user)
     if membership is None or membership.project_id != project_id or (user.role not in {"admin", "engineer"} and membership.role not in {"owner", "maintainer"}):
         raise HTTPException(status_code=403, detail="Project maintainer access required")
-    require_permission(user, "semantic:write", "Semantic write permission required")
+    require_permission(user, db, "semantic:write", "Semantic write permission required")
 
 
 def run_agent_evaluation_case(

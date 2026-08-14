@@ -116,7 +116,7 @@ from ..superset_client import create_editor_url, create_guest_token
 from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
-from ..vector_store import delete_document, index_document, search_documents
+from ..vector_store import chunk_glossary_text, delete_document, index_document, search_documents
 from fastapi import APIRouter
 
 from .. import main
@@ -246,7 +246,7 @@ def update_dataset_metadata(
     staging, or pipeline publish) with no way for a human to edit or enrich the
     description/tags afterward. See docs/IMPLEMENTATION_STATUS_MATRIX.md section 5.
     """
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     asset = db.get(DataAsset, asset_id)
     require_project_resource(asset, project, "Dataset")
@@ -314,7 +314,7 @@ def import_dataset_metadata(
     grouped into a single DataAsset, created with metadata_status
     "manual_import" or updated if it already exists in this project.
     """
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix != ".csv":
@@ -395,32 +395,6 @@ def import_dataset_metadata(
     return {"tables": len(grouped), "columns_processed": row_count, "created": created, "updated": updated}
 
 
-def _chunk_glossary_text(text: str, chunk_size: int = 1500, overlap: int = 150) -> list[str]:
-    """Split into overlapping chunks so each vector point stays specific.
-
-    embed_text() (see vector_store.py) is a bag-of-tokens hash, not a real
-    semantic embedding — feeding it one giant multi-page document as a
-    single point would dilute every chunk's distinguishing tokens into one
-    blurry average vector. Indexing per-chunk keeps each point's vocabulary
-    narrow enough for the hash-based scorer (and any real embedding model
-    wired in later, see model_runtime.py) to actually discriminate between
-    passages about different topics in the same document.
-    """
-    normalized = re.sub(r"\n{3,}", "\n\n", text.strip())
-    if len(normalized) <= chunk_size:
-        return [normalized] if normalized else []
-    chunks: list[str] = []
-    start = 0
-    while start < len(normalized):
-        end = min(start + chunk_size, len(normalized))
-        boundary = normalized.rfind("\n\n", start, end)
-        if boundary <= start:
-            boundary = end
-        chunks.append(normalized[start:boundary].strip())
-        start = max(boundary - overlap, start + 1) if boundary < len(normalized) else end
-    return [chunk for chunk in chunks if chunk]
-
-
 @router.post("/glossary", status_code=201)
 def upload_glossary_document(
     title: str = Form(...),
@@ -440,7 +414,7 @@ def upload_glossary_document(
     alongside catalog/semantic/join matches for SQL generation and the
     agent planner.
     """
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     if not file and not (text_content or "").strip():
         raise HTTPException(status_code=400, detail="Provide either a file or text_content")
@@ -487,7 +461,7 @@ def upload_glossary_document(
     db.add(document)
     db.flush()
 
-    chunks = _chunk_glossary_text(extracted)
+    chunks = chunk_glossary_text(extracted)
     indexed_chunks = 0
     for index, chunk in enumerate(chunks):
         try:
@@ -496,6 +470,7 @@ def upload_glossary_document(
                 document.title,
                 chunk,
                 {"source_type": "glossary", "document_id": document.id, "chunk_index": index, "chunk_count": len(chunks)},
+                db=db,
             ):
                 indexed_chunks += 1
         except Exception:
@@ -537,7 +512,7 @@ def list_glossary_documents(user: User = Depends(get_current_user), db: Session 
 
 @router.delete("/glossary/{document_id}")
 def delete_glossary_document(document_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     document = db.get(GlossaryDocument, document_id)
     require_project_resource(document, project, "Glossary document")
@@ -604,7 +579,7 @@ def search_workspace(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     project = require_current_project(db, user)
-    vector_results = search_documents(q, limit)
+    vector_results = search_documents(q, limit, db=db)
     normalized = q.lower()
     keyword_results = []
     project_asset_ids: set[str] = set()

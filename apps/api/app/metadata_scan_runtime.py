@@ -118,6 +118,7 @@ def execute_metadata_scan(connector_id: str, job_id: str, actor_id: str) -> dict
                         f"{asset.schema_name}.{asset.table_name}",
                         f"{asset.description or ''} Columns: " + ", ".join(column.get("name", "") for column in asset.columns),
                         {"source_type": "dataset", "schema_name": asset.schema_name, "table_name": asset.table_name, "tags": asset.tags},
+                        db=db,
                     )
                 except Exception:
                     pass

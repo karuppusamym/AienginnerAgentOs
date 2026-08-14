@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -211,7 +211,25 @@ def semantic_graph(
     project = require_current_project(db, user)
     assets = db.scalars(select(DataAsset).where(DataAsset.project_id == project.id).order_by(DataAsset.table_name)).all()
     policies = db.scalars(select(SemanticJoinPolicy).where(SemanticJoinPolicy.project_id == project.id)).all()
-    nodes = [{"id": asset.id, "relation": f"{asset.schema_name}.{asset.table_name}", "columns": column_names_for_asset(asset), "metadata_status": asset.metadata_status} for asset in assets]
+    # Two different sources can legitimately catalog a table under the same
+    # schema.table name (e.g. a locally-seeded "core.accounts" demo table and
+    # an externally-scanned "core.accounts" from a SQL Server connector are
+    # both real, distinct DataAsset rows — this isn't a data bug). The graph
+    # used to label both nodes with the bare "schema.table" string, so they
+    # were visually and even on-hover indistinguishable — a real UX gap
+    # noticed live in this project's own graph (two identical "core.accounts"
+    # nodes). Disambiguate only the relations that actually collide, so every
+    # already-unique relation keeps its plain, familiar label.
+    connector_names = {connector.id: connector.name for connector in db.scalars(select(Connector).where(Connector.project_id == project.id)).all()}
+    bare_relations = [f"{asset.schema_name}.{asset.table_name}" for asset in assets]
+    duplicate_relations = {relation for relation in bare_relations if bare_relations.count(relation) > 1}
+    nodes = []
+    for asset, bare_relation in zip(assets, bare_relations):
+        relation = bare_relation
+        if bare_relation in duplicate_relations:
+            source_label = connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
+            relation = f"{bare_relation} ({source_label})"
+        nodes.append({"id": asset.id, "relation": relation, "columns": column_names_for_asset(asset), "metadata_status": asset.metadata_status})
     edges = [{"id": policy.id, "source": policy.left_asset_id, "target": policy.right_asset_id, "left_column": policy.left_column, "right_column": policy.right_column, "join_type": policy.join_type, "status": policy.status, "governed": True} for policy in policies]
     if include_inferred:
         for index, left in enumerate(assets):
@@ -237,9 +255,7 @@ def list_semantic_metrics(
     resolved_project_id = project_id or (membership.project_id if membership else None)
     if resolved_project_id is None:
         return []
-    allowed = user.role == "admin" or db.scalar(select(ProjectMembership).where(ProjectMembership.project_id == resolved_project_id, ProjectMembership.user_id == user.id))
-    if not allowed:
-        raise HTTPException(status_code=403, detail="Project membership required")
+    require_permission(user, db, "semantic:read", "Project membership required")
     metrics = db.scalars(select(SemanticMetric).where(SemanticMetric.project_id == resolved_project_id).order_by(SemanticMetric.name)).all()
     return [as_dict(metric, ["id", "project_id", "asset_id", "name", "description", "formula", "grain", "owner", "dimensions", "synonyms", "status", "created_at", "updated_at"]) for metric in metrics]
 
@@ -252,8 +268,7 @@ def create_semantic_metric(
     membership = main.current_membership(db, user)
     if membership is None:
         raise HTTPException(status_code=409, detail="Select a project first")
-    if user.role not in {"admin", "engineer"} and membership.role not in {"owner", "maintainer"}:
-        raise HTTPException(status_code=403, detail="Project maintainer access required")
+    require_permission(user, db, "semantic:write", "Project maintainer access required")
     if payload.asset_id:
         asset = db.get(DataAsset, payload.asset_id)
         if asset is None or asset.project_id != membership.project_id:
@@ -276,8 +291,9 @@ def update_semantic_metric(
     membership = main.current_membership(db, user)
     if metric is None:
         raise HTTPException(status_code=404, detail="Metric not found")
-    if membership is None or (user.role != "admin" and (membership.project_id != metric.project_id or membership.role not in {"owner", "maintainer"})):
+    if membership is None or metric.project_id != membership.project_id:
         raise HTTPException(status_code=403, detail="Project maintainer access required")
+    require_permission(user, db, "semantic:write", "Project maintainer access required")
     if payload.asset_id:
         asset = db.get(DataAsset, payload.asset_id)
         if asset is None or asset.project_id != metric.project_id:
@@ -298,8 +314,9 @@ def delete_semantic_metric(
     membership = main.current_membership(db, user)
     if metric is None:
         raise HTTPException(status_code=404, detail="Metric not found")
-    if membership is None or (user.role != "admin" and (membership.project_id != metric.project_id or membership.role not in {"owner", "maintainer"})):
+    if membership is None or metric.project_id != membership.project_id:
         raise HTTPException(status_code=403, detail="Project maintainer access required")
+    require_permission(user, db, "semantic:write", "Project maintainer access required")
     audit(db, user, "semantic_metric.deleted", "semantic_metric", metric.id)
     db.delete(metric)
     db.commit()
@@ -315,9 +332,7 @@ def list_semantic_join_policies(
     resolved_project_id = project_id or (membership.project_id if membership else None)
     if resolved_project_id is None:
         return []
-    allowed = user.role == "admin" or db.scalar(select(ProjectMembership).where(ProjectMembership.project_id == resolved_project_id, ProjectMembership.user_id == user.id))
-    if not allowed:
-        raise HTTPException(status_code=403, detail="Project membership required")
+    require_permission(user, db, "semantic:read", "Project membership required")
     policies = db.scalars(select(SemanticJoinPolicy).where(SemanticJoinPolicy.project_id == resolved_project_id).order_by(SemanticJoinPolicy.updated_at.desc())).all()
     return [semantic_join_policy_output(policy) for policy in policies]
 

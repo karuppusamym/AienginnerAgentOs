@@ -43,6 +43,12 @@ def _message_text(payload: dict) -> str:
     candidates = payload.get("candidates") or []
     if candidates:
         parts = candidates[0].get("content", {}).get("parts") or []
+        # Reasoning-capable Gemini models can emit a hidden "thought" part
+        # ahead of the real answer. Skip those so a thinking trace never gets
+        # mistaken for the structured output the caller actually asked for.
+        answer_parts = [part for part in parts if not part.get("thought")]
+        if answer_parts:
+            return str(answer_parts[0].get("text", ""))
         if parts:
             return str(parts[0].get("text", ""))
     return ""
@@ -113,7 +119,16 @@ def generate_text(
                     json={
                         "systemInstruction": {"parts": [{"text": system_prompt}]},
                         "contents": [{"parts": [{"text": user_prompt}]}],
-                        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0},
+                        "generationConfig": {
+                            "maxOutputTokens": max_tokens,
+                            "temperature": 0,
+                            # Structured/governed calls need the visible answer, not a
+                            # chain-of-thought trace. Without this, reasoning-capable
+                            # Gemini models can spend the whole maxOutputTokens budget
+                            # on hidden "thinking" tokens and return an empty answer
+                            # part, which then fails downstream JSON parsing.
+                            "thinkingConfig": {"thinkingBudget": 0},
+                        },
                     },
                 )
             elif provider.provider_type == "claude":
@@ -238,7 +253,10 @@ def test_provider(
                 response = client.post(
                     f"{base_url}/models/{provider.default_model}:generateContent",
                     headers={"x-goog-api-key": secret},
-                    json={"contents": [{"parts": [{"text": "Reply with OK only."}]}]},
+                    json={
+                        "contents": [{"parts": [{"text": "Reply with OK only."}]}],
+                        "generationConfig": {"thinkingConfig": {"thinkingBudget": 0}},
+                    },
                 )
             elif provider.provider_type == "claude":
                 base_url = (provider.base_url or "https://api.anthropic.com/v1").rstrip("/")

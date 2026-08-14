@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -228,7 +228,7 @@ def save_artifact(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     if payload.artifact_id:
         artifact = db.get(Artifact, payload.artifact_id)
@@ -351,7 +351,7 @@ def add_artifact_comment(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     artifact = require_project_resource(db.get(Artifact, artifact_id), project, "Artifact")
     if payload.version is not None and db.scalar(
@@ -381,8 +381,8 @@ def review_artifact(
 ) -> dict[str, Any]:
     project = require_current_project(db, user)
     artifact = require_project_resource(db.get(Artifact, artifact_id), project, "Artifact")
-    if payload.decision == "approved" and user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required for approval")
+    if payload.decision == "approved":
+        require_permission(user, db, "jobs:write", "Approving an artifact requires jobs:write permission")
     artifact.status = payload.decision
     artifact.updated_at = datetime.now(timezone.utc)
     if payload.note:

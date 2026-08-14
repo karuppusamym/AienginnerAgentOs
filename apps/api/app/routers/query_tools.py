@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -356,8 +356,7 @@ def query_tool_analytics(
 
 @router.post("/query-tools", status_code=201)
 def create_query_tool(payload: QueryToolCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     project = require_current_project(db, user)
     _validate_query_tool_contract(payload, db, project)
     if db.scalar(select(QueryTool).where(QueryTool.project_id == project.id, QueryTool.name == payload.name)):
@@ -373,8 +372,7 @@ def create_query_tool(payload: QueryToolCreate, user: User = Depends(get_current
 
 @router.put("/query-tools/{tool_id}")
 def update_query_tool(tool_id: str, payload: QueryToolCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     project = require_current_project(db, user)
     tool = db.get(QueryTool, tool_id)
     if tool is None or tool.project_id != project.id:
@@ -430,17 +428,34 @@ def test_query_tool(tool_id: str, payload: QueryToolInvoke, user: User = Depends
     if tool is None or tool.project_id != project.id:
         raise HTTPException(status_code=404, detail="Query tool not found")
     _validate_tool_parameters(tool.parameter_schema, payload.parameters)
-    if tool.connector_id:
-        connector = require_project_resource(db.get(Connector, tool.connector_id), project, "Connector")
-        result = main.execute_connector_query(
-            connector, tool.sql_template, payload.parameters, tool.row_limit, tool.timeout_seconds,
-            upstream_tool_name=tool.upstream_tool_name,
-            user_id=user.id,
-            session_id=tool.id,
-            feature="query_tool_test",
-        )
-    else:
-        result = execute_parameterized_read_only(engine, tool.sql_template, payload.parameters, tool.row_limit, tool.timeout_seconds)
+    try:
+        if tool.connector_id:
+            connector = require_project_resource(db.get(Connector, tool.connector_id), project, "Connector")
+            result = main.execute_connector_query(
+                connector, tool.sql_template, payload.parameters, tool.row_limit, tool.timeout_seconds,
+                upstream_tool_name=tool.upstream_tool_name,
+                user_id=user.id,
+                session_id=tool.id,
+                feature="query_tool_test",
+            )
+        else:
+            result = execute_parameterized_read_only(engine, tool.sql_template, payload.parameters, tool.row_limit, tool.timeout_seconds)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Bug fix: this endpoint used to let any connector/execution failure
+        # (bad/missing credentials, unreachable host, a query tool built
+        # against an offline demo-only connector, etc.) propagate as a bare,
+        # unhandled 500 "Internal Server Error" with zero diagnostic detail --
+        # found live while testing "transactions.lookup" against the
+        # "Banking demo warehouse" connector, which has no secret_reference
+        # configured (it's a schema-browsing-only demo connector, not one
+        # wired for live execution). The external invoke path
+        # (_invoke_external_query_tool in main.py) already converts the same
+        # class of failure into an informative 422; mirror that here so the
+        # Catalog wizard's own "Test" button surfaces an actionable message
+        # instead of a dead end.
+        raise HTTPException(status_code=422, detail=f"Query tool test failed: {exc}") from exc
     audit(db, user, "query_tool.tested", "query_tool", tool.id, {"row_count": result["row_count"]})
     if tool.status == "draft":
         tool.status = "tested"

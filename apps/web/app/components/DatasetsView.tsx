@@ -106,7 +106,7 @@ import {
 import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
 
 
-export function DatasetsView({ onOpenSQL, notify }: { onOpenSQL: (dataset: Dataset) => void; notify?: (message: string, tone?: "ok" | "error") => void }) {
+export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL: (dataset: Dataset) => void; onStartAnalysis?: (dataset: Dataset) => void; notify?: (message: string, tone?: "ok" | "error") => void }) {
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
@@ -248,6 +248,7 @@ export function DatasetsView({ onOpenSQL, notify }: { onOpenSQL: (dataset: Datas
                 ))}
               </div>
               <button className="secondary-button wide" onClick={openEdit}><FileSpreadsheet size={17} />Review / edit metadata</button>
+              <button className="secondary-button wide" onClick={() => onStartAnalysis?.(selected)}><MessageSquare size={17} />Start analysis</button>
               <button className="secondary-button wide" onClick={() => onOpenSQL(selected)}><Code2 size={17} />Open in SQL workspace</button>
             </>
           ) : <LoadingBlock label="Loading catalog" />}

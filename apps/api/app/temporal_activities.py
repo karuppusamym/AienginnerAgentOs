@@ -169,6 +169,65 @@ def _llm_parameters_for_tool(
     return parameters
 
 
+def _reflect_on_tool_error(db, provider, tool_name, schema, objective, parameters, error_msg, project_id, job):
+    if provider is None or provider.provider_type == "local_mock":
+        return None
+    schema_text = json.dumps({"required": schema.get("required", []), "properties": schema.get("properties", {})}, default=str)
+    try:
+        generated = generate_text(
+            provider,
+            "You are an agent recovering from a tool execution failure. Return strict JSON only: a single object whose keys are exactly the required parameter names. Provide corrected parameters to fix the error.",
+            f"Tool: {tool_name}\nParameter schema: {schema_text}\nObjective: {objective[:500]}\nPrevious Parameters: {json.dumps(parameters, default=str)}\nError Encountered: {error_msg[:1000]}",
+            300,
+            governance_feature="agent_tool_reflection",
+            governance_business_id=project_id,
+            governance_session_id=job.id,
+            governance_user_id=job.created_by,
+        )
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", generated.content.strip(), flags=re.I)
+        new_params = json.loads(content)
+        if not isinstance(new_params, dict) or not new_params:
+            return None
+        validate_parameters(schema, new_params)
+        for name, value in new_params.items():
+            model = _ID_LOOKUP_MODELS.get(name)
+            if model:
+                row = db.get(model, str(value)) if isinstance(value, str) else None
+                if not row or getattr(row, "project_id", None) != project_id:
+                    return None
+        return new_params
+    except Exception:
+        return None
+
+def _review_plan_outputs(provider, objective, plan, outputs, enabled_agent_names, project_id, job):
+    if provider is None or provider.provider_type == "local_mock":
+        return []
+    try:
+        generated = generate_text(
+            provider,
+            f"You are the Reviewer agent for a data engineering product. Configured agents are {', '.join(sorted(enabled_agent_names))}. Review the outputs of the executed steps against the original objective. Is the objective fully met? If yes, return an empty array []. If no, propose up to 2 new steps to append to the plan to solve the objective. Return strict JSON only: an array of objects with 'agent' and 'action' string fields.",
+            f"Objective: {objective}\nPlan so far:\n{json.dumps(plan, default=str)}\nOutputs from latest steps:\n{json.dumps(outputs[-3:], default=str)}",
+            400,
+            governance_feature="agent_plan_review",
+            governance_business_id=project_id,
+            governance_session_id=job.id,
+            governance_user_id=job.created_by,
+        )
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", generated.content.strip(), flags=re.I)
+        new_steps = json.loads(content)
+        if not isinstance(new_steps, list):
+            return []
+        valid_steps = []
+        for step in new_steps:
+            agent = str(step.get("agent", ""))
+            action = str(step.get("action", ""))
+            if agent in enabled_agent_names and action:
+                valid_steps.append({"agent": agent, "action": action[:500], "status": "complete"})
+        return valid_steps[:2]
+    except Exception:
+        return []
+
+
 DETERMINISTIC_POLICY_KEYWORDS = (
     "schedule", "write", "create table", "publish", "deploy", "execute", "delete",
     "drop", "alter", "truncate", "grant", "revoke", "export", "send", "email",
@@ -176,7 +235,6 @@ DETERMINISTIC_POLICY_KEYWORDS = (
 
 
 def _plan_requires_deterministic_approval(plan: list[dict]) -> bool:
-    """The configurable Policy agent can explain this result, but cannot weaken it."""
     return any(
         any(keyword in str(step.get("action", "")).lower() for keyword in DETERMINISTIC_POLICY_KEYWORDS)
         for step in plan
@@ -257,49 +315,68 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
             if parameters is None:
                 continue
             calls_remaining -= 1
-            try:
-                result, attempts, duration_ms = execute_tool(
-                    db,
-                    tool_version.implementation_type,
-                    tool_version.handler_name,
-                    tool_version.endpoint,
-                    tool_version.http_method,
-                    tool_version.parameter_schema,
-                    parameters,
-                    job.project_id,
-                    tool_version.timeout_seconds,
-                    tool_version.max_retries,
-                    tool_version.retry_backoff_seconds,
-                    user_id=job.created_by,
-                    session_id=job.id,
-                )
-                count = result.get("count", result.get("row_count", "completed")) if isinstance(result, dict) else "completed"
-                evidence.append({"type": "tool", "label": f"{agent.name} used {tool.name}: {count}", "tool": tool.name, "parameters": parameters, "parameter_source": parameter_source})
-                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} completed {tool.name} in {duration_ms} ms ({attempts} attempt(s))"})
-                outputs.append(
-                    {
-                        "type": "tool_result",
-                        "agent": agent.name,
-                        "tool": tool.name,
-                        "title": f"{agent.name} -> {tool.name}",
-                        "summary": f"{tool.name} completed in {duration_ms} ms",
-                        "data": summarize_tool_result(result),
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-            except ToolRuntimeError as exc:
-                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} skipped {tool.name}: {str(exc)[:300]}"})
-                outputs.append(
-                    {
-                        "type": "tool_error",
-                        "agent": agent.name,
-                        "tool": tool.name,
-                        "title": f"{agent.name} -> {tool.name}",
-                        "summary": str(exc)[:300],
-                        "data": {"error": str(exc)[:500]},
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+            for attempt_idx in range(3):
+                try:
+                    result, attempts, duration_ms = execute_tool(
+                        db,
+                        tool_version.implementation_type,
+                        tool_version.handler_name,
+                        tool_version.endpoint,
+                        tool_version.http_method,
+                        tool_version.parameter_schema,
+                        parameters,
+                        job.project_id,
+                        tool_version.timeout_seconds,
+                        tool_version.max_retries,
+                        tool_version.retry_backoff_seconds,
+                        user_id=job.created_by,
+                        session_id=job.id,
+                    )
+                    count = result.get("count", result.get("row_count", "completed")) if isinstance(result, dict) else "completed"
+                    evidence.append({"type": "tool", "label": f"{agent.name} used {tool.name}: {count}", "tool": tool.name, "parameters": parameters, "parameter_source": parameter_source})
+                    logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} completed {tool.name} in {duration_ms} ms ({attempts} attempt(s))"})
+                    outputs.append(
+                        {
+                            "type": "tool_result",
+                            "agent": agent.name,
+                            "tool": tool.name,
+                            "title": f"{agent.name} -> {tool.name}",
+                            "summary": f"{tool.name} completed in {duration_ms} ms",
+                            "data": summarize_tool_result(result),
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    break
+                except ToolRuntimeError as exc:
+                    if attempt_idx < 2:
+                        logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} encountered error with {tool.name}, attempting reflection..."})
+                        outputs.append({
+                            "type": "tool_reflection",
+                            "agent": agent.name,
+                            "tool": tool.name,
+                            "title": f"Reflection triggered for {tool.name}",
+                            "summary": "Repairing parameters...",
+                            "data": {"error": str(exc)[:500]},
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        new_params = _reflect_on_tool_error(db, provider, tool.name, tool_version.parameter_schema, objective, parameters, str(exc), job.project_id, job)
+                        if new_params:
+                            parameters = new_params
+                            parameter_source = "reflection"
+                            continue
+                    logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} skipped {tool.name}: {str(exc)[:300]}"})
+                    outputs.append(
+                        {
+                            "type": "tool_error",
+                            "agent": agent.name,
+                            "tool": tool.name,
+                            "title": f"{agent.name} -> {tool.name}",
+                            "summary": str(exc)[:300],
+                            "data": {"error": str(exc)[:500]},
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    break
         query_tool_names = (version.query_tool_names if version else agent.query_tool_names) or []
         for query_tool_name in query_tool_names:
             if calls_remaining <= 0:
@@ -325,59 +402,78 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
             except ToolRuntimeError:
                 continue
             calls_remaining -= 1
-            started = datetime.now(timezone.utc)
-            try:
-                result = _execute_bound_query_tool(db, job, query_tool, parameters)
-                duration_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-                record_governance_event(
-                    "agent_bound_query_tool",
-                    query_tool.name,
-                    "succeeded",
-                    project_id=job.project_id,
-                    user_id=job.created_by,
-                    session_id=job.id,
-                    feature="agent_bound_query_tool",
-                    query_tool_id=query_tool.id,
-                    row_count=result.get("row_count") if isinstance(result, dict) else None,
-                    duration_ms=duration_ms,
-                )
-                evidence.append({"type": "query_tool", "label": f"{agent.name} used {query_tool.name}: {result.get('row_count', 'completed') if isinstance(result, dict) else 'completed'}", "tool": query_tool.name, "parameters": parameters, "parameter_source": parameter_source})
-                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} completed SQL query tool {query_tool.name} in {duration_ms} ms"})
-                outputs.append(
-                    {
-                        "type": "query_tool_result",
-                        "agent": agent.name,
-                        "tool": query_tool.name,
-                        "title": f"{agent.name} -> {query_tool.name}",
-                        "summary": f"{query_tool.name} completed in {duration_ms} ms",
-                        "data": summarize_tool_result(result),
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-            except (ToolRuntimeError, ConnectorRuntimeError, ValueError) as exc:
-                record_governance_event(
-                    "agent_bound_query_tool",
-                    query_tool.name,
-                    "failed",
-                    project_id=job.project_id,
-                    user_id=job.created_by,
-                    session_id=job.id,
-                    feature="agent_bound_query_tool",
-                    query_tool_id=query_tool.id,
-                    error_type=type(exc).__name__,
-                )
-                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} skipped {query_tool.name}: {str(exc)[:300]}"})
-                outputs.append(
-                    {
-                        "type": "tool_error",
-                        "agent": agent.name,
-                        "tool": query_tool.name,
-                        "title": f"{agent.name} -> {query_tool.name}",
-                        "summary": str(exc)[:300],
-                        "data": {"error": str(exc)[:500]},
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+            for attempt_idx in range(3):
+                started = datetime.now(timezone.utc)
+                try:
+                    result = _execute_bound_query_tool(db, job, query_tool, parameters)
+                    duration_ms = round((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                    record_governance_event(
+                        "agent_bound_query_tool",
+                        query_tool.name,
+                        "succeeded",
+                        project_id=job.project_id,
+                        user_id=job.created_by,
+                        session_id=job.id,
+                        feature="agent_bound_query_tool",
+                        query_tool_id=query_tool.id,
+                        row_count=result.get("row_count") if isinstance(result, dict) else None,
+                        duration_ms=duration_ms,
+                    )
+                    evidence.append({"type": "query_tool", "label": f"{agent.name} used {query_tool.name}: {result.get('row_count', 'completed') if isinstance(result, dict) else 'completed'}", "tool": query_tool.name, "parameters": parameters, "parameter_source": parameter_source})
+                    logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} completed SQL query tool {query_tool.name} in {duration_ms} ms"})
+                    outputs.append(
+                        {
+                            "type": "query_tool_result",
+                            "agent": agent.name,
+                            "tool": query_tool.name,
+                            "title": f"{agent.name} -> {query_tool.name}",
+                            "summary": f"{query_tool.name} completed in {duration_ms} ms",
+                            "data": summarize_tool_result(result),
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    break
+                except (ToolRuntimeError, ConnectorRuntimeError, ValueError) as exc:
+                    if attempt_idx < 2:
+                        logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} encountered error with {query_tool.name}, attempting reflection..."})
+                        outputs.append({
+                            "type": "tool_reflection",
+                            "agent": agent.name,
+                            "tool": query_tool.name,
+                            "title": f"Reflection triggered for {query_tool.name}",
+                            "summary": "Repairing parameters...",
+                            "data": {"error": str(exc)[:500]},
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        new_params = _reflect_on_tool_error(db, provider, query_tool.name, query_tool.parameter_schema, objective, parameters, str(exc), job.project_id, job)
+                        if new_params:
+                            parameters = new_params
+                            parameter_source = "reflection"
+                            continue
+                    record_governance_event(
+                        "agent_bound_query_tool",
+                        query_tool.name,
+                        "failed",
+                        project_id=job.project_id,
+                        user_id=job.created_by,
+                        session_id=job.id,
+                        feature="agent_bound_query_tool",
+                        query_tool_id=query_tool.id,
+                        error_type=type(exc).__name__,
+                    )
+                    logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} skipped {query_tool.name}: {str(exc)[:300]}"})
+                    outputs.append(
+                        {
+                            "type": "tool_error",
+                            "agent": agent.name,
+                            "tool": query_tool.name,
+                            "title": f"{agent.name} -> {query_tool.name}",
+                            "summary": str(exc)[:300],
+                            "data": {"error": str(exc)[:500]},
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    break
     return evidence, logs, outputs
 
 
@@ -509,12 +605,47 @@ def _execute_agent_plan(job_id: str, objective: str) -> dict:
                 db.commit()
                 record_governance_event("agent_run", "deterministic_policy", "approval_required", project_id=job.project_id, user_id=job.created_by, session_id=job.id, feature="agent_policy")
                 return {"status": "WAITING_FOR_APPROVAL", "job_id": job.id}
-            tool_evidence, tool_logs, tool_outputs = _execute_bound_tools(db, job, plan, objective, provider)
+            
+            executed_plan_steps = 0
+            tool_evidence, tool_logs, tool_outputs = [], [], []
+            review_iterations = 0
+            while executed_plan_steps < len(plan) and len(plan) <= 12 and review_iterations < 3:
+                current_slice = plan[executed_plan_steps:]
+                slice_evidence, slice_logs, slice_outputs = _execute_bound_tools(db, job, current_slice, objective, provider)
+                tool_evidence.extend(slice_evidence)
+                tool_logs.extend(slice_logs)
+                tool_outputs.extend(slice_outputs)
+                executed_plan_steps += len(current_slice)
+                
+                if provider and provider.provider_type != "local_mock" and executed_plan_steps >= len(plan) and len(plan) < 12 and review_iterations < 2:
+                    new_steps = _review_plan_outputs(provider, objective, plan, tool_outputs, enabled_agent_names, job.project_id, job)
+                    if new_steps:
+                        plan.extend(new_steps)
+                        review_iterations += 1
+                        tool_logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Reviewer agent appended {len(new_steps)} new steps to the plan."})
+                        trace_outputs.append({
+                            "type": "plan_review",
+                            "agent": "Reviewer",
+                            "title": "Agentic Plan-and-Solve Review",
+                            "summary": f"Appended {len(new_steps)} new step(s) to solve objective",
+                            "data": new_steps,
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        })
+                    else:
+                        break
+                else:
+                    break
+
             job.evidence = [
                 {"type": "catalog", "label": f"{len(grounding['catalog_matches'])} grounded catalog matches retrieved"},
                 {"type": "vector", "label": f"{len(grounding['vector_hits'])} vector hits retrieved"},
                 {"type": "semantic", "label": f"{len(grounding['semantic_matches'])} semantic metrics evaluated"},
                 {"type": "policy", "label": "Read-only and bounded-run policies passed"},
+                *(
+                    [{"type": "planning_fallback", "label": "Model planning failed — used deterministic fallback plan"}]
+                    if model_log and model_log.get("level") == "warning"
+                    else []
+                ),
                 *tool_evidence,
             ]
             job.outputs = [*trace_outputs, *tool_outputs]

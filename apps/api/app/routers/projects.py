@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -217,8 +217,7 @@ def create_project(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "catalog:write", "Catalog write permission required")
     base_slug = re.sub(r"[^a-z0-9]+", "-", payload.name.lower()).strip("-") or "project"
     slug = base_slug
     counter = 2
@@ -306,8 +305,7 @@ def set_project_model_provider(
     membership = db.scalar(select(ProjectMembership).where(ProjectMembership.project_id == project_id, ProjectMembership.user_id == user.id))
     if project is None or membership is None:
         raise HTTPException(status_code=404, detail="Project is unavailable")
-    if user.role != "admin" and membership.role not in {"owner", "maintainer"}:
-        raise HTTPException(status_code=403, detail="Project maintainer access required")
+    require_permission(user, db, "registry:write", "Project maintainer access required")
     provider = db.get(ModelProvider, payload.provider_id)
     if provider is None or not provider.enabled or provider.status != "healthy":
         raise HTTPException(status_code=409, detail="Select an enabled provider that passed its connection test")

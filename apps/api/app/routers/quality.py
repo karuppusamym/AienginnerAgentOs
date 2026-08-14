@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -229,6 +229,19 @@ def create_quality_rule(
     audit(db, user, "quality.rule_created", "quality_rule", rule.id, {"asset_id": asset.id})
     db.commit()
     return quality_rule_output(rule, db)
+
+@router.delete("/quality/rules/{rule_id}")
+def delete_quality_rule(
+    rule_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    project = require_current_project(db, user)
+    rule = require_project_resource(db.get(QualityRule, rule_id), project, "Quality rule")
+    db.delete(rule)
+    audit(db, user, "quality.rule_deleted", "quality_rule", rule_id, {"asset_id": rule.asset_id})
+    db.commit()
+    return {"status": "ok", "deleted": rule_id}
 
 @router.post("/quality/assets/{asset_id}/suggest", status_code=201)
 def suggest_quality_rules(
@@ -334,6 +347,25 @@ def run_quality_rule(
     }
     db.commit()
     try:
+        # Quality-rule execution only ever queries the app's own PostgreSQL
+        # engine (see execute_quality_rule in ../quality.py) — it does not
+        # route through connector_runtime.execute_connector_query the way
+        # SQL generation and staging do. Running a rule against an asset
+        # that's sourced from an external connector and was never staged
+        # locally used to fall straight into the Table(..., autoload_with=
+        # engine) reflection call, which raised an opaque "table not found"/
+        # driver error. That error was real, but the message gave no hint
+        # that the fix was "stage this table first" — surface it plainly
+        # instead of letting a confusing exception speak for itself.
+        if asset.connector_id:
+            connector = db.get(Connector, asset.connector_id)
+            connector_label = f"connector \"{connector.name}\"" if connector else "an external connector"
+            raise ValueError(
+                f"Quality rules run against data staged in DataPilot's own PostgreSQL, not directly "
+                f"against source systems. \"{execution_context['schema_name']}.{execution_context['table_name']}\" "
+                f"is sourced from {connector_label} and has not been staged locally yet — stage it first "
+                f"(Files upload, or a pipeline/extraction load) and re-run this rule against the staged copy."
+            )
         result = execute_quality_rule(
             engine,
             execution_context["schema_name"],
@@ -347,8 +379,19 @@ def run_quality_rule(
         for key, value in result.items():
             setattr(run, key, value)
     except Exception as exc:
+        # Bug fix: this branch used to leave checked_rows/failed_rows/
+        # pass_rate untouched on failure, so they kept QualityRun's column
+        # defaults (0, 0, 100.0) — an errored run then displayed "Pass
+        # rate: 100%" next to "Status: ERROR" simultaneously, which is
+        # exactly the contradictory state a live demo run surfaced
+        # ("Pass rate: 100%", "Status: ERROR", toast "0 rows passed" all
+        # at once). An errored run has no valid pass rate; zero it out so
+        # the UI can't imply a passing run that never happened.
         run.status = "error"
         run.error = str(exc)[:2000]
+        run.checked_rows = 0
+        run.failed_rows = 0
+        run.pass_rate = 0.0
     audit(
         db,
         user,
@@ -366,8 +409,7 @@ def run_quality_rule(
 
 @router.post("/quality/runs/{run_id}/remediate", status_code=201)
 def request_quality_remediation(run_id: str, payload: QualityRemediationRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "quality:write", "Quality write permission required")
     project = require_current_project(db, user)
     run = require_project_resource(db.get(QualityRun, run_id), project, "Quality run")
     if payload.action == "purge_quarantine" and not run.quarantine_relation:

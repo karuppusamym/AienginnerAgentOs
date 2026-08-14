@@ -205,6 +205,7 @@ def run_ingestion_schedule(schedule_id: str, actor_id: str | None = None) -> dic
                     staged["relation"],
                     f"Scheduled local dataset with {staged['row_count']} rows",
                     {"source_type": "dataset", "schema_name": staged["schema_name"], "table_name": staged["table_name"], "tags": asset.tags},
+                    db=db,
                 )
             except Exception:
                 pass

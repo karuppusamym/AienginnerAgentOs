@@ -208,7 +208,7 @@ def list_prompts(user: User = Depends(get_current_user), db: Session = Depends(g
 
 @router.post("/prompts", status_code=201)
 def save_prompt(payload: PromptSave, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     document = {"system_prompt": payload.system_prompt, "template": payload.template, "variables": payload.variables}
     artifact, version = save_internal_artifact_version(db, user, payload.name, "prompt", json.dumps(document, indent=2), {**payload.metadata, "state": "draft"}, payload.prompt_id)
     artifact.status = "draft"
@@ -233,7 +233,7 @@ def rollback_prompt(prompt_id: str, payload: PromptRollback, user: User = Depend
 
 @router.delete("/prompts/{prompt_id}")
 def delete_prompt(prompt_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     prompt = db.get(Artifact, prompt_id)
     if prompt is None or prompt.project_id != project.id or prompt.artifact_type != "prompt":
