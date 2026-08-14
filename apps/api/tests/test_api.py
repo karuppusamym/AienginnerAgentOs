@@ -627,6 +627,56 @@ class DataPilotApiTests(unittest.TestCase):
             "/sql/execute", headers=self.headers, json={"sql": f"SELECT COUNT(*) AS row_count FROM {relation}", "dialect": "postgres"},
         )
         self.assertEqual(row_check.json()["rows"][0]["row_count"], 2)
+        local_connector = next(
+            item for item in self.client.get("/connectors", headers=self.headers).json()
+            if item["connector_type"] == "local_files"
+        )
+        local_row_check = self.client.post(
+            "/sql/execute",
+            headers=self.headers,
+            json={
+                "sql": f"SELECT COUNT(*) AS row_count FROM {relation}",
+                "dialect": "postgres",
+                "connector_id": local_connector["id"],
+            },
+        )
+        self.assertEqual(local_row_check.status_code, 200, local_row_check.json())
+        self.assertEqual(local_row_check.json()["rows"][0]["row_count"], 2)
+        connector_preview = self.client.post(
+            "/connectors",
+            headers=self.headers,
+            json={
+                "name": "preview_db",
+                "connector_type": "oracle",
+                "host": "oracle.preview.internal",
+                "database": "PREVIEW",
+                "read_only": True,
+            },
+        )
+        self.assertEqual(connector_preview.status_code, 201)
+        with patch(
+            "app.main.execute_connector_query",
+            return_value={
+                "columns": ["txn_type", "total_amount"],
+                "rows": [{"txn_type": "deposit", "total_amount": 42.0}],
+                "row_count": 1,
+                "truncated": False,
+                "limit": 500,
+                "duration_ms": 1,
+            },
+        ):
+            preview_run = self.client.post(
+                "/sql/execute",
+                headers=self.headers,
+                json={
+                    "sql": "SELECT txn_type, SUM(amount) AS total_amount FROM staging.transactions GROUP BY txn_type",
+                    "dialect": "oracle",
+                    "connector_id": connector_preview.json()["id"],
+                    "limit": 500,
+                },
+            )
+        self.assertEqual(preview_run.status_code, 200, preview_run.json())
+        self.assertEqual(preview_run.json()["row_count"], 1)
 
         asset_id = staged_execution["result"]["asset_id"]
         rule = self.client.post(
@@ -2430,6 +2480,29 @@ class DataPilotApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(connector.status_code, 201)
+        with SessionLocal() as db:
+            current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+            from app.models import DataAsset
+
+            db.add(
+                DataAsset(
+                    project_id=current_project["id"],
+                    connector_id=connector.json()["id"],
+                    source_name="customer_db",
+                    schema_name="core",
+                    table_name="accounts",
+                    asset_type="table",
+                    row_count=10,
+                    columns=[
+                        {"name": "account_id", "type": "integer", "nullable": False},
+                        {"name": "customer_id", "type": "integer", "nullable": False},
+                        {"name": "status", "type": "varchar", "nullable": True},
+                    ],
+                    tags=["connector-scoped"],
+                    description="Connector-scoped accounts table for source-aware SQL generation tests.",
+                )
+            )
+            db.commit()
         source_driven_sql = self.client.post(
             "/sql/generate",
             headers=self.headers,
@@ -2458,6 +2531,72 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(follow_up.status_code, 201)
         self.assertGreaterEqual(follow_up.json()["structured"]["memory"]["prior_messages_used"], 2)
         self.assertEqual(follow_up.json()["structured"]["source"]["connector_type"], "local_files")
+        local_connector = next(
+            item for item in self.client.get("/connectors", headers=self.headers).json()
+            if item["connector_type"] == "local_files"
+        )
+        local_answer = self.client.post(
+            f"/conversations/{conversation['id']}/messages",
+            headers=self.headers,
+            json={
+                "content": "Show monthly account growth for the local workspace",
+                "dialect": "postgres",
+                "connector_id": local_connector["id"],
+            },
+        )
+        self.assertEqual(local_answer.status_code, 201, local_answer.json())
+        self.assertEqual(local_answer.json()["structured"]["source"]["connector_type"], "local_files")
+        self.assertIsNotNone(local_answer.json()["structured"]["execution"])
+        local_transactions = self.client.post(
+            "/files/ingest",
+            headers=self.headers,
+            data={"stage_to_postgres": "true"},
+            files={"file": ("local_transactions.csv", b"transaction_type,amount\ndeposit,125.0\nwithdrawal,50.0\n", "text/csv")},
+        )
+        self.assertEqual(local_transactions.status_code, 201, local_transactions.json())
+        local_sql = self.client.post(
+            "/sql/generate",
+            headers=self.headers,
+            json={
+                "question": "Show transaction totals by type",
+                "dialect": "postgres",
+                "connector_id": local_connector["id"],
+            },
+        )
+        self.assertEqual(local_sql.status_code, 200, local_sql.json())
+        self.assertEqual(local_sql.json()["source"]["connector_type"], "local_files")
+        self.assertNotIn("activity.transactions", local_sql.json()["sql"])
+        self.assertIsNotNone(local_sql.json()["execution"])
+        with patch(
+            "app.main.execute_connector_query",
+            return_value={
+                "columns": ["txn_type", "total_amount"],
+                "rows": [
+                    {"txn_type": "deposit", "total_amount": 1250.0},
+                    {"txn_type": "withdrawal", "total_amount": 500.0},
+                ],
+                "row_count": 2,
+                "truncated": False,
+                "limit": 500,
+                "duration_ms": 1,
+            },
+        ):
+            connector_answer = self.client.post(
+                f"/conversations/{conversation['id']}/messages",
+                headers=self.headers,
+                json={
+                    "content": "Show transaction totals by type",
+                    "dialect": "postgres",
+                    "connector_id": connector.json()["id"],
+                },
+            )
+        self.assertEqual(connector_answer.status_code, 201, connector_answer.json())
+        self.assertEqual(connector_answer.json()["structured"]["execution"]["row_count"], 2)
+        self.assertEqual(connector_answer.json()["structured"]["chart"]["y"], "total_amount")
+        self.assertIn(
+            "Executed against configured source system",
+            connector_answer.json()["structured"]["validation"]["checks"],
+        )
         listed_conversations = self.client.get("/conversations", headers=self.headers).json()
         self.assertEqual(listed_conversations[0]["id"], conversation["id"])
         report = self.client.post(

@@ -111,10 +111,11 @@ export function JobsView({ notify }: { notify: (message: string, tone?: "ok" | "
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [selected, setSelected] = useState<Job | null>(null);
   const [filter, setFilter] = useState<"all" | "running" | "action">("all");
+  const [search, setSearch] = useState("");
   const load = useCallback(() => Promise.all([api<Job[]>("/jobs"), api<Incident[]>("/incidents")]).then(([data, incidentData]) => { setJobs(data); setIncidents(incidentData); setSelected((current) => data.find((item) => item.id === current?.id) || data[0] || null); }), []);
   useEffect(() => { load(); }, [load]);
   useEffect(() => { const timer = window.setInterval(() => { if (jobs.some((job) => ["RUNNING", "QUEUED", "PLANNING", "RETRYING"].includes(job.status))) load(); }, 2000); return () => window.clearInterval(timer); }, [jobs, load]);
-  const filtered = jobs.filter((job) => filter === "all" || (filter === "running" ? ["RUNNING", "QUEUED", "PLANNING"].includes(job.status) : ["WAITING_FOR_APPROVAL", "FAILED"].includes(job.status)));
+  const filtered = jobs.filter((job) => (filter === "all" || (filter === "running" ? ["RUNNING", "QUEUED", "PLANNING"].includes(job.status) : ["WAITING_FOR_APPROVAL", "FAILED"].includes(job.status))) && (search ? job.title.toLowerCase().includes(search.toLowerCase()) || job.job_type.toLowerCase().includes(search.toLowerCase()) : true));
   async function cancelSelected() {
     if (!selected) return;
     try { await api(`/jobs/${selected.id}/cancel`, { method: "POST" }); notify("Job cancelled"); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Job could not be cancelled", "error"); }
@@ -123,7 +124,7 @@ export function JobsView({ notify }: { notify: (message: string, tone?: "ok" | "
   async function diagnoseSelected() { if (!selected) return; try { await api(`/jobs/${selected.id}/diagnose`, { method: "POST" }); notify("Incident diagnosis recorded"); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Diagnosis failed", "error"); } }
   return (
     <div className="view-stack">
-      <div className="view-header"><div><h2>Job operations</h2><p>Inspect state, progress, evidence, and every specialist handoff.</p></div><div className="segmented"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All</button><button className={filter === "running" ? "active" : ""} onClick={() => setFilter("running")}>Running</button><button className={filter === "action" ? "active" : ""} onClick={() => setFilter("action")}>Needs action</button></div></div>
+      <div className="view-header"><div><h2>Job operations</h2><p>Inspect state, progress, evidence, and every specialist handoff.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search jobs..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><div className="segmented"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All</button><button className={filter === "running" ? "active" : ""} onClick={() => setFilter("running")}>Running</button><button className={filter === "action" ? "active" : ""} onClick={() => setFilter("action")}>Needs action</button></div></div></div>
       <div className="jobs-layout">
         <section className="surface jobs-table">
           <div className="table-header job-grid"><span>Job</span><span>Status</span><span>Progress</span><span>Created</span></div>

@@ -119,6 +119,9 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
   const [publishing, setPublishing] = useState(false);
   const [artifactId, setArtifactId] = useState<string | null>(null);
   const [explainOpen, setExplainOpen] = useState(false);
+  const [toolModalOpen, setToolModalOpen] = useState(false);
+  const [notebookModalOpen, setNotebookModalOpen] = useState(false);
+  const [reportName, setReportName] = useState("");
   const [analyticsStatus, setAnalyticsStatus] = useState<{ published: boolean; dashboard_title?: string } | null>(null);
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
   const checkAnalyticsStatus = useCallback((id: string) => {
@@ -131,8 +134,14 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
     else setAnalyticsStatus(null);
   }, [artifactId, checkAnalyticsStatus]);
   const canSaveSql = ["admin", "engineer", "analyst"].includes(currentUser.role);
+  const localConnector = connectors.find((connector) => connector.connector_type === "local_files");
+  const externalConnectors = connectors.filter((connector) => connector.connector_type !== "local_files");
   const selectedConnector = connectors.find((connector) => connector.id === connectorId);
-  const effectiveDialect = selectedConnector ? connectorDialectForType(selectedConnector.connector_type) : dialect;
+  const resolvedConnector = selectedConnector || localConnector || null;
+  const effectiveDialect = resolvedConnector ? connectorDialectForType(resolvedConnector.connector_type) : dialect;
+  const executionTarget = resolvedConnector
+    ? `${resolvedConnector.name} / ${resolvedConnector.database || resolvedConnector.host || connectorLabels[resolvedConnector.connector_type] || resolvedConnector.connector_type}`
+    : "DataPilot local workspace / PostgreSQL staging";
   const loadSqlHistory = useCallback(() => api<Artifact[]>("/artifacts").then((items) => setSqlArtifacts(items.filter((item) => item.artifact_type === "sql"))), []);
   useEffect(() => {
     Promise.all([api<Connector[]>("/connectors").then(setConnectors), loadSqlHistory()]).catch(() => undefined);
@@ -140,7 +149,7 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
   useEffect(() => {
     if (!seed) return;
     setQuestion(seed.question);
-    setDialect(seed.dialect);
+    setDialect(seed.dialect || "postgres");
     setConnectorId("");
     setResult(null);
     setArtifactId(null);
@@ -152,7 +161,7 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
     try {
       setResult(await api<SQLResult>("/sql/generate", {
         method: "POST",
-        body: JSON.stringify({ question, dialect: effectiveDialect, connector_id: connectorId || null }),
+        body: JSON.stringify({ question, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null }),
       }));
       notify("SQL draft generated and validated");
     } catch (reason) {
@@ -163,15 +172,11 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
   }
   async function runPreview() {
     if (!result) return;
-    if (effectiveDialect !== "postgres") {
-      notify("Local execution currently supports PostgreSQL; use the matching enterprise connector for this dialect", "error");
-      return;
-    }
     setExecuting(true);
     try {
       const execution = await api<SQLExecutionResult>("/sql/execute", {
         method: "POST",
-        body: JSON.stringify({ sql: result.sql, dialect: "postgres", limit: 500 }),
+        body: JSON.stringify({ sql: result.sql, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null, limit: 500 }),
       });
       setResult({ ...result, preview: execution.rows, execution });
       notify(`Read-only query returned ${execution.row_count} rows`);
@@ -193,7 +198,7 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
           name: question.slice(0, 120),
           artifact_type: "sql",
           content: result.sql,
-          metadata: { dialect: effectiveDialect, question, connector_id: connectorId || null, validation: result.validation, sources: result.sources },
+          metadata: { dialect: effectiveDialect, question, connector_id: resolvedConnector?.id || null, validation: result.validation, sources: result.sources },
         }),
       });
       setArtifactId(artifact.id);
@@ -207,6 +212,35 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
   }
   async function sendFeedback(rating: "helpful" | "not_helpful") {
     try { await api("/feedback", { method: "POST", body: JSON.stringify({ context_type: "sql", context_id: artifactId, rating, comment: `${effectiveDialect}: ${question}` }) }); notify(`Feedback recorded as ${rating.replaceAll("_", " ")}`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Feedback could not be recorded", "error"); }
+  }
+
+  async function publishTool(event: FormEvent) {
+    event.preventDefault();
+    if (!result) return;
+    const slug = ("tool_" + reportName.toLowerCase().replace(/[^a-z0-9_.-]+/g, "_")).slice(0, 120);
+    try {
+      await api("/query-tools", { method: "POST", body: JSON.stringify({
+        name: slug,
+        description: `Published from the SQL workspace: ${reportName}`,
+        purpose: question || reportName,
+        data_source: selectedConnector?.name || "DataPilot workspace",
+        line_of_business: "general",
+        owner: currentUser.email || currentUser.name,
+        sql_template: result.sql,
+        parameter_schema: { type: "object", properties: {}, additionalProperties: false },
+        requires_approval: true,
+      }) });
+      setToolModalOpen(false); setReportName(""); notify("Tool publication requested and sent to Approvals");
+    } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not publish tool", "error"); }
+  }
+
+  async function ejectNotebook(event: FormEvent) {
+    event.preventDefault();
+    if (!result) return;
+    try {
+      await api("/notebooks", { method: "POST", body: JSON.stringify({ name: reportName, cells: [{ id: `cell-${Date.now()}`, type: "sql", source: result.sql }] }) });
+      setNotebookModalOpen(false); setReportName(""); notify("Notebook created");
+    } catch (reason) { notify("Could not create notebook", "error"); }
   }
   async function requestSupersetPublication() {
     if (!artifactId) return;
@@ -252,10 +286,8 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
       <div className="view-header">
         <div><h2>Grounded SQL workspace</h2><p>Generate dialect-aware, read-only SQL from catalog metadata and approved business terms.</p></div>
         <div className="sql-source-controls">
-          <select value={connectorId} onChange={(event) => setConnectorId(event.target.value)} aria-label="SQL source connection"><option value="">Local PostgreSQL catalog</option>{connectors.map((connector) => <option key={connector.id} value={connector.id}>{connector.name} / {connectorLabels[connector.connector_type] || connector.connector_type}</option>)}</select>
-          <select value={dialect} onChange={(event) => setDialect(event.target.value)} disabled={Boolean(connectorId)} aria-label="SQL dialect">
-            <option value="sqlserver">SQL Server</option><option value="oracle">Oracle</option><option value="teradata">Teradata</option><option value="bigquery">BigQuery</option><option value="postgres">PostgreSQL</option>
-          </select>
+          <select value={connectorId} onChange={(event) => setConnectorId(event.target.value)} aria-label="SQL source connection"><option value="">DataPilot local workspace / PostgreSQL staging</option>{externalConnectors.map((connector) => <option key={connector.id} value={connector.id}>{connector.name} / {connectorLabels[connector.connector_type] || connector.connector_type}</option>)}</select>
+          <span className="analysis-dialect">{selectedConnector ? `${connectorLabels[selectedConnector.connector_type] || selectedConnector.connector_type} source` : "PostgreSQL local source"}</span>
         </div>
       </div>
       <form className="sql-question surface" onSubmit={generate}>
@@ -270,11 +302,13 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
           <section className="surface code-panel">
             <div className="panel-toolbar"><span><Code2 size={16} />{result.dialect} | {selectedConnector?.name || result.provider.name}</span><StatusPill value={result.validation.status} /></div>
             <pre><code>{result.sql}</code></pre>
-            <div className="code-actions"><button className="icon-button" onClick={() => sendFeedback("helpful")} title="Helpful result"><Check size={16} /></button><button className="icon-button" onClick={() => sendFeedback("not_helpful")} title="Result needs improvement"><XCircle size={16} /></button><button className="secondary-button" onClick={() => setExplainOpen(true)}><Layers3 size={16} />Why this result?</button><button className="secondary-button" onClick={saveArtifact} disabled={saving || !canSaveSql}>{saving ? <RefreshCw size={16} className="spin" /> : <Archive size={16} />}Save artifact</button>{analyticsStatus?.published ? <button className="secondary-button" onClick={() => setAnalyticsOpen(true)}><LayoutDashboard size={16} />Open in Superset</button> : <button className="secondary-button" onClick={requestSupersetPublication} disabled={!artifactId || publishing} title={!artifactId ? "Save this SQL as an artifact first" : "Requests admin approval before this query becomes a Superset dashboard"}>{publishing ? <RefreshCw size={16} className="spin" /> : <LayoutDashboard size={16} />}Publish to Superset</button>}<button className="primary-button" onClick={runPreview} disabled={executing}>{executing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run read-only preview</button></div>
+            <div className="code-actions"><button className="icon-button" onClick={() => sendFeedback("helpful")} title="Helpful result"><Check size={16} /></button><button className="icon-button" onClick={() => sendFeedback("not_helpful")} title="Result needs improvement"><XCircle size={16} /></button><button className="secondary-button" onClick={() => setExplainOpen(true)}><Layers3 size={16} />Why this result?</button><button className="secondary-button" onClick={saveArtifact} disabled={saving || !canSaveSql}>{saving ? <RefreshCw size={16} className="spin" /> : <Archive size={16} />}Save artifact</button><button className="secondary-button" onClick={() => { setToolModalOpen(true); setReportName(question.slice(0, 50)); }}><Network size={16} />Publish API</button><button className="secondary-button" onClick={() => { setNotebookModalOpen(true); setReportName(question.slice(0, 50)); }}><FileSpreadsheet size={16} />Eject</button>{analyticsStatus?.published ? <button className="secondary-button" onClick={() => setAnalyticsOpen(true)}><LayoutDashboard size={16} />Open in Superset</button> : <button className="secondary-button" onClick={requestSupersetPublication} disabled={!artifactId || publishing} title={!artifactId ? "Save this SQL as an artifact first" : "Requests admin approval before this query becomes a Superset dashboard"}>{publishing ? <RefreshCw size={16} className="spin" /> : <LayoutDashboard size={16} />}Publish to Superset</button>}<button className="primary-button" onClick={runPreview} disabled={executing}>{executing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run preview</button></div>
           </section>
           <aside className="surface validation-panel">
             <div className="section-heading compact"><div><span className="eyebrow">EVIDENCE</span><h3>Validation</h3></div><StatusPill value={result.validation.risk_level} /></div>
             <p>{result.explanation}</p>
+            <div className="conversation-memory compact-memory"><span>Execution target</span><p>{executionTarget}</p></div>
+            {result.execution?.error ? <div className="conversation-memory compact-memory execution-error"><span>Execution error</span><p>{result.execution.error}</p></div> : null}
             {result.cache?.hit ? <div className="conversation-memory compact-memory"><span>Reuse</span><p>Reused a saved governed query for the same normalized question and source context.</p></div> : null}
             <div className="check-list">{result.validation.checks.map((check) => <div key={check}><Check size={15} />{check}</div>)}</div>
             <div className="subheading"><h4>Sources used</h4><span>{result.sources.length}</span></div>
@@ -284,9 +318,9 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
           </aside>
           <section className="surface preview-panel">
             <div className="section-heading compact"><div><span className="eyebrow">LIMITED PREVIEW</span><h3>Query result</h3></div><span className="caption">Maximum {result.validation.row_limit} rows</span></div>
-            {result.preview.length ? <div className="data-table-wrap">
+            {result.execution?.error ? <div className="inline-empty">Preview unavailable because query execution failed for the selected source.</div> : result.preview.length ? <div className="data-table-wrap">
               <table><thead><tr>{Object.keys(result.preview[0] || {}).map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}</tr></thead><tbody>{result.preview.map((row, index) => <tr key={index}>{Object.values(row).map((value, valueIndex) => <td key={valueIndex}>{typeof value === "number" ? value.toLocaleString() : value}</td>)}</tr>)}</tbody></table>
-            </div> : <div className="inline-empty">No local preview is available for this dialect.</div>}
+            </div> : <div className="inline-empty">No preview rows returned for this source.</div>}
           </section>
         </div>
       )}
@@ -295,6 +329,8 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
         {sqlArtifacts.length ? <div className="sql-history-list">{sqlArtifacts.slice(0, 8).map((artifact) => <button key={artifact.id} onClick={() => openSqlArtifact(artifact)}><Archive size={16} /><span><strong>{artifact.name}</strong><small>{String(artifact.metadata?.dialect || artifact.artifact_type)} / v{artifact.latest_version} / {new Date(artifact.updated_at).toLocaleString()}</small></span><ChevronRight size={16} /></button>)}</div> : <div className="inline-empty">Saved SQL from this project appears here. Conversation SQL stays inside each analysis thread until it is saved as a report or artifact.</div>}
       </section>
       {analyticsOpen && artifactId && <PublishedQueryAnalyticsModal artifactId={artifactId} title={analyticsStatus?.dashboard_title || "Query analytics"} onClose={() => setAnalyticsOpen(false)} />}
+      {toolModalOpen && <Modal title="Publish as API Tool" onClose={() => setToolModalOpen(false)}><form className="modal-form" onSubmit={publishTool}><label>Tool name<input value={reportName} onChange={(event) => setReportName(event.target.value)} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setToolModalOpen(false)}>Cancel</button><button className="primary-button"><Network size={16} />Request Approval</button></div></form></Modal>}
+      {notebookModalOpen && <Modal title="Eject to Notebook" onClose={() => setNotebookModalOpen(false)}><form className="modal-form" onSubmit={ejectNotebook}><label>Notebook title<input value={reportName} onChange={(event) => setReportName(event.target.value)} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setNotebookModalOpen(false)}>Cancel</button><button className="primary-button"><FileSpreadsheet size={16} />Create Notebook</button></div></form></Modal>}
       {explainOpen && result && <Modal title="Why this result?" onClose={() => setExplainOpen(false)}><div className="modal-form"><p>{result.explanation}</p><div className="subheading"><h4>Source and model</h4></div><div className="check-list"><div><Database size={15} />{result.source?.name || selectedConnector?.name || "DataPilot local workspace"} / {result.dialect}</div><div><Bot size={15} />{result.provider.name} / {result.provider.model} ({result.provider.mode})</div><div><CircleGauge size={15} />Validation: {result.validation.status}; risk: {result.validation.risk_level}; row limit: {result.validation.row_limit}</div></div><div className="subheading"><h4>Grounding evidence</h4></div>{result.grounding?.catalog_matches?.slice(0, 5).map((item) => <div className="source-row" key={`${item.relation}-${item.match_type}`}><Layers3 size={15} /><span><strong>{item.relation}</strong><small>{item.match_type} catalog match / score {item.score}</small></span></div>)}{result.grounding?.semantic_matches?.slice(0, 5).map((item) => <div className="source-row" key={item.name}><Braces size={15} /><span><strong>{item.name}</strong><small>{item.formula} at {item.grain}</small></span></div>)}{result.grounding?.join_matches?.slice(0, 5).map((item) => <div className="source-row" key={`${item.left_relation}-${item.right_relation}`}><Network size={15} /><span><strong>{item.left_relation} {item.join_type} {item.right_relation}</strong><small>{item.left_column} = {item.right_column}</small></span></div>)}<div className="subheading"><h4>Safety checks</h4></div><div className="check-list">{result.validation.checks.map((check) => <div key={check}><Check size={15} />{check}</div>)}</div></div></Modal>}
     </div>
   );

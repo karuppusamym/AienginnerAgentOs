@@ -169,6 +169,25 @@ def stage_rows(
     }
 
 
+def _json_safe_value(value: Any) -> Any:
+    """Convert a raw DB-driver value into something JSON/JSONB-serializable.
+
+    Query results are stored verbatim into JSONB columns (QueryRun.result,
+    SqlQueryCache.result) after this function runs. Raw driver values for
+    date/time/decimal columns (e.g. a `timestamp` column, or a `numeric`
+    column) come back as native Python `datetime`/`date`/`Decimal` objects,
+    which psycopg's JSON adapter cannot serialize — every SQL-generate or
+    ask-a-question call that executed a query touching such a column failed
+    with `TypeError: Object of type datetime is not JSON serializable` on
+    commit. Normalize those two type families before they reach the ORM.
+    """
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
 def execute_parameterized_read_only(
     engine: Engine,
     sql: str,
@@ -201,7 +220,10 @@ def execute_parameterized_read_only(
             transaction.rollback()
             raise
     truncated = len(rows) > limit
-    protected_rows, pii_columns = protect_rows(columns, [dict(zip(columns, row, strict=False)) for row in rows[:limit]])
+    protected_rows, pii_columns = protect_rows(
+        columns,
+        [{key: _json_safe_value(value) for key, value in zip(columns, row, strict=False)} for row in rows[:limit]],
+    )
     return {
         "columns": columns,
         "rows": protected_rows,

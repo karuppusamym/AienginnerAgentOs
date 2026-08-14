@@ -218,7 +218,7 @@ def save_notebook(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     artifact, version = save_internal_artifact_version(
         db,
         user,
@@ -238,7 +238,7 @@ def delete_notebook(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     notebook = db.get(Artifact, notebook_id)
     if notebook is None or notebook.project_id != project.id or notebook.artifact_type != "notebook":
@@ -256,7 +256,7 @@ def run_notebook(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     notebook = db.get(Artifact, notebook_id)
     if notebook is None or notebook.project_id != project.id or notebook.artifact_type != "notebook":

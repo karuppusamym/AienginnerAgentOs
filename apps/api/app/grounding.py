@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import re
@@ -99,17 +100,25 @@ def _token_overlap_score(haystack: str, tokens: set[str], normalized_query: str)
     return float(matches)
 
 
-def project_asset_search(db: Session, project_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
+def project_asset_search(
+    db: Session,
+    project_id: str,
+    query: str,
+    limit: int = 8,
+    allowed_asset_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     normalized_query = normalize_query(query)
     tokens = set(TOKEN_PATTERN.findall(normalized_query))
     assets = db.scalars(
         select(DataAsset).where(DataAsset.project_id == project_id).order_by(DataAsset.schema_name, DataAsset.table_name)
     ).all()
+    if allowed_asset_ids is not None:
+        assets = [asset for asset in assets if asset.id in allowed_asset_ids]
     asset_lookup = {asset.id: asset for asset in assets}
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for hit in search_documents(query, limit=max(limit * 2, 8)):
+    for hit in search_documents(query, limit=max(limit * 2, 8), db=db):
         asset = asset_lookup.get(str(hit.get("source_id", "")))
         if asset is None:
             continue
@@ -170,7 +179,51 @@ def project_asset_search(db: Session, project_id: str, query: str, limit: int = 
     return results[:limit]
 
 
-def semantic_matches(db: Session, project_id: str, query: str, limit: int = 5) -> dict[str, list[dict[str, Any]]]:
+def _find_graph_join_paths(target_asset_ids: set[str], all_joins: list[SemanticJoinPolicy]) -> set[str]:
+    if not target_asset_ids:
+        return set()
+    
+    if len(target_asset_ids) == 1:
+        target = list(target_asset_ids)[0]
+        return {j.id for j in all_joins if j.left_asset_id == target or j.right_asset_id == target}
+
+    graph = collections.defaultdict(list)
+    for join in all_joins:
+        graph[join.left_asset_id].append((join.right_asset_id, join.id))
+        graph[join.right_asset_id].append((join.left_asset_id, join.id))
+    
+    required_policy_ids = set()
+    targets = list(target_asset_ids)
+    
+    for i in range(len(targets)):
+        for j in range(i + 1, len(targets)):
+            start, end = targets[i], targets[j]
+            queue = collections.deque([(start, [])])
+            visited = {start}
+            path_found = False
+            
+            while queue and not path_found:
+                current_node, current_path = queue.popleft()
+                if current_node == end:
+                    required_policy_ids.update(current_path)
+                    path_found = True
+                    break
+                
+                for neighbor, policy_id in graph.get(current_node, []):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, current_path + [policy_id]))
+                        
+    return required_policy_ids
+
+def semantic_matches(
+    db: Session,
+    project_id: str,
+    query: str,
+    target_asset_ids: set[str] = None,
+    limit: int = 5,
+    allowed_asset_ids: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     normalized_query = normalize_query(query)
     tokens = set(TOKEN_PATTERN.findall(normalized_query))
     metrics = db.scalars(
@@ -179,12 +232,20 @@ def semantic_matches(db: Session, project_id: str, query: str, limit: int = 5) -
     asset_lookup = {
         asset.id: f"{asset.schema_name}.{asset.table_name}"
         for asset in db.scalars(select(DataAsset).where(DataAsset.project_id == project_id)).all()
+        if allowed_asset_ids is None or asset.id in allowed_asset_ids
     }
     joins = db.scalars(
         select(SemanticJoinPolicy)
         .where(SemanticJoinPolicy.project_id == project_id, SemanticJoinPolicy.status == "approved")
         .order_by(SemanticJoinPolicy.id)
     ).all()
+    if allowed_asset_ids is not None:
+        joins = [
+            join for join in joins
+            if join.left_asset_id in allowed_asset_ids and join.right_asset_id in allowed_asset_ids
+        ]
+        if target_asset_ids:
+            target_asset_ids = {asset_id for asset_id in target_asset_ids if asset_id in allowed_asset_ids}
 
     matched_metrics: list[dict[str, Any]] = []
     for metric in metrics:
@@ -217,40 +278,26 @@ def semantic_matches(db: Session, project_id: str, query: str, limit: int = 5) -
     matched_metrics.sort(key=lambda item: (float(item["score"]), item["name"]), reverse=True)
 
     matched_joins: list[dict[str, Any]] = []
-    for policy in joins:
-        left_relation = asset_lookup.get(policy.left_asset_id, policy.left_asset_id)
-        right_relation = asset_lookup.get(policy.right_asset_id, policy.right_asset_id)
-        haystack = " ".join(
-            [
-                left_relation,
-                right_relation,
-                policy.left_column,
-                policy.right_column,
-                policy.join_type,
-                policy.description or "",
-            ]
-        )
-        score = _token_overlap_score(haystack, tokens, normalized_query)
-        if score <= 0:
-            continue
-        matched_joins.append(
-            {
-                "policy_id": policy.id,
-                "left_relation": left_relation,
-                "right_relation": right_relation,
-                "left_column": policy.left_column,
-                "right_column": policy.right_column,
-                "join_type": policy.join_type,
-                "description": policy.description,
-                "score": round(score, 4),
-            }
-        )
+    if target_asset_ids:
+        required_policy_ids = _find_graph_join_paths(target_asset_ids, joins)
+        for policy in joins:
+            if policy.id in required_policy_ids:
+                left_relation = asset_lookup.get(policy.left_asset_id, policy.left_asset_id)
+                right_relation = asset_lookup.get(policy.right_asset_id, policy.right_asset_id)
+                matched_joins.append(
+                    {
+                        "policy_id": policy.id,
+                        "left_relation": left_relation,
+                        "right_relation": right_relation,
+                        "left_column": policy.left_column,
+                        "right_column": policy.right_column,
+                        "join_type": policy.join_type,
+                        "description": policy.description,
+                        "score": 1.0, # Exact graph path match
+                    }
+                )
 
-    matched_joins.sort(
-        key=lambda item: (float(item["score"]), item["left_relation"], item["right_relation"]),
-        reverse=True,
-    )
-    return {"metrics": matched_metrics[:limit], "joins": matched_joins[:limit]}
+    return {"metrics": matched_metrics[:limit], "joins": matched_joins}
 
 
 def glossary_matches(db: Session, project_id: str, query: str, limit: int = 4) -> list[dict[str, Any]]:
@@ -275,7 +322,7 @@ def glossary_matches(db: Session, project_id: str, query: str, limit: int = 4) -
     if not documents:
         return []
     results: list[dict[str, Any]] = []
-    for hit in search_documents(query, limit=max(limit * 4, 12)):
+    for hit in search_documents(query, limit=max(limit * 4, 12), db=db):
         if hit.get("source_type") != "glossary":
             continue
         document = documents.get(str(hit.get("document_id", "")))
@@ -294,9 +341,23 @@ def glossary_matches(db: Session, project_id: str, query: str, limit: int = 4) -
     return results[:limit]
 
 
-def grounding_context(db: Session, project_id: str, question: str, limit: int = 5) -> dict[str, Any]:
-    catalog_matches = project_asset_search(db, project_id, question, limit=limit)
-    semantic = semantic_matches(db, project_id, question, limit=limit)
+def grounding_context(
+    db: Session,
+    project_id: str,
+    question: str,
+    limit: int = 5,
+    allowed_asset_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    catalog_matches = project_asset_search(db, project_id, question, limit=limit, allowed_asset_ids=allowed_asset_ids)
+    target_asset_ids = {m["asset_id"] for m in catalog_matches} if catalog_matches else set()
+    semantic = semantic_matches(
+        db,
+        project_id,
+        question,
+        target_asset_ids,
+        limit=limit,
+        allowed_asset_ids=allowed_asset_ids,
+    )
     return {
         "catalog_matches": catalog_matches,
         "vector_hits": [item for item in catalog_matches if item["match_type"] in {"vector", "hybrid"}][:limit],

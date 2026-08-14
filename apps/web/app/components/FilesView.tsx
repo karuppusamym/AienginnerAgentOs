@@ -108,28 +108,15 @@ import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, Analy
 
 export function FilesView({ notify, currentUser }: { notify: (message: string, tone?: "ok" | "error") => void; currentUser: SessionUser }) {
   const [files, setFiles] = useState<IngestedFile[]>([]);
-  const [connectors, setConnectors] = useState<Connector[]>([]);
   const [selected, setSelected] = useState<IngestedFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [staging, setStaging] = useState(false);
-  const [showConnector, setShowConnector] = useState(false);
-  const [editingConnector, setEditingConnector] = useState<Connector | null>(null);
-  const emptyConnectorForm = { name: "", connector_type: "sql_server", description: "", host: "", database: "", secret_reference: "env:SQLSERVER_CREDENTIALS" };
-  const [connectorForm, setConnectorForm] = useState(emptyConnectorForm);
   const [targetTable, setTargetTable] = useState("");
   const [mappingColumns, setMappingColumns] = useState<MappingColumn[]>([]);
   const [loadMode, setLoadMode] = useState<LoadMode>("versioned");
   const [keyColumn, setKeyColumn] = useState("");
-  const canManageConnections = ["admin", "engineer"].includes(currentUser.role);
-  const connectorTypeHelp: Record<string, string> = {
-    postgres: "PostgreSQL read-only metadata and parameterized query access.",
-    sql_server: "SQL Server read-only metadata and parameterized query access.",
-    oracle: "Oracle read-only metadata and parameterized query access.",
-    teradata: "Teradata read-only metadata and parameterized query access.",
-    bigquery: "BigQuery dataset metadata and read-only query access.",
-    local_files: "Local file source registered for catalog context.",
-  };
-  const load = useCallback(() => Promise.all([api<IngestedFile[]>("/files"), api<Connector[]>("/connectors")]).then(([fileData, connectorData]) => { setFiles(fileData); setConnectors(connectorData); }), []);
+  
+  const load = useCallback(() => api<IngestedFile[]>("/files").then((fileData) => setFiles(fileData)), []);
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     if (!selected || selected.profile.kind !== "structured") {
@@ -175,65 +162,6 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
     setMappingColumns((current) => current.map((column, columnIndex) => columnIndex === index ? { ...column, ...patch } : column));
   }
 
-  function openConnector(connector?: Connector) {
-    setEditingConnector(connector || null);
-    setConnectorForm(connector ? {
-      name: connector.name,
-      connector_type: connector.connector_type,
-      description: connector.description || "",
-      host: connector.host || "",
-      database: connector.database || "",
-      secret_reference: connector.secret_reference || "",
-    } : emptyConnectorForm);
-    setShowConnector(true);
-  }
-
-  async function saveConnector(event: FormEvent) {
-    event.preventDefault();
-    try {
-      const payload = { ...connectorForm, read_only: true };
-      await api(editingConnector ? `/connectors/${editingConnector.id}` : "/connectors", {
-        method: editingConnector ? "PUT" : "POST",
-        body: JSON.stringify(payload),
-      });
-      setShowConnector(false);
-      setEditingConnector(null);
-      await load();
-      notify(editingConnector ? "Connection updated" : "Connection added");
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Connection could not be saved", "error");
-    }
-  }
-
-  async function testConnector(id: string) {
-    try {
-      const result = await api<{ message: string }>(`/connectors/${id}/test`, { method: "POST" });
-      await load();
-      notify(result.message);
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Connection test failed", "error");
-    }
-  }
-
-  async function scanConnector(id: string) {
-    try {
-      const result = await api<{ status: string; assets_discovered?: number }>(`/connectors/${id}/scan`, { method: "POST" });
-      await load();
-      notify(result.status === "QUEUED" ? "Metadata scan queued" : `Metadata scan completed: ${result.assets_discovered || 0} assets`);
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Metadata scan failed", "error");
-    }
-  }
-
-  async function deleteConnector(id: string) {
-    try {
-      await api(`/connectors/${id}`, { method: "DELETE" });
-      await load();
-      notify("Connection deleted");
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Connection could not be deleted", "error");
-    }
-  }
 
   async function saveAndStage() {
     if (!selected || !targetTable.trim() || !mappingColumns.length) return;
@@ -272,26 +200,7 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
           <input type="file" accept=".csv,.json,.xlsx,.parquet,.pdf" onChange={uploadFile} disabled={uploading} />
         </label>
       </div>
-      <section className="surface connection-surface">
-        <div className="section-heading compact">
-          <div><span className="eyebrow">CONNECTIONS</span><h3>Registered data sources</h3></div>
-          {canManageConnections && <button className="primary-button" onClick={() => openConnector()}><Plus size={17} />Add connection</button>}
-        </div>
-        {connectors.length ? (
-          <div className="connection-list">
-            {connectors.map((connector) => (
-              <div className="connection-row" key={connector.id}>
-                <span className="connection-icon"><Database size={17} /></span>
-                <span><strong>{connector.name}</strong><small>{connectorLabels[connector.connector_type] || connector.connector_type} / {connector.database || connector.host || "not configured"}</small>{connector.description && <small>{connector.description}</small>}</span>
-                <StatusPill value={connector.status} />
-                {canManageConnections && <span className="row-actions"><button className="icon-button" title="Test connection" onClick={() => testConnector(connector.id)}><Gauge size={16} /></button><button className="icon-button" title="Scan metadata" onClick={() => scanConnector(connector.id)}><RefreshCw size={16} /></button><button className="icon-button" title="Edit connection" onClick={() => openConnector(connector)}><Settings size={16} /></button><button className="icon-button" title="Delete connection" onClick={() => deleteConnector(connector.id)}><XCircle size={16} /></button></span>}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="inline-empty">No external connections are registered for this project.</div>
-        )}
-      </section>
+
       <div className="two-column file-columns">
         <section className="surface">
           <div className="section-heading compact"><div><span className="eyebrow">INGESTED FILES</span><h3>Recent uploads</h3></div></div>
@@ -353,7 +262,6 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
           )}
         </section>
       </div>
-      {showConnector && <Modal title={editingConnector ? "Edit connection" : "Add connection"} onClose={() => setShowConnector(false)}><form className="modal-form" onSubmit={saveConnector}><div className="form-grid"><label>Name<input value={connectorForm.name} onChange={(event) => setConnectorForm({ ...connectorForm, name: event.target.value })} required /></label><label>Connection type<select value={connectorForm.connector_type} onChange={(event) => setConnectorForm({ ...connectorForm, connector_type: event.target.value })}><option value="postgres">PostgreSQL</option><option value="sql_server">SQL Server</option><option value="oracle">Oracle</option><option value="teradata">Teradata</option><option value="bigquery">BigQuery</option><option value="local_files">Local files</option></select></label></div><div className="connector-type-note"><ShieldCheck size={16} />{connectorTypeHelp[connectorForm.connector_type]}</div><label>Description<textarea value={connectorForm.description} onChange={(event) => setConnectorForm({ ...connectorForm, description: event.target.value })} rows={3} placeholder="Business owner, domain, allowed use, and data sensitivity." /></label><div className="form-grid"><label>Host / project<input value={connectorForm.host} onChange={(event) => setConnectorForm({ ...connectorForm, host: event.target.value })} /></label><label>Database / dataset<input value={connectorForm.database} onChange={(event) => setConnectorForm({ ...connectorForm, database: event.target.value })} /></label></div><label>Secret reference<input value={connectorForm.secret_reference} onChange={(event) => setConnectorForm({ ...connectorForm, secret_reference: event.target.value })} placeholder="env:POSTGRES_CREDENTIALS" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowConnector(false)}>Cancel</button><button className="primary-button"><Check size={17} />{editingConnector ? "Save connection" : "Add connection"}</button></div></form></Modal>}
     </div>
   );
 }

@@ -67,6 +67,23 @@ def ensure_control_plane(db: Session) -> None:
         db.flush()
     elif project.default_model_provider_id is None:
         project.default_model_provider_id = provider.id if provider else None
+    if not db.scalar(
+        select(Connector).where(
+            Connector.project_id == project.id,
+            Connector.connector_type == "local_files",
+        )
+    ):
+        db.add(
+            Connector(
+                project_id=project.id,
+                name="DataPilot local workspace",
+                connector_type="local_files",
+                status="healthy",
+                read_only=True,
+                metadata_summary={"files": 0, "tables": 0},
+            )
+        )
+        db.flush()
     if os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"} and not db.scalar(
         select(DataAsset).where(DataAsset.project_id == project.id, DataAsset.schema_name == "core", DataAsset.table_name == "accounts")
     ):

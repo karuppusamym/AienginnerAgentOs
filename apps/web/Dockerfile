@@ -19,6 +19,11 @@ COPY --from=build /app/package-lock.json ./package-lock.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
+# next.config.mjs is read at runtime by `next start` (rewrites/redirects are
+# not baked into .next) — must ship it into the runtime stage. Kept as plain
+# .mjs specifically so it loads without the `typescript` devDependency that
+# `npm prune --omit=dev` below removes.
+COPY --from=build /app/next.config.mjs ./next.config.mjs
 RUN npm prune --omit=dev
 
 # Same non-root / group-0 pattern as apps/api/Dockerfile — works unmodified

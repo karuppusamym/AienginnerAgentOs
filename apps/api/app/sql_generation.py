@@ -57,7 +57,7 @@ def generated_sql(dialect: str) -> str:
 
 
 def generated_catalog_sql(dialect: str, assets: list[DataAsset]) -> str:
-    if any(asset.schema_name == "core" and asset.table_name == "accounts" for asset in assets):
+    if assets and assets[0].schema_name == "core" and assets[0].table_name == "accounts":
         return generated_sql(dialect)
     if not assets:
         raise HTTPException(status_code=409, detail="Ingest or scan a dataset before generating SQL")

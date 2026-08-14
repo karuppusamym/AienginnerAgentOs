@@ -126,7 +126,7 @@ from ..main import (
     ArtifactCreate, ArtifactReviewRequest, ArtifactVersion, AuditEvent, AuthProvider,
     AuthProviderUpdate, Base, BaseModel, CORSMiddleware, ConfigDict, Connector,
     ConnectorCreate, ConnectorRuntimeError, ConnectorUpdate, Conversation,
-    ConversationAsk, ConversationCreate, ConversationMessage, ConversationReportCreate,
+    ConversationAsk, ConversationCreate, ConversationMessage, ConversationRename, ConversationReportCreate,
     DEFAULT_ARTIFACT_TARGETS, DataAsset, Depends, EvaluationBaselineRequest,
     EvaluationCaseInput, EvaluationRun, EvaluationRunRequest, EvaluationSet,
     EvaluationSetCreate, ExternalClient, ExternalClientCreate, ExternalClientUpdate,
@@ -205,7 +205,7 @@ def list_conversations(user: User = Depends(get_current_user), db: Session = Dep
 
 @router.post("/conversations", status_code=201)
 def create_conversation(payload: ConversationCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     conversation = Conversation(project_id=project.id, title=payload.title, created_by=user.id)
     db.add(conversation)
@@ -225,7 +225,7 @@ def list_conversation_messages(conversation_id: str, user: User = Depends(get_cu
 
 @router.post("/conversations/{conversation_id}/messages", status_code=201)
 def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
@@ -249,6 +249,42 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
         db,
     )
     execution = analysis.get("execution")
+    if execution is None and payload.connector_id and _safe_read_only_sql(analysis.get("sql", "")):
+        connector = require_project_resource(db.get(Connector, payload.connector_id), project, "Connector")
+        try:
+            execution = main.execute_connector_query(
+                connector,
+                analysis["sql"],
+                {},
+                500,
+                30,
+                user_id=user.id,
+                session_id=conversation.id,
+                feature="conversation_analysis",
+            )
+        except Exception as exc:
+            execution = {
+                "columns": [],
+                "rows": [],
+                "row_count": 0,
+                "truncated": False,
+                "limit": 500,
+                "duration_ms": 0,
+                "error": str(exc),
+            }
+        analysis["execution"] = execution
+        analysis["preview"] = execution.get("rows", [])
+        checks = analysis.get("validation", {}).get("checks")
+        if isinstance(checks, list):
+            status_line = (
+                "Executed against configured source system"
+                if not execution.get("error")
+                else "Execution failed against configured source system"
+            )
+            analysis["validation"]["checks"] = [
+                status_line if check == "Execution requires the matching configured source system" else check
+                for check in checks
+            ]
     chart = _chart_from_result(payload.content, execution)
     row_count = execution.get("row_count", 0) if execution else 0
     provider = selected_model_provider(db, user)
@@ -287,7 +323,7 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
 
 @router.post("/conversations/{conversation_id}/report", status_code=201)
 def save_conversation_report(conversation_id: str, payload: ConversationReportCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
@@ -299,9 +335,24 @@ def save_conversation_report(conversation_id: str, payload: ConversationReportCr
     db.commit()
     return {"id": artifact.id, "name": artifact.name, "artifact_type": artifact.artifact_type, "version": version.version}
 
+@router.put("/conversations/{conversation_id}")
+def rename_conversation(conversation_id: str, payload: ConversationRename, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    require_workspace_editor(user, db)
+    project = require_current_project(db, user)
+    conversation = db.get(Conversation, conversation_id)
+    if conversation is None or conversation.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if user.role == "analyst" and conversation.created_by != user.id:
+        raise HTTPException(status_code=403, detail="Analysts can rename only their own conversations")
+    conversation.title = payload.title.strip()
+    conversation.updated_at = datetime.now(timezone.utc)
+    audit(db, user, "conversation.renamed", "conversation", conversation_id, {"title": conversation.title})
+    db.commit()
+    return {"id": conversation.id, "title": conversation.title}
+
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:

@@ -91,7 +91,7 @@ from ..models import (
     User,
     UserFeedback,
 )
-from ..provider_selection import selected_model_provider
+from ..provider_selection import current_membership, selected_model_provider
 from ..quality import execute_quality_rule
 from ..notebook_runtime import execute_notebook
 from ..observability import elapsed_ms, emit, initialize_observability, request_id, span, status as observability_status
@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    project_permissions, require_current_project, require_data_editor, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -204,7 +204,7 @@ def list_connectors(
     connectors = db.scalars(
         select(Connector).where(Connector.project_id == project.id).order_by(Connector.created_at)
     ).all()
-    return [connector_output(connector, include_secret=user.role in {"admin", "engineer"}) for connector in connectors]
+    return [connector_output(connector, include_secret="*" in project_permissions(user, current_membership(db, user).role if current_membership(db, user) else None) or "catalog:write" in project_permissions(user, current_membership(db, user).role if current_membership(db, user) else None)) for connector in connectors]
 
 @router.post("/connectors", status_code=201)
 def create_connector(
@@ -212,7 +212,7 @@ def create_connector(
     admin: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(admin)
+    require_data_editor(admin, db)
     project = require_current_project(db, admin)
     if not payload.read_only:
         raise HTTPException(status_code=400, detail="DataPilot connectors must be read-only")
@@ -232,7 +232,7 @@ def update_connector(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     connector = require_project_resource(db.get(Connector, connector_id), project, "Connector")
     if not payload.read_only:
@@ -252,7 +252,7 @@ def delete_connector(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     connector = require_project_resource(db.get(Connector, connector_id), project, "Connector")
     asset_count = db.scalar(select(func.count()).select_from(DataAsset).where(DataAsset.connector_id == connector.id)) or 0
@@ -269,7 +269,7 @@ def test_connector(
     admin: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(admin)
+    require_data_editor(admin, db)
     project = require_current_project(db, admin)
     connector = require_project_resource(db.get(Connector, connector_id), project, "Connector")
     try:
@@ -308,7 +308,7 @@ async def scan_connector(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     connector = require_project_resource(db.get(Connector, connector_id), project, "Connector")
     job = Job(
@@ -359,8 +359,7 @@ def list_schema_drift(status: str | None = Query(default=None), user: User = Dep
 
 @router.post("/schema-drift/{event_id}/acknowledge")
 def acknowledge_schema_drift(event_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     event = db.get(SchemaDriftEvent, event_id)
     if event is None or event.project_id != project.id:

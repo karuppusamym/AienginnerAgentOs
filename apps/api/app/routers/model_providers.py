@@ -114,7 +114,7 @@ from ..superset_client import create_editor_url, create_guest_token
 from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
-from ..vector_store import index_document, search_documents
+from ..vector_store import index_document, reindex_all, search_documents
 from fastapi import APIRouter
 
 from .. import main
@@ -317,6 +317,24 @@ def set_default_model_provider(
     audit(db, admin, "model_provider.default_selected", "model_provider", provider.id)
     db.commit()
     return {"id": provider.id, "name": provider.name, "is_default": True}
+
+@router.post("/model-providers/reindex-embeddings")
+def reindex_embeddings(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Re-embed every catalog asset and glossary document under whichever
+    ModelProvider.embedding_model is currently active.
+
+    Needed after switching the default/enabled provider or editing its
+    embedding_model, since indexing only migrates the Qdrant collection
+    lazily on the next write -- existing points aren't recomputed until this
+    runs. Safe to call any time; it's idempotent per document/asset.
+    """
+    summary = reindex_all(db)
+    audit(db, admin, "model_provider.reindexed_embeddings", "model_provider", None, summary)
+    db.commit()
+    return summary
 
 @router.get("/model-usage")
 def model_usage(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:

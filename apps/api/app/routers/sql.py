@@ -210,11 +210,25 @@ def generate_sql(
     if payload.connector_id:
         connector = require_project_resource(db.get(Connector, payload.connector_id), project, "Connector")
     dialect = connector_dialect(connector, payload.dialect)
+    executable_local_source = connector is None or connector.connector_type == "local_files"
     source_system = analysis_source_output(connector, dialect)
-    catalog = db.scalars(
+    project_assets = db.scalars(
         select(DataAsset).where(DataAsset.project_id == project.id).order_by(DataAsset.schema_name, DataAsset.table_name)
     ).all()
-    grounding = grounding_context(db, project.id, payload.question, limit=5)
+    if executable_local_source:
+        allowed_asset_ids = {
+            asset.id
+            for asset in project_assets
+            if asset.connector_id in {None, connector.id if connector else None}
+        }
+    else:
+        allowed_asset_ids = {
+            asset.id
+            for asset in project_assets
+            if asset.connector_id == connector.id
+        }
+    catalog = [asset for asset in project_assets if asset.id in allowed_asset_ids]
+    grounding = grounding_context(db, project.id, payload.question, limit=5, allowed_asset_ids=allowed_asset_ids)
     prioritized_ids = [item["asset_id"] for item in grounding["catalog_matches"] if item.get("asset_id")]
     prioritized_catalog = [
         *[item for item in catalog if item.id in prioritized_ids],
@@ -337,7 +351,7 @@ def generate_sql(
             # PostgreSQL local sources are the one case where we can validate
             # execution before returning SQL to the user. Ask the provider for
             # one targeted repair when its safe query does not run.
-            if dialect == "postgres" and connector is None and _safe_read_only_sql(sql):
+            if dialect == "postgres" and executable_local_source and _safe_read_only_sql(sql):
                 execution = _local_execution_error(sql)
                 if execution.get("error"):
                     repaired = generate_text(
@@ -372,7 +386,7 @@ def generate_sql(
             raise HTTPException(status_code=422, detail=f"Model generation failed: {call_error}") from exc
         db.add(ModelCallLog(project_id=project.id, provider_id=provider.id, model=provider.default_model, purpose="sql_generation", status=call_status, latency_ms=latency_ms, input_tokens=input_tokens, output_tokens=output_tokens, estimated_cost_usd=estimated_model_cost(input_tokens, output_tokens), error=call_error, created_by=user.id))
     destructive = not _safe_read_only_sql(sql)
-    if dialect == "postgres" and connector is None and not destructive and execution is None:
+    if dialect == "postgres" and executable_local_source and not destructive and execution is None:
         execution = _local_execution_error(sql)
     primary_asset = next((item for item in prioritized_catalog if item.asset_type in {"staged_file", "view"}), prioritized_catalog[0] if prioritized_catalog else None)
     sources: list[dict[str, Any]] = []
@@ -403,7 +417,7 @@ def generate_sql(
                 "Read-only statement",
                 "Result limit applied",
                 "Registered source selected: " + f"{source_system['name']} ({source_system['connector_type']})",
-                "Executed against local PostgreSQL" if dialect == "postgres" and connector is None and execution and not execution.get("error") else "Execution requires the matching configured source system",
+                "Executed against local PostgreSQL" if dialect == "postgres" and executable_local_source and execution and not execution.get("error") else "Execution requires the matching configured source system",
             ],
         },
         "sources": sources,
@@ -460,7 +474,22 @@ def execute_sql(
 ) -> dict[str, Any]:
     project = require_current_project(db, user)
     try:
-        result = execute_read_only(engine, payload.sql, payload.limit)
+        if payload.connector_id:
+            connector = require_project_resource(db.get(Connector, payload.connector_id), project, "Connector")
+            result = main.execute_connector_query(
+                connector,
+                payload.sql,
+                {},
+                payload.limit,
+                30,
+                user_id=user.id,
+                session_id=request_id.get() or None,
+                feature="sql_execute_preview",
+            )
+            audit_dialect = connector_dialect(connector, payload.dialect)
+        else:
+            result = execute_read_only(engine, payload.sql, payload.limit)
+            audit_dialect = payload.dialect
     except ValueError as exc:
         main.record_governance_event(
             "sql_guardrail",
@@ -483,7 +512,7 @@ def execute_sql(
         "sql.executed_read_only",
         "query",
         None,
-        {"dialect": payload.dialect, "row_count": result["row_count"], "truncated": result["truncated"]},
+        {"dialect": audit_dialect, "row_count": result["row_count"], "truncated": result["truncated"]},
     )
     db.commit()
     return result

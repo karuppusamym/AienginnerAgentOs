@@ -88,6 +88,7 @@ export default function Home() {
   const [projectDialog, setProjectDialog] = useState(false);
   const [projectForm, setProjectForm] = useState({ name: "", description: "", environment: "local" });
   const [sqlSeed, setSqlSeed] = useState<{ question: string; dialect: string } | null>(null);
+  const [analysisSeed, setAnalysisSeed] = useState<{ question: string; connector_id: string } | null>(null);
   const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const [openNavGroups, setOpenNavGroups] = useState<Record<string, boolean>>({ overview: true, data: true, delivery: true, governance: false, administration: false });
 
@@ -342,8 +343,8 @@ export default function Home() {
 
         <main className="content">
           {active === "workspace" && <WorkspaceView setActive={setActive} notify={notify} />}
-          {active === "conversations" && <ConversationsView notify={notify} currentUser={user} />}
-          {active === "datasets" && <DatasetsView notify={notify} onOpenSQL={(dataset) => { setSqlSeed({ question: `Analyze ${dataset.schema_name}.${dataset.table_name} using its approved metadata`, dialect: dataset.source_name === "Local files" ? "postgres" : "sqlserver" }); setActive("sql"); }} />}
+          {active === "conversations" && <ConversationsView notify={notify} currentUser={user} seed={analysisSeed} />}
+          {active === "datasets" && <DatasetsView notify={notify} onOpenSQL={(dataset) => { setSqlSeed({ question: `Analyze ${dataset.schema_name}.${dataset.table_name} using its approved metadata`, dialect: dataset.source_name === "Local files" ? "postgres" : "sqlserver" }); setActive("sql"); }} onStartAnalysis={(dataset) => { setAnalysisSeed({ question: `Can you analyze the ${dataset.schema_name}.${dataset.table_name} dataset for me?`, connector_id: dataset.connector_id || "" }); setActive("conversations"); }} />}
           {active === "files" && <FilesView notify={notify} currentUser={user} />}
           {active === "sql" && <SQLView notify={notify} seed={sqlSeed} currentUser={user} />}
           {active === "notebooks" && <NotebooksView notify={notify} />}

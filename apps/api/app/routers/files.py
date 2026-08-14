@@ -221,7 +221,7 @@ def ingest_file(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     suffix = Path(file.filename or "").suffix.lower()
     allowed = {".csv", ".json", ".xlsx", ".parquet", ".pdf"}
@@ -311,6 +311,7 @@ def ingest_file(
                 "status": item.status,
                 "relation": staged.get("relation") if staged else None,
             },
+            db=db,
         )
     except Exception:
         pass
@@ -383,8 +384,7 @@ def create_external_extraction(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     connector = require_project_resource(db.get(Connector, payload.connector_id), project, "Connector")
     asset = require_project_resource(db.get(DataAsset, payload.source_asset_id), project, "Data asset")
@@ -460,8 +460,7 @@ async def run_external_extraction(
     scheduled file ingestion. See extraction_runtime.py and
     IMPLEMENTATION_STATUS_MATRIX.md for the full write-up.
     """
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     extraction = require_project_resource(db.get(ExternalExtraction, extraction_id), project, "External extraction")
     connector = require_project_resource(db.get(Connector, extraction.connector_id), project, "Connector")
@@ -498,7 +497,7 @@ def create_schedule(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     mapping = require_project_resource(db.get(IngestionMapping, payload.mapping_id), project, "Ingestion mapping")
     target_columns = {str(column["target_name"]) for column in mapping.columns}
@@ -578,8 +577,7 @@ async def run_schedule_now(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     schedule = require_project_resource(db.get(IngestionSchedule, schedule_id), project, "Ingestion schedule")
     if not schedule.enabled:
@@ -602,8 +600,7 @@ def disable_schedule(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     schedule = require_project_resource(db.get(IngestionSchedule, schedule_id), project, "Ingestion schedule")
     schedule.enabled = False
@@ -618,7 +615,7 @@ def save_file_schema(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     item = require_project_resource(db.get(IngestedFile, file_id), project, "File")
     if item.profile.get("kind") != "structured":
@@ -697,7 +694,7 @@ def stage_file_mapping(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     item = require_project_resource(db.get(IngestedFile, file_id), project, "File")
     mapping = require_project_resource(db.get(IngestionMapping, payload.mapping_id), project, "File mapping")
@@ -818,6 +815,7 @@ def stage_file_mapping(
             f"Mapped local file {item.filename} with {staged['row_count']} rows. Columns: "
             + ", ".join(column["name"] for column in staged["columns"]),
             {"source_type": "dataset", "schema_name": staged["schema_name"], "table_name": staged["table_name"], "tags": asset.tags},
+            db=db,
         )
     except Exception:
         pass

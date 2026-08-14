@@ -1,7 +1,7 @@
 # DataPilot Agent OS: Product, Architecture, and Deployment Specification
 
-**Status:** authoritative local-build reference  
-**Last reviewed:** August 2, 2026  
+**Status:** authoritative local-build reference — for current pass/fail status, capability completeness, and open gaps, see `docs/IMPLEMENTATION_STATUS_MATRIX.md` (reconciled more frequently than this document; last reconciled August 9, 2026)  
+**Last reviewed:** August 2, 2026 — narrative/architecture content only; test counts and capability claims below have not been re-verified as often as the status matrix and may lag it  
 **Audience:** product owners, data teams, platform engineers, security reviewers, and implementers
 
 ## 1. Executive summary
@@ -404,7 +404,7 @@ Before any production cutover, complete the following release gates:
 
 ### 9.1 Current verification baseline
 
-The documented August 2026 local verification baseline is: API acceptance suite (54 passing tests), web production build, Docker API readiness, browser preflight for the local development origin, and AgentGuard initialization/custom event emission. This is evidence for the local path, not production certification of external systems.
+The documented August 2026 local verification baseline is: API acceptance suite (54 passing tests as of this document's last review — now 79 passing per `docs/IMPLEMENTATION_STATUS_MATRIX.md`, reconciled August 9, 2026), web production build, Docker API readiness, browser preflight for the local development origin, and AgentGuard initialization/custom event emission. This is evidence for the local path, not production certification of external systems.
 
 ### 9.2 Recommended demonstrations
 

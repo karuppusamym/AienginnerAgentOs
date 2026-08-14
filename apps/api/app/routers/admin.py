@@ -241,14 +241,22 @@ def update_user(
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    if payload.role is None and payload.active is None:
+    if payload.role is None and payload.active is None and payload.name is None and payload.email is None:
         raise HTTPException(status_code=422, detail="At least one user field is required")
     next_role = payload.role if payload.role is not None else user.role
     next_active = payload.active if payload.active is not None else user.active
     if user.id == admin.id and (not next_active or next_role != "admin"):
         raise HTTPException(status_code=409, detail="The active administrator cannot remove their own access")
+    if payload.email is not None:
+        normalized_email = payload.email.strip().lower()
+        existing = db.scalar(select(User).where(func.lower(User.email) == normalized_email, User.id != user.id))
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="A user with this email already exists")
+        user.email = normalized_email
+    if payload.name is not None:
+        user.name = payload.name.strip()
     user.role = next_role
     user.active = next_active
-    audit(db, admin, "admin.user_updated", "user", user.id, {"role": user.role, "active": user.active})
+    audit(db, admin, "admin.user_updated", "user", user.id, {"role": user.role, "active": user.active, "name": user.name, "email": user.email})
     db.commit()
     return as_dict(user, ["id", "email", "name", "role", "active", "must_change_password", "created_at"])

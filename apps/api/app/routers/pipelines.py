@@ -204,7 +204,7 @@ def list_pipelines(user: User = Depends(get_current_user), db: Session = Depends
 
 @router.post("/pipelines/generate", status_code=201)
 def generate_pipeline(payload: PipelineGenerateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     assets = [db.get(DataAsset, asset_id) for asset_id in payload.source_asset_ids]
     if any(asset is None or asset.project_id != project.id for asset in assets):
@@ -370,7 +370,7 @@ def save_pipeline_package_delivery_config(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     _, pipeline, version = _get_project_pipeline_with_version(pipeline_id, user=user, db=db)
     definition = json.loads(json.dumps(version.definition, default=str))
     if not definition.get("artifacts"):
@@ -490,7 +490,7 @@ def validate_pipeline_package(
 
 @router.put("/pipelines/{pipeline_id}")
 def update_pipeline(pipeline_id: str, payload: PipelineUpdateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     pipeline = db.get(PipelineDefinition, pipeline_id)
     if pipeline is None or pipeline.project_id != project.id or pipeline.status == "deleted":
@@ -535,7 +535,7 @@ def update_pipeline(pipeline_id: str, payload: PipelineUpdateRequest, user: User
 
 @router.delete("/pipelines/{pipeline_id}")
 def delete_pipeline(pipeline_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, str]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     pipeline = db.get(PipelineDefinition, pipeline_id)
     if pipeline is None or pipeline.project_id != project.id or pipeline.status == "deleted":
@@ -547,7 +547,7 @@ def delete_pipeline(pipeline_id: str, user: User = Depends(get_current_user), db
 
 @router.post("/pipelines/{pipeline_id}/deploy", status_code=201)
 def request_pipeline_deployment(pipeline_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    require_data_editor(user)
+    require_data_editor(user, db)
     project = require_current_project(db, user)
     pipeline = db.get(PipelineDefinition, pipeline_id)
     if pipeline is None or pipeline.project_id != project.id:

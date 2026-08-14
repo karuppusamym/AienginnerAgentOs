@@ -255,7 +255,7 @@ def request_sql_publication(
     immutable DataPilot artifact version, be locally executable, and is copied
     into approval evidence before an approver can promote it.
     """
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     if bool(payload.artifact_id) == bool(payload.notebook_id):
         raise HTTPException(status_code=422, detail="Select exactly one saved SQL artifact or notebook")

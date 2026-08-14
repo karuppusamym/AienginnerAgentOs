@@ -107,11 +107,19 @@ Web:
 ```powershell
 cd apps\web
 npm install
+$env:INTERNAL_API_URL = "http://localhost:8000"
 npm run dev
 ```
 
 The API uses SQLite when `DATABASE_URL` is not set, which keeps the direct local
 development path self-contained.
+
+The web app calls its API through a same-origin `/api/*` path that Next.js rewrites
+to `INTERNAL_API_URL` (see `apps/web/next.config.ts`), defaulting to `http://api:8000`
+for the Docker Compose network. Running the web app directly (outside Compose) needs
+`INTERNAL_API_URL` set to wherever the API is actually reachable — `http://localhost:8000`
+for the standalone `uvicorn` command above. `NEXT_PUBLIC_API_URL` is no longer read by
+the frontend and can be ignored.
 
 ## Enterprise configuration
 
@@ -150,7 +158,23 @@ Database connection modes, Google MCP Toolbox examples, external tool discovery,
 VS Code configuration, and the Google ADK account-agent example are documented in
 [`docs/DATABASE_MCP_TOOL_REGISTRY_GUIDE.md`](docs/DATABASE_MCP_TOOL_REGISTRY_GUIDE.md).
 
+For a detailed mapping of how the system addresses the OWASP Top 10 for Large Language Model Applications, see
+[`docs/OWASP_TOP_10_LLM_MAPPING.md`](docs/OWASP_TOP_10_LLM_MAPPING.md).
+
 For a production-platform baseline, [infra/kubernetes/README.md](infra/kubernetes/README.md)
 contains the Kustomize deployment manifests and prerequisite checklist. The
 manifests require managed backing services and organization-specific secrets;
 they are not applied by the local Compose workflow.
+
+## Generating the Demo and Videos
+You can programmatically generate the demo screenshots and record the complete application flow by running the Playwright E2E script:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install playwright pytest-playwright
+playwright install chromium
+python scripts\e2e_playwright_demo.py
+```
+
+The resulting screenshots will be saved to `docs/screenshots/workflows/` and the video recordings will be in `docs/videos/`.

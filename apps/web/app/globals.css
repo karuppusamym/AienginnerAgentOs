@@ -1351,8 +1351,10 @@ a {
 .source-summary small { color: var(--muted); font-size: 10px; }
 .conversation-memory { border-top: 1px solid var(--line); padding: 14px 16px; }
 .compact-memory { margin: 0 18px 12px; border: 1px solid var(--line); border-radius: 5px; background: #faf8f8; padding: 13px; }
+.execution-error { border-color: #e4b8bc; background: #fff3f4; }
 .conversation-memory > span { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .conversation-memory p { max-height: 126px; overflow: auto; margin: 7px 0 0; color: #5b4b4c; font-size: 10px; line-height: 1.5; white-space: pre-line; }
+.execution-error p { color: #8c2f39; }
 .result-chart { border-top: 1px solid var(--line); padding: 16px; }
 .result-chart h4 { margin: 0 0 14px; font-size: 12px; }
 .chart-row { display: grid; grid-template-columns: 72px minmax(40px, 1fr) 62px; align-items: center; gap: 8px; min-height: 28px; font-size: 10px; }
@@ -2070,6 +2072,67 @@ a {
 .dataset-list,
 .jobs-table {
   overflow: hidden;
+}
+
+.graph-panel .section-heading {
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.semantic-graph-svg {
+  width: 100%;
+  height: 460px;
+  display: block;
+}
+
+.graph-edge {
+  stroke: var(--line-strong);
+  stroke-width: 1.4;
+  stroke-dasharray: 5 4;
+  transition: stroke 0.15s ease, stroke-width 0.15s ease;
+}
+
+.graph-edge.governed {
+  stroke: var(--brand);
+  stroke-width: 2;
+  stroke-dasharray: none;
+  opacity: 0.75;
+}
+
+.graph-edge.active {
+  stroke: var(--brand-strong);
+  stroke-width: 2.5;
+  opacity: 1;
+}
+
+.graph-node-dot {
+  fill: var(--surface);
+  stroke: var(--brand);
+  stroke-width: 2;
+}
+
+.graph-node text {
+  font-size: 11px;
+  fill: var(--ink);
+  font-family: inherit;
+}
+
+.graph-node.active .graph-node-dot {
+  fill: var(--brand-soft);
+  stroke: var(--brand-strong);
+}
+
+.graph-node.active text {
+  font-weight: 600;
 }
 
 .dataset-toolbar,
@@ -2797,6 +2860,12 @@ a {
   font-size: 10px;
 }
 
+.admin-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: -8px 0 4px;
+}
+
 .data-table-wrap {
   overflow-x: auto;
   border-top: 1px solid var(--line);
@@ -3419,7 +3488,7 @@ th {
 }
 
 .quality-grid {
-  grid-template-columns: minmax(170px, 0.9fr) minmax(230px, 1.35fr) 90px 110px 36px;
+  grid-template-columns: minmax(170px, 0.9fr) minmax(230px, 1.35fr) 90px 110px 72px;
 }
 
 .quality-grid > span:nth-child(2) {

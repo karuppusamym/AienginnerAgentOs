@@ -224,7 +224,7 @@ def create_evaluation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     evaluation_set = EvaluationSet(
         project_id=project.id,
@@ -254,7 +254,7 @@ def create_agent_red_team_suite(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     cases = [
         {
@@ -331,7 +331,7 @@ def update_evaluation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     evaluation_set = require_project_resource(db.get(EvaluationSet, evaluation_set_id), project, "Evaluation set")
     evaluation_set.name = payload.name
@@ -353,7 +353,7 @@ def delete_evaluation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     evaluation_set = require_project_resource(db.get(EvaluationSet, evaluation_set_id), project, "Evaluation set")
     artifact_id = evaluation_set.artifact_id
@@ -473,7 +473,7 @@ def promote_agent_evaluation_baseline(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    require_workspace_editor(user)
+    require_workspace_editor(user, db)
     project = require_current_project(db, user)
     evaluation_set = require_project_resource(
         db.get(EvaluationSet, evaluation_set_id), project, "Evaluation set"

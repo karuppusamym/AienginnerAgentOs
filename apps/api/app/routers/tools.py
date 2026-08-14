@@ -180,7 +180,7 @@ from ..main import (
     project_grounding_signature, project_output, quality_rule_output,
     query_tool_output, query_tool_usage_summary, re, read_structured_rows,
     record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
+    require_current_project, require_data_editor, require_permission, require_project_resource,
     require_role, require_semantic_maintainer, require_workspace_editor,
     resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
     run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
@@ -207,8 +207,7 @@ def list_tools(_: User = Depends(get_current_user), db: Session = Depends(get_db
 
 @router.post("/tools", status_code=201)
 def create_tool(payload: ToolDefinitionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     if db.scalar(select(ToolDefinition).where(ToolDefinition.name == payload.name)):
         raise HTTPException(status_code=409, detail="A tool with this name already exists")
     if payload.implementation_type == "builtin":
@@ -246,8 +245,7 @@ def get_tool(tool_id: str, _: User = Depends(get_current_user), db: Session = De
 
 @router.put("/tools/{tool_id}")
 def update_tool(tool_id: str, payload: ToolDefinitionUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     tool = db.get(ToolDefinition, tool_id)
     if tool is None:
         raise HTTPException(status_code=404, detail="Tool not found")
@@ -268,8 +266,7 @@ def update_tool(tool_id: str, payload: ToolDefinitionUpdate, user: User = Depend
 
 @router.post("/tools/{tool_id}/versions", status_code=201)
 def create_tool_version(tool_id: str, payload: ToolVersionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
-    if user.role not in {"admin", "engineer"}:
-        raise HTTPException(status_code=403, detail="Admin or engineer role required")
+    require_permission(user, db, "registry:write", "Registry write permission required")
     tool = db.get(ToolDefinition, tool_id)
     if tool is None:
         raise HTTPException(status_code=404, detail="Tool not found")
