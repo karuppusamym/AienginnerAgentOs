@@ -16,6 +16,14 @@ The API scales horizontally via Kubernetes replicas (HPA: 2–8 for `datapilot-a
 
 This baseline only creates `ClusterIP` Services — nothing routes external traffic to them yet. See `ingress.example.yaml` for a vanilla-Kubernetes `Ingress` template and a commented-out OpenShift `Route` alternative; copy whichever matches your platform into your overlay, fill in the hostname/TLS placeholders, and add it to `kustomization.yaml`.
 
+## NetworkPolicy — lateral-movement restriction, not egress control
+
+`network-policy.yaml` closes the "every pod can reach every other pod" gap for **ingress**: a default-deny-ingress policy applies to every pod in the namespace, with explicit allows for `datapilot-api` (from `datapilot-web`/`datapilot-worker` on 8000) and `datapilot-web` (from those two, plus your ingress controller on 3000). `datapilot-worker` has no Service and gets no inbound allow rule at all under this baseline — it only makes outbound calls.
+
+**Before applying, edit the `namespaceSelector` placeholder in `network-policy.yaml`'s `datapilot-web-allow-ingress` rule** to match your actual ingress controller's namespace/labels (e.g. nginx-ingress is commonly `kubernetes.io/metadata.name: ingress-nginx`) — left as the placeholder, external traffic to the web UI will be silently blocked.
+
+This intentionally does **not** restrict egress. `datapilot-api`/`datapilot-worker` need broad outbound reach by design — connectors, MCP servers, and model providers are registered against arbitrary external endpoints at runtime, so a safe egress allowlist has to live at the network/firewall layer (cloud provider egress controls) where the destination list is centrally managed, not hardcoded into a namespace-scoped NetworkPolicy that has no way to know your cluster's pod/service CIDR.
+
 ## Required secrets
 
 Create a `datapilot-runtime` secret in the target namespace with at least:
@@ -40,6 +48,6 @@ Before production cutover, validate backup/restore, TLS ingress, network egress,
 
 ## Known gaps in this baseline (honest, not yet closed)
 
-- No `NetworkPolicy` — every pod can reach every other pod/namespace by default. Add one before this is internet-facing.
+- `NetworkPolicy` now restricts ingress (see above) but not egress — a compromised pod can still reach arbitrary external hosts, and cross-namespace egress within the cluster is unrestricted. Deliberate scope limit, not an oversight; see the NetworkPolicy section above for why.
 - The worker's liveness probe checks that the `app.worker` process exists (`pgrep`), which catches crashes but not a hung-but-alive event loop. A heartbeat file or small health-check sidecar would close that gap.
 - No autoscaling signal beyond CPU utilization — a burst of Temporal activity (e.g. many scheduled ingestions at once) that's I/O-bound rather than CPU-bound won't trigger the worker HPA. Worth adding a custom metric (e.g. Temporal task-queue depth) if that pattern shows up in practice.

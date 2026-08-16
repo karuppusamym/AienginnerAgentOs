@@ -57,7 +57,16 @@ def generated_sql(dialect: str) -> str:
 
 
 def generated_catalog_sql(dialect: str, assets: list[DataAsset]) -> str:
-    if assets and assets[0].schema_name == "core" and assets[0].table_name == "accounts":
+    # Look for the well-known demo table anywhere in the catalog, not just at
+    # position 0. `assets` is caller-provided ordering (grounding-prioritized
+    # in routers/sql.py) -- when any other asset sorts or scores ahead of
+    # core.accounts (e.g. another catalog asset whose schema_name sorts
+    # alphabetically before "core", or one grounding scores higher for a
+    # given question), the polished canned demo query silently disappeared
+    # in favor of a generic, less useful templated query even though the
+    # well-known demo table was still right there in the catalog.
+    demo_accounts = next((item for item in assets if item.schema_name == "core" and item.table_name == "accounts"), None)
+    if demo_accounts is not None:
         return generated_sql(dialect)
     if not assets:
         raise HTTPException(status_code=409, detail="Ingest or scan a dataset before generating SQL")

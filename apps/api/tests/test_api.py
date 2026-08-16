@@ -26,7 +26,7 @@ os.environ["ENABLE_DEMO_DATA"] = "true"
 from fastapi.testclient import TestClient
 
 from app.database import SessionLocal, engine
-from app.connector_runtime import ConnectorRuntimeError, execute_connector_query, list_mcp_tools, resolve_credentials, test_connection as connector_connection_probe
+from app.connector_runtime import ConnectorRuntimeError, _normalize_mcp_result, execute_connector_query, list_mcp_tools, resolve_credentials, test_connection as connector_connection_probe
 from app.governance import record_governance_event, record_model_generation
 from app.main import app, audit
 from app.model_runtime import test_provider as invoke_provider_test
@@ -422,6 +422,21 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(fake_client.calls[2]["json"]["method"], "tools/list")
         self.assertEqual(fake_client.calls[2]["headers"]["Mcp-Session-Id"], "session-42")
 
+    def test_mcp_text_content_items_are_normalized_as_rows(self) -> None:
+        result = _normalize_mcp_result(
+            {
+                "content": [
+                    {"type": "text", "text": '{"status":"settled","total_amount":12.5}'},
+                    {"type": "text", "text": '{"status":"pending","total_amount":3.0}'},
+                ]
+            },
+            limit=50,
+            started=0.0,
+        )
+        self.assertEqual(result["columns"], ["status", "total_amount"])
+        self.assertEqual(result["row_count"], 2)
+        self.assertEqual(result["rows"][1]["status"], "pending")
+
     def test_mcp_connector_and_query_tool_contract(self) -> None:
         missing_url = self.client.post(
             "/connectors",
@@ -774,6 +789,281 @@ class DataPilotApiTests(unittest.TestCase):
                     db, job2, [{"agent": "Metadata", "action": "Profile the relevant dataset"}], objective, fake_provider,
                 )
         self.assertFalse([item for item in evidence2 if item.get("tool") == "dataset.profile"], evidence2)
+
+        # Clean up the synthetic catalog asset created above. unittest runs
+        # test methods alphabetically within this shared-DB TestCase, and an
+        # uncleaned asset here previously leaked into the project catalog for
+        # every alphabetically-later test -- concretely, it silently changed
+        # which table /sql/generate's deterministic local-mock path picked
+        # for a generic question, breaking test_postgres_connector_type_is_
+        # registered_with_postgres_dialect and test_sql_generation_is_read_only
+        # even though neither test touches this asset directly.
+        with SessionLocal() as db:
+            db.query(DataAsset).filter(DataAsset.id == asset_id).delete()
+            db.commit()
+
+    def test_semantic_join_policy_rejects_cross_connector_datasets(self) -> None:
+        """A join policy is a promise DataPilot can execute the join it
+        describes -- but every /sql/generate or /sql/execute call is scoped
+        to one connector (or the local workspace) at a time, so a policy
+        between two different external connectors' assets can never
+        actually be run by anything that reads it. validate_semantic_join_policy()
+        must reject that combination at creation time, while still allowing
+        same-connector and local-workspace (connector_id is None) pairs,
+        which really can be joined in one query."""
+        from app.database import SessionLocal
+        from app.models import Connector, DataAsset
+
+        connector_a = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Warehouse A", "connector_type": "postgres", "host": "a.internal", "database": "a", "secret_reference": "env:A_CREDS", "read_only": True},
+        ).json()
+        connector_b = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Warehouse B", "connector_type": "postgres", "host": "b.internal", "database": "b", "secret_reference": "env:B_CREDS", "read_only": True},
+        ).json()
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        with SessionLocal() as db:
+            asset_a = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Warehouse A", schema_name="public", table_name="customers", asset_type="table", columns=[{"name": "customer_id", "type": "integer"}])
+            asset_a2 = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Warehouse A", schema_name="public", table_name="orders", asset_type="table", columns=[{"name": "customer_id", "type": "integer"}])
+            asset_b = DataAsset(project_id=current_project["id"], connector_id=connector_b["id"], source_name="Warehouse B", schema_name="public", table_name="customers", asset_type="table", columns=[{"name": "customer_id", "type": "integer"}])
+            local_1 = DataAsset(project_id=current_project["id"], connector_id=None, source_name="Local", schema_name="staging", table_name="left_local", asset_type="staged_file", columns=[{"name": "customer_id", "type": "integer"}])
+            local_2 = DataAsset(project_id=current_project["id"], connector_id=None, source_name="Local", schema_name="staging", table_name="right_local", asset_type="staged_file", columns=[{"name": "customer_id", "type": "integer"}])
+            db.add_all([asset_a, asset_a2, asset_b, local_1, local_2])
+            db.commit()
+            for asset in (asset_a, asset_a2, asset_b, local_1, local_2):
+                db.refresh(asset)
+            asset_a_id, asset_a2_id, asset_b_id, local_1_id, local_2_id = asset_a.id, asset_a2.id, asset_b.id, local_1.id, local_2.id
+
+        cross_connector = self.client.post(
+            "/semantic/joins", headers=self.headers,
+            json={"left_asset_id": asset_a_id, "right_asset_id": asset_b_id, "left_column": "customer_id", "right_column": "customer_id", "join_type": "inner", "status": "draft"},
+        )
+        self.assertEqual(cross_connector.status_code, 422, cross_connector.text)
+        self.assertIn("different connectors", cross_connector.json()["detail"])
+
+        same_connector = self.client.post(
+            "/semantic/joins", headers=self.headers,
+            json={"left_asset_id": asset_a_id, "right_asset_id": asset_a2_id, "left_column": "customer_id", "right_column": "customer_id", "join_type": "inner", "status": "draft"},
+        )
+        self.assertEqual(same_connector.status_code, 201, same_connector.text)
+
+        local_to_local = self.client.post(
+            "/semantic/joins", headers=self.headers,
+            json={"left_asset_id": local_1_id, "right_asset_id": local_2_id, "left_column": "customer_id", "right_column": "customer_id", "join_type": "inner", "status": "draft"},
+        )
+        self.assertEqual(local_to_local.status_code, 201, local_to_local.text)
+
+        with SessionLocal() as db:
+            from app.models import SemanticJoinPolicy
+            db.query(SemanticJoinPolicy).filter(SemanticJoinPolicy.id.in_([same_connector.json()["id"], local_to_local.json()["id"]])).delete(synchronize_session=False)
+            db.query(DataAsset).filter(DataAsset.id.in_([asset_a_id, asset_a2_id, asset_b_id, local_1_id, local_2_id])).delete(synchronize_session=False)
+            db.commit()
+        self.client.delete(f"/connectors/{connector_a['id']}", headers=self.headers)
+        self.client.delete(f"/connectors/{connector_b['id']}", headers=self.headers)
+
+    def test_semantic_graph_inferred_edges_stay_within_connector_groups(self) -> None:
+        """/semantic/graph's column-name-based inferred suggestions used to
+        pair up assets from completely different external connectors just
+        because they shared a column name -- e.g. two unrelated warehouses
+        that both happen to have a `customer_id` column -- producing a dense,
+        misleading graph where most edges described a join the query engine
+        can never actually run (every /sql/generate call is scoped to one
+        connector at a time). This confirms inferred edges are now confined
+        to assets that could genuinely be queried together (same connector,
+        or both from the local workspace), and that each node carries a
+        `group`/`source_label` the UI can use to cluster by source."""
+        from app.database import SessionLocal
+        from app.models import Connector, DataAsset
+
+        connector_a = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Graph Warehouse A", "connector_type": "postgres", "host": "ga.internal", "database": "ga", "secret_reference": "env:GA_CREDS", "read_only": True},
+        ).json()
+        connector_b = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Graph Warehouse B", "connector_type": "postgres", "host": "gb.internal", "database": "gb", "secret_reference": "env:GB_CREDS", "read_only": True},
+        ).json()
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        with SessionLocal() as db:
+            asset_a1 = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Graph Warehouse A", schema_name="public", table_name="widgets_left", asset_type="table", columns=[{"name": "shared_key", "type": "integer"}])
+            asset_a2 = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Graph Warehouse A", schema_name="public", table_name="widgets_right", asset_type="table", columns=[{"name": "shared_key", "type": "integer"}])
+            asset_b1 = DataAsset(project_id=current_project["id"], connector_id=connector_b["id"], source_name="Graph Warehouse B", schema_name="public", table_name="gizmos", asset_type="table", columns=[{"name": "shared_key", "type": "integer"}])
+            db.add_all([asset_a1, asset_a2, asset_b1])
+            db.commit()
+            for asset in (asset_a1, asset_a2, asset_b1):
+                db.refresh(asset)
+            a1_id, a2_id, b1_id = asset_a1.id, asset_a2.id, asset_b1.id
+
+        graph = self.client.get("/semantic/graph?include_inferred=true", headers=self.headers)
+        self.assertEqual(graph.status_code, 200)
+        payload = graph.json()
+        edge_pairs = [{edge["source"], edge["target"]} for edge in payload["edges"] if not edge["governed"]]
+        self.assertIn({a1_id, a2_id}, edge_pairs, "same-connector assets sharing a column should still get an inferred edge")
+        self.assertNotIn({a1_id, b1_id}, edge_pairs, "cross-connector assets must not get an inferred edge even if columns match")
+        self.assertNotIn({a2_id, b1_id}, edge_pairs, "cross-connector assets must not get an inferred edge even if columns match")
+        nodes_by_id = {node["id"]: node for node in payload["nodes"]}
+        self.assertEqual(nodes_by_id[a1_id]["group"], connector_a["id"])
+        self.assertEqual(nodes_by_id[b1_id]["group"], connector_b["id"])
+        self.assertNotEqual(nodes_by_id[a1_id]["group"], nodes_by_id[b1_id]["group"])
+        self.assertEqual(nodes_by_id[a1_id]["source_label"], "Graph Warehouse A")
+
+        with SessionLocal() as db:
+            db.query(DataAsset).filter(DataAsset.id.in_([a1_id, a2_id, b1_id])).delete(synchronize_session=False)
+            db.commit()
+        self.client.delete(f"/connectors/{connector_a['id']}", headers=self.headers)
+        self.client.delete(f"/connectors/{connector_b['id']}", headers=self.headers)
+
+    def test_semantic_graph_flags_pre_existing_cross_connector_policies(self) -> None:
+        """validate_semantic_join_policy() blocks *creating* a cross-connector
+        governed policy, but that guard can't retroactively fix one that
+        already exists -- e.g. approved before the check existed, or created
+        while the Join Policy panel's dataset picker still silently
+        collapsed duplicate-named assets from different sources into one
+        selectable option. Insert a policy directly (bypassing the create
+        endpoint's validation, the same way stale/pre-existing data would
+        have gotten in) and confirm /semantic/graph flags it with
+        cross_connector: true rather than rendering it identically to a
+        real, executable governed join. A same-connector policy must not be
+        flagged."""
+        from app.database import SessionLocal
+        from app.models import Connector, DataAsset, SemanticJoinPolicy
+
+        connector_a = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Flag Warehouse A", "connector_type": "postgres", "host": "fa.internal", "database": "fa", "secret_reference": "env:FA_CREDS", "read_only": True},
+        ).json()
+        connector_b = self.client.post(
+            "/connectors", headers=self.headers,
+            json={"name": "Flag Warehouse B", "connector_type": "postgres", "host": "fb.internal", "database": "fb", "secret_reference": "env:FB_CREDS", "read_only": True},
+        ).json()
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        me = self.client.get("/auth/me", headers=self.headers).json()
+        with SessionLocal() as db:
+            asset_a = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Flag Warehouse A", schema_name="public", table_name="left_table", asset_type="table", columns=[{"name": "key", "type": "integer"}])
+            asset_a2 = DataAsset(project_id=current_project["id"], connector_id=connector_a["id"], source_name="Flag Warehouse A", schema_name="public", table_name="left_table_2", asset_type="table", columns=[{"name": "key", "type": "integer"}])
+            asset_b = DataAsset(project_id=current_project["id"], connector_id=connector_b["id"], source_name="Flag Warehouse B", schema_name="public", table_name="right_table", asset_type="table", columns=[{"name": "key", "type": "integer"}])
+            db.add_all([asset_a, asset_a2, asset_b])
+            db.flush()
+            bad_policy = SemanticJoinPolicy(project_id=current_project["id"], left_asset_id=asset_a.id, right_asset_id=asset_b.id, left_column="key", right_column="key", join_type="inner", status="approved", created_by=me["id"])
+            good_policy = SemanticJoinPolicy(project_id=current_project["id"], left_asset_id=asset_a.id, right_asset_id=asset_a2.id, left_column="key", right_column="key", join_type="inner", status="approved", created_by=me["id"])
+            db.add_all([bad_policy, good_policy])
+            db.commit()
+            for row in (asset_a, asset_a2, asset_b, bad_policy, good_policy):
+                db.refresh(row)
+            bad_policy_id, good_policy_id = bad_policy.id, good_policy.id
+            asset_a_id, asset_a2_id, asset_b_id = asset_a.id, asset_a2.id, asset_b.id
+
+        graph = self.client.get("/semantic/graph?include_inferred=false", headers=self.headers)
+        self.assertEqual(graph.status_code, 200)
+        edges_by_id = {edge["id"]: edge for edge in graph.json()["edges"]}
+        self.assertTrue(edges_by_id[bad_policy_id]["cross_connector"], edges_by_id[bad_policy_id])
+        self.assertFalse(edges_by_id[good_policy_id]["cross_connector"], edges_by_id[good_policy_id])
+
+        with SessionLocal() as db:
+            db.query(SemanticJoinPolicy).filter(SemanticJoinPolicy.id.in_([bad_policy_id, good_policy_id])).delete(synchronize_session=False)
+            db.query(DataAsset).filter(DataAsset.id.in_([asset_a_id, asset_a2_id, asset_b_id])).delete(synchronize_session=False)
+            db.commit()
+        self.client.delete(f"/connectors/{connector_a['id']}", headers=self.headers)
+        self.client.delete(f"/connectors/{connector_b['id']}", headers=self.headers)
+
+    def test_semantic_graph_treats_distinct_mcp_tools_as_non_joinable_even_under_one_connector(self) -> None:
+        """A direct-driver connector's assets really do share one physical DB
+        connection, so grouping purely by connector_id is correct for those.
+        An MCP-backed connector is different: discover_mcp_metadata() catalogs
+        each MCP tool as its own DataAsset (all hardcoded schema_name='mcp'),
+        and MCP execution (execute_connector_query -> execute_mcp_tool)
+        always invokes exactly one named tool per call -- there is no
+        cross-tool join path. A single MCP toolbox can even front two
+        entirely separate physical backends (see infra/mcp-toolbox/toolbox.yaml,
+        which pairs a SQL Server source and a Postgres source behind one
+        connector) with no structured signal telling DataPilot which tools
+        share a backend, so two tools under the *same* connector_id must
+        still never be treated as joinable, unlike a direct connector's
+        assets. This was a real gap: the first pass of group_key() grouped
+        purely by connector_id and produced a graph that visually connected
+        an MCP SQL Server tool to an MCP Postgres tool behind one toolbox."""
+        from app.database import SessionLocal
+        from app.models import Connector, DataAsset
+
+        mcp_connector = self.client.post(
+            "/connectors", headers=self.headers,
+            json={
+                "name": "Payments MCP Toolbox",
+                "connector_type": "sql_server",
+                "connection_mode": "mcp",
+                "mcp_server_url": "http://mcp-toolbox.internal:5000/mcp",
+                "read_only": True,
+            },
+        ).json()
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        with SessionLocal() as db:
+            sqlserver_tool = DataAsset(project_id=current_project["id"], connector_id=mcp_connector["id"], source_name="Payments MCP Toolbox", schema_name="mcp", table_name="sqlserver.get_account", asset_type="table", columns=[{"name": "account_id", "type": "integer"}])
+            postgres_tool = DataAsset(project_id=current_project["id"], connector_id=mcp_connector["id"], source_name="Payments MCP Toolbox", schema_name="mcp", table_name="postgres.get_account", asset_type="table", columns=[{"name": "account_id", "type": "integer"}])
+            db.add_all([sqlserver_tool, postgres_tool])
+            db.commit()
+            for asset in (sqlserver_tool, postgres_tool):
+                db.refresh(asset)
+            sqlserver_id, postgres_id = sqlserver_tool.id, postgres_tool.id
+
+        graph = self.client.get("/semantic/graph?include_inferred=true", headers=self.headers)
+        self.assertEqual(graph.status_code, 200)
+        payload = graph.json()
+        edge_pairs = [{edge["source"], edge["target"]} for edge in payload["edges"] if not edge["governed"]]
+        self.assertNotIn({sqlserver_id, postgres_id}, edge_pairs, "two distinct MCP tools sharing a connector_id and a column name must not get an inferred edge")
+        nodes_by_id = {node["id"]: node for node in payload["nodes"]}
+        self.assertNotEqual(nodes_by_id[sqlserver_id]["group"], nodes_by_id[postgres_id]["group"], "each MCP tool must be its own atomic group even under one connector")
+        self.assertEqual(nodes_by_id[sqlserver_id]["source_label"], "Payments MCP Toolbox")
+        self.assertEqual(nodes_by_id[postgres_id]["source_label"], "Payments MCP Toolbox")
+
+        with SessionLocal() as db:
+            db.query(DataAsset).filter(DataAsset.id.in_([sqlserver_id, postgres_id])).delete(synchronize_session=False)
+            db.commit()
+        self.client.delete(f"/connectors/{mcp_connector['id']}", headers=self.headers)
+
+    def test_semantic_join_policy_rejects_two_mcp_tools_on_same_connector(self) -> None:
+        """validate_semantic_join_policy() blocked cross-connector policies,
+        but that alone would still let someone approve a policy between two
+        different MCP tools that merely happen to share a connector_id --
+        which is just as non-executable, since MCP execution invokes exactly
+        one named tool per call. Confirm that combination is rejected with a
+        message about MCP tools (not the generic cross-connector message),
+        while a same-connector pair on a direct-driver connector still
+        succeeds (covered by test_semantic_join_policy_rejects_cross_connector_datasets)."""
+        from app.database import SessionLocal
+        from app.models import Connector, DataAsset, SemanticJoinPolicy
+
+        mcp_connector = self.client.post(
+            "/connectors", headers=self.headers,
+            json={
+                "name": "Ledger MCP Toolbox",
+                "connector_type": "postgres",
+                "connection_mode": "mcp",
+                "mcp_server_url": "http://ledger-toolbox.internal:5000/mcp",
+                "read_only": True,
+            },
+        ).json()
+        current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+        with SessionLocal() as db:
+            tool_a = DataAsset(project_id=current_project["id"], connector_id=mcp_connector["id"], source_name="Ledger MCP Toolbox", schema_name="mcp", table_name="get_ledger_entry", asset_type="table", columns=[{"name": "ledger_id", "type": "integer"}])
+            tool_b = DataAsset(project_id=current_project["id"], connector_id=mcp_connector["id"], source_name="Ledger MCP Toolbox", schema_name="mcp", table_name="get_ledger_balance", asset_type="table", columns=[{"name": "ledger_id", "type": "integer"}])
+            db.add_all([tool_a, tool_b])
+            db.commit()
+            for asset in (tool_a, tool_b):
+                db.refresh(asset)
+            tool_a_id, tool_b_id = tool_a.id, tool_b.id
+
+        same_connector_mcp = self.client.post(
+            "/semantic/joins", headers=self.headers,
+            json={"left_asset_id": tool_a_id, "right_asset_id": tool_b_id, "left_column": "ledger_id", "right_column": "ledger_id", "join_type": "inner", "status": "draft"},
+        )
+        self.assertEqual(same_connector_mcp.status_code, 422, same_connector_mcp.text)
+        self.assertIn("MCP", same_connector_mcp.json()["detail"])
+
+        with SessionLocal() as db:
+            db.query(DataAsset).filter(DataAsset.id.in_([tool_a_id, tool_b_id])).delete(synchronize_session=False)
+            db.commit()
+        self.client.delete(f"/connectors/{mcp_connector['id']}", headers=self.headers)
 
     def test_seeded_sql_analyst_agent_autonomously_generates_sql(self) -> None:
         """Before sql.generate had a builtin handler, the seeded 'SQL Analyst'
@@ -1178,11 +1468,35 @@ class DataPilotApiTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201)
         self.assertEqual(created.json()["connector_type"], "postgres")
+        # /sql/generate correctly 409s for a connector with no scanned catalog
+        # (see generated_catalog_sql's "Ingest or scan a dataset first" guard) --
+        # this test is about connector_dialect()'s type->dialect override, not
+        # catalog completeness, so give the connector one scanned asset first,
+        # same pattern used below for the Oracle connector-scoped SQL test.
+        with SessionLocal() as db:
+            current_project = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])
+            from app.models import DataAsset
+
+            db.add(
+                DataAsset(
+                    project_id=current_project["id"],
+                    connector_id=created.json()["id"],
+                    source_name="Finance warehouse",
+                    schema_name="finance",
+                    table_name="summary",
+                    asset_type="table",
+                    row_count=10,
+                    columns=[{"name": "id", "type": "integer", "nullable": False}],
+                    tags=["connector-scoped"],
+                    description="Connector-scoped asset for dialect-override test.",
+                )
+            )
+            db.commit()
         generated = self.client.post(
             "/sql/generate", headers=self.headers,
             json={"question": "Show finance summary", "dialect": "sqlserver", "connector_id": created.json()["id"]},
         )
-        self.assertEqual(generated.status_code, 200)
+        self.assertEqual(generated.status_code, 200, generated.text)
         self.assertEqual(generated.json()["dialect"], "postgres")
 
     def test_viewer_cannot_see_connector_secret_or_write_conversations(self) -> None:

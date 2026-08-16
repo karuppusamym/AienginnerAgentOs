@@ -274,11 +274,30 @@ def _normalize_mcp_result(result: dict[str, Any], limit: int, started: float) ->
             for item in result.get("content", [])
             if isinstance(item, dict) and item.get("type") == "text"
         ]
-        text_value = "\n".join(part for part in text_parts if part)
-        try:
-            value = json.loads(text_value) if text_value else []
-        except json.JSONDecodeError:
-            value = {"result": text_value}
+        # MCP Toolbox commonly returns one JSON object per text content item
+        # rather than one JSON array. Joining those objects with newlines
+        # turns a perfectly good result set into one opaque string row, which
+        # prevents external agents and the UI from rendering database results
+        # as a table. Parse each content item independently first, while still
+        # supporting a single JSON array/object and plain text responses.
+        non_empty_parts = [part for part in text_parts if part]
+        parsed_parts: list[Any] = []
+        for part in non_empty_parts:
+            try:
+                parsed_parts.append(json.loads(part))
+            except json.JSONDecodeError:
+                parsed_parts = []
+                break
+        if len(parsed_parts) > 1:
+            value = parsed_parts
+        elif len(parsed_parts) == 1:
+            value = parsed_parts[0]
+        else:
+            text_value = "\n".join(non_empty_parts)
+            try:
+                value = json.loads(text_value) if text_value else []
+            except json.JSONDecodeError:
+                value = {"result": text_value}
     if isinstance(value, dict) and isinstance(value.get("rows"), list):
         rows = value["rows"]
         columns = value.get("columns") or (

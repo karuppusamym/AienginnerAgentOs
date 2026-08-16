@@ -80,7 +80,7 @@ export type Dataset = {
   freshness_sla_hours?: number | null;
   metadata_status?: string;
   connector_id?: string | null;
-  source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string };
+  source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string; connection_mode?: "direct" | "mcp" };
 };
 
 export type Connector = {

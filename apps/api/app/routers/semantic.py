@@ -220,21 +220,108 @@ def semantic_graph(
     # noticed live in this project's own graph (two identical "core.accounts"
     # nodes). Disambiguate only the relations that actually collide, so every
     # already-unique relation keeps its plain, familiar label.
-    connector_names = {connector.id: connector.name for connector in db.scalars(select(Connector).where(Connector.project_id == project.id)).all()}
+    connectors_by_id = {connector.id: connector for connector in db.scalars(select(Connector).where(Connector.project_id == project.id)).all()}
+    connector_names = {connector_id: connector.name for connector_id, connector in connectors_by_id.items()}
+
+    def group_key(asset: DataAsset) -> str:
+        # Every /sql/generate or /sql/execute call is scoped to exactly one
+        # connector (or the local workspace) at a time -- see routers/sql.py's
+        # allowed_asset_ids computation. A join between two assets from
+        # different external connectors can never actually be executed as a
+        # single query, no matter how similar their column names look, so
+        # "group" here means "assets DataPilot can actually query together
+        # in one call": one bucket per external connector_id, plus one shared
+        # bucket for every locally-staged/uploaded asset (connector_id is
+        # None for all of them, but they really do all live in the same
+        # local Postgres/SQLite database and can genuinely be joined).
+        if not asset.connector_id:
+            return "__local__"
+        connector = connectors_by_id.get(asset.connector_id)
+        if connector is not None and connector.connection_mode == "mcp":
+            # A direct-driver connector's assets really do share one
+            # physical DB connection, so grouping by connector_id alone is
+            # correct there. An MCP-backed connector is different: each
+            # asset is a separately-discovered tool (discover_mcp_metadata
+            # hardcodes schema_name="mcp" for every tool regardless of what
+            # it fronts), and MCP execution (execute_connector_query ->
+            # execute_mcp_tool) always invokes exactly one named tool per
+            # call -- there is no cross-tool join path in the runtime. Worse,
+            # one MCP toolbox can front multiple distinct physical backends
+            # with no structured signal in tools/list telling us which tools
+            # share one (see infra/mcp-toolbox/toolbox.yaml's two separate
+            # "kind: source" blocks -- a SQL Server source and a Postgres
+            # source behind the same connector). So even two MCP tools that
+            # happen to share a backend still can't be joined in one query.
+            # Every MCP tool/asset is therefore its own atomic group.
+            return f"{asset.connector_id}:{asset.id}"
+        return asset.connector_id
+
+    def source_label(asset: DataAsset) -> str:
+        return connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
+
     bare_relations = [f"{asset.schema_name}.{asset.table_name}" for asset in assets]
     duplicate_relations = {relation for relation in bare_relations if bare_relations.count(relation) > 1}
     nodes = []
     for asset, bare_relation in zip(assets, bare_relations):
         relation = bare_relation
         if bare_relation in duplicate_relations:
-            source_label = connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
-            relation = f"{bare_relation} ({source_label})"
-        nodes.append({"id": asset.id, "relation": relation, "columns": column_names_for_asset(asset), "metadata_status": asset.metadata_status})
-    edges = [{"id": policy.id, "source": policy.left_asset_id, "target": policy.right_asset_id, "left_column": policy.left_column, "right_column": policy.right_column, "join_type": policy.join_type, "status": policy.status, "governed": True} for policy in policies]
+            relation = f"{bare_relation} ({source_label(asset)})"
+        nodes.append({
+            "id": asset.id,
+            "relation": relation,
+            "columns": column_names_for_asset(asset),
+            "metadata_status": asset.metadata_status,
+            # New: lets the UI cluster/color nodes by source instead of
+            # rendering every asset from every connector on one flat ring
+            # with no notion of which ones can actually be queried together.
+            "group": group_key(asset),
+            "source_label": source_label(asset),
+        })
+    # validate_semantic_join_policy() (app/main.py) now blocks *creating* a
+    # governed policy across two different connectors, but that guard only
+    # covers policies made from this point forward -- it can't retroactively
+    # fix one that was already approved before the check existed (or, e.g.,
+    # created against the wrong asset because the Join Policy panel's own
+    # dataset picker used to silently collapse two identically-named assets
+    # from different sources into one selectable option -- see
+    # JoinPoliciesPanel in SemanticView.tsx). Rather than let an existing
+    # violation keep rendering identically to a real, executable governed
+    # join with no signal anything is wrong, flag it here so the UI can
+    # visibly distinguish it instead of silently trusting stale data.
+    asset_by_id = {asset.id: asset for asset in assets}
+    edges = []
+    for policy in policies:
+        left_asset = asset_by_id.get(policy.left_asset_id)
+        right_asset = asset_by_id.get(policy.right_asset_id)
+        cross_connector = bool(left_asset and right_asset and group_key(left_asset) != group_key(right_asset))
+        edges.append({
+            "id": policy.id,
+            "source": policy.left_asset_id,
+            "target": policy.right_asset_id,
+            "left_column": policy.left_column,
+            "right_column": policy.right_column,
+            "join_type": policy.join_type,
+            "status": policy.status,
+            "governed": True,
+            "cross_connector": cross_connector,
+        })
     if include_inferred:
         for index, left in enumerate(assets):
             left_columns = set(column_names_for_asset(left))
             for right in assets[index + 1:]:
+                # Only ever suggest an inferred join between assets that
+                # could actually be queried together (see group_key above).
+                # Column-name matching across two unrelated external
+                # connectors (e.g. a Postgres source and a SQL Server
+                # source both happening to have a "customer_id" column)
+                # produced a dense, misleading "everything joins to
+                # everything" mesh in this project's own graph -- every
+                # one of those edges implied a join the query engine can
+                # never actually run. Same-connector and same-local-workspace
+                # matches are unaffected; this only removes the
+                # non-actionable cross-connector noise.
+                if group_key(left) != group_key(right):
+                    continue
                 shared = sorted(left_columns & set(column_names_for_asset(right)))
                 for column in shared:
                     if column.lower() in {"id", "created_at", "updated_at"}:

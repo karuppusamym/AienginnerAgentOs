@@ -244,7 +244,7 @@ services:
   mcp-toolbox:
     image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
     restart: unless-stopped
-    command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000"]
+    command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000", "--allowed-hosts", "localhost,127.0.0.1,mcp-toolbox", "--allowed-origins", "http://localhost:3000,http://localhost:8000"]
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
       POSTGRES_DEMO_PASSWORD: ${POSTGRES_DEMO_PASSWORD:-DemoPass#2026!}
@@ -257,8 +257,13 @@ services:
         condition: service_healthy
       postgres-demo:
         condition: service_healthy
+    # The official Toolbox image is shell-less, so CMD-SHELL probes always
+    # fail with "/bin/sh: no such file or directory" even when the MCP
+    # server is ready. Use the image's executable as a shell-free liveness
+    # probe; the API and external-agent smoke tests perform the actual MCP
+    # initialize/tools-list/tools-call readiness validation.
     healthcheck:
-      test: ["CMD-SHELL", "cat /dev/null > /dev/tcp/localhost/5000 && echo ok || exit 1"]
+      test: ["CMD", "/toolbox", "--help"]
       interval: 10s
       timeout: 5s
       retries: 12

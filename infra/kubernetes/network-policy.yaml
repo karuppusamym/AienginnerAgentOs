@@ -1,0 +1,92 @@
+# Baseline NetworkPolicy set closing the "every pod can reach every other
+# pod by default" gap documented in README.md and the implementation status
+# matrix. Scope is deliberately conservative: this only restricts INGRESS
+# (who may open a connection *to* each DataPilot pod). It does not restrict
+# EGRESS, because datapilot-worker and datapilot-api both need broad
+# outbound reach by design -- admins register arbitrary external database
+# connectors (Postgres/SQL Server/Oracle/Teradata/BigQuery), MCP servers,
+# and model-provider endpoints at runtime, so a cluster-CIDR-aware egress
+# allowlist would either need to be re-derived per cluster (this baseline
+# has no way to know your pod/service CIDR) or would break that core
+# product capability. Restricting egress safely is a follow-up that belongs
+# at the network/firewall layer (e.g. cloud provider egress controls) where
+# the destination allowlist can be managed centrally, not hardcoded here.
+#
+# Effect once applied:
+#   - No pod in the `datapilot` namespace may open a connection to another
+#     DataPilot pod unless a rule below explicitly allows it.
+#   - datapilot-api only accepts connections from datapilot-web and
+#     datapilot-worker (its two legitimate internal callers) on port 8000.
+#   - datapilot-web only accepts connections from your ingress controller
+#     (edit the namespaceSelector/podSelector below to match your platform
+#     -- see the placeholders) on port 3000, plus the two callers above for
+#     completeness if either ever needs to reach it directly.
+#   - datapilot-worker has no Service/inbound traffic at all today (it only
+#     originates outbound calls), so it gets no explicit allow-ingress rule
+#     and is fully closed to inbound connections once this policy applies.
+#
+# This does NOT replace TLS/ingress config, a service mesh, or a real
+# security review -- see the "Security review (threat model, pen test,
+# dependency scan)" row in docs/IMPLEMENTATION_STATUS_MATRIX.md, which
+# remains open and out of scope here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: datapilot-default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: datapilot-api-allow-ingress
+spec:
+  podSelector:
+    matchLabels: {app: datapilot-api}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: datapilot-web}}
+        - podSelector: {matchLabels: {app: datapilot-worker}}
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: datapilot-web-allow-ingress
+spec:
+  podSelector:
+    matchLabels: {app: datapilot-web}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Same-namespace internal callers (harmless to allow, kept for parity
+    # with the api policy in case anything server-side ever calls web).
+    - from:
+        - podSelector: {matchLabels: {app: datapilot-api}}
+        - podSelector: {matchLabels: {app: datapilot-worker}}
+      ports:
+        - protocol: TCP
+          port: 3000
+    # External traffic arrives via your ingress controller, which is itself
+    # a pod (usually in another namespace) -- NetworkPolicy sees that hop as
+    # pod-to-pod, so it must be explicitly allowed here. The values below
+    # are placeholders: nginx-ingress typically runs in a namespace labeled
+    # `kubernetes.io/metadata.name: ingress-nginx`; OpenShift's Router runs
+    # as a cluster-infra component that is usually exempt from NetworkPolicy
+    # enforcement entirely (verify against your cluster before relying on
+    # that). Edit this selector to match your actual ingress controller
+    # before applying, or this policy will block all external traffic to
+    # DataPilot's web UI.
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress-nginx} # EDIT ME
+      ports:
+        - protocol: TCP
+          port: 3000
