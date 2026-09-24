@@ -25,7 +25,7 @@ class ProviderGenerationResult:
     latency_ms: int
 
 
-DEFAULT_BASE_URLS = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1"}
+DEFAULT_BASE_URLS = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1", "jev": "https://openrouter.ai/api/alpha/decisions"}
 
 # Environment variables a provider or connector secret reference may never read.
 # An admin could otherwise point a provider at their own base_url with
@@ -130,6 +130,8 @@ def generate_text(
 ) -> ProviderGenerationResult:
     if provider.provider_type == "local_mock":
         return ProviderGenerationResult(content="", latency_ms=1)
+    if provider.provider_type == "jev":
+        raise ValueError("Jev is a decision model (typed choices with probabilities); route it only to decision purposes")
     secret = resolve_secret(provider.secret_reference)
     if not secret:
         raise ValueError("The selected model provider secret is unavailable")
@@ -250,6 +252,14 @@ def test_provider(
         }.items()
         if value is not None
     }
+    if provider.provider_type == "jev":
+        from .jev_client import ask
+
+        probe = ask(provider, {"message": "Please refund my last payment."}, {"refund": {"type": "noul", "instructions": "Does `message` ask for a refund?"}})
+        if not probe["ok"]:
+            return ProviderTestResult("failed", "Jev decision call failed", probe["latency_ms"], probe["error"])
+        value = (probe["answers"].get("refund") or {}).get("noul")
+        return ProviderTestResult("healthy", f"Decision model responded ({probe['model']}): P(refund request)={value}", probe["latency_ms"])
     if provider.provider_type == "local_mock":
         record_model_generation(
             feature="provider_test",

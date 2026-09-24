@@ -68,6 +68,11 @@ def _dashboard_slug(project_slug: str) -> str:
 
 
 def _chart_name(project_slug: str, suffix: str) -> str:
+    # Published-query dashboards pass "query-<artifact uuid>": keep names unique but readable.
+    if project_slug.startswith("query-"):
+        return f"DataPilot query {project_slug[6:14]} - {suffix}"[:240]
+    if project_slug.startswith("asset-"):
+        return f"DataPilot dataset {project_slug[6:14]} - {suffix}"[:240]
     return f"DataPilot {project_slug} {suffix}"[:240]
 
 
@@ -182,7 +187,8 @@ def _choose_dimensions(columns: list[dict[str, Any]]) -> list[str]:
             continue
         lowered_name = name.lower()
         lowered_type = _column_type(column)
-        if lowered_name.endswith("_id"):
+        # Ids, measures and time columns make poor pie slices / categories.
+        if lowered_name.endswith("_id") or lowered_type in {"numeric", "timestamp"} or re.search(r"(date|time|_at$|_on$|month|year|day)", lowered_name):
             continue
         if any(token in lowered_type for token in ("char", "text", "string")) or lowered_type in {
             "bool",
@@ -197,6 +203,30 @@ def _choose_dimensions(columns: list[dict[str, Any]]) -> list[str]:
 def _choose_dimension(columns: list[dict[str, Any]]) -> str | None:
     dimensions = _choose_dimensions(columns)
     return dimensions[0] if dimensions else None
+
+
+def _choose_measure(columns: list[dict[str, Any]]) -> str | None:
+    for column in columns:
+        name = _column_name(column)
+        lowered_type = _column_type(column)
+        numeric = lowered_type == "numeric" or any(t in lowered_type for t in ("int", "numeric", "number", "decimal", "float", "double", "real", "money"))
+        if name and not name.lower().endswith("_id") and numeric:
+            return name
+    return None
+
+
+def _choose_temporal(columns: list[dict[str, Any]]) -> str | None:
+    for column in columns:
+        lowered_type = _column_type(column)
+        if lowered_type == "timestamp" or any(t in lowered_type for t in ("date", "time")):
+            return _column_name(column)
+    return None
+
+
+def _metric(measure: str | None) -> Any:
+    if not measure:
+        return "count"
+    return {"expressionType": "SIMPLE", "column": {"column_name": measure}, "aggregate": "SUM", "label": f"SUM({measure})"}
 
 
 def _choose_preview_columns(columns: list[dict[str, Any]]) -> list[str]:
@@ -258,8 +288,15 @@ def _chart_params(
         "adhoc_filters": [],
         "time_range": "No filter",
     }
+    measure = _choose_measure(columns)
     if chart_kind == "big_number_total":
-        return {**common, "metric": "count", "y_axis_format": "SMART_NUMBER"}
+        return {**common, "metric": _metric(measure), "y_axis_format": "SMART_NUMBER"}
+    if chart_kind == "echarts_timeseries_bar":
+        return {**common, "x_axis": groupby_column, "metrics": [_metric(measure)], "groupby": [], "row_limit": 100,
+                "orientation": "vertical", "show_legend": False, "y_axis_format": "SMART_NUMBER"}
+    if chart_kind == "echarts_timeseries_line":
+        return {**common, "x_axis": groupby_column, "time_grain_sqla": "P1M", "metrics": [_metric(measure)], "groupby": [],
+                "row_limit": 10000, "show_legend": False, "y_axis_format": "SMART_NUMBER", "markerEnabled": True}
     if chart_kind == "pie":
         dimension = groupby_column or _choose_dimension(columns)
         if not dimension:
@@ -348,8 +385,12 @@ def _ensure_chart(
     chart_kind: str,
     columns: list[dict[str, Any]],
     groupby_column: str | None = None,
+    dashboard_key: str | None = None,
 ) -> int:
-    name = _chart_name(project_slug, suffix)
+    # Chart names are the lookup key, so they must be unique per *dashboard*: a
+    # published query dashboard reusing the project dashboard's names used to
+    # take over (and re-point) the project's charts, leaving empty panels.
+    name = _chart_name(dashboard_key or project_slug, suffix)
     existing = next(
         (item for item in _list_results(client, token, internal_url, "/api/v1/chart/") if item.get("slice_name") == name),
         None,
@@ -384,16 +425,41 @@ def _ensure_chart(
     return chart_id
 
 
+def _detach_foreign_charts(client: httpx.Client, token: str, csrf_token: str, internal_url: str, dashboard_id: int, keep: set[int]) -> None:
+    """Remove charts from this dashboard that it does not own (left over from the old name collision)."""
+    headers = {"Authorization": f"Bearer {token}", "X-CSRFToken": csrf_token}
+    attached = client.get(f"{internal_url}/api/v1/dashboard/{dashboard_id}/charts", headers={"Authorization": f"Bearer {token}"})
+    if attached.status_code != 200:
+        return
+    for chart in attached.json().get("result", []):
+        chart_id = int(chart["id"])
+        if chart_id in keep:
+            continue
+        detail = client.get(f"{internal_url}/api/v1/chart/{chart_id}", headers={"Authorization": f"Bearer {token}"})
+        if detail.status_code != 200:
+            continue
+        owners = [int(item["id"]) for item in detail.json().get("result", {}).get("dashboards", []) if int(item["id"]) != dashboard_id]
+        client.put(f"{internal_url}/api/v1/chart/{chart_id}", headers=headers, json={"dashboards": owners})
+
+
 def _dashboard_chart_specs(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    specs: list[dict[str, Any]] = [{"suffix": "total rows", "kind": "big_number_total"}]
-    for dimension in _choose_dimensions(columns):
-        specs.append(
-            {
-                "suffix": f"by {dimension.replace('_', ' ')}",
-                "kind": "pie",
-                "groupby": dimension,
-            }
-        )
+    """KPI, the measure by category (bar), share by category (pie), a monthly trend, and a table.
+
+    A numeric measure is summed, never used as pie slices; pies only count rows,
+    so negative values cannot distort them.
+    """
+    measure = _choose_measure(columns)
+    label = measure.replace("_", " ") if measure else None
+    headline = (label if label.startswith("total") else f"total {label}") if label else "total rows"
+    specs: list[dict[str, Any]] = [{"suffix": headline, "kind": "big_number_total"}]
+    dimensions = _choose_dimensions(columns)
+    if dimensions and measure:
+        specs.append({"suffix": f"{label} by {dimensions[0].replace('_', ' ')}", "kind": "echarts_timeseries_bar", "groupby": dimensions[0]})
+    for dimension in dimensions[: (1 if measure else 2)]:
+        specs.append({"suffix": f"share by {dimension.replace('_', ' ')}", "kind": "pie", "groupby": dimension})
+    temporal = _choose_temporal(columns)
+    if temporal:
+        specs.append({"suffix": f"{label or 'rows'} per month", "kind": "echarts_timeseries_line", "groupby": temporal})
     specs.append({"suffix": "preview", "kind": "table"})
     return specs
 
@@ -403,9 +469,7 @@ def _row_widths(row: list[dict[str, Any]]) -> list[int]:
         return [12]
     first_kind = str(row[0]["kind"])
     second_kind = str(row[1]["kind"])
-    if first_kind == "big_number_total":
-        return [4, 8]
-    if second_kind == "table":
+    if first_kind == "big_number_total" or second_kind == "table":
         return [4, 8]
     return [6, 6]
 
@@ -413,8 +477,14 @@ def _row_widths(row: list[dict[str, Any]]) -> list[int]:
 def _dashboard_positions(charts: list[dict[str, Any]]) -> dict[str, Any]:
     root = "ROOT_ID"
     grid = "GRID_ID"
-    row_ids = ["ROW-OVERVIEW", "ROW-DETAIL"]
-    rows = [charts[:2], charts[2:]] if len(charts) > 2 else [charts]
+    # Two charts per row (the table gets its own row) so no chart is dropped from the layout.
+    rows: list[list[dict[str, Any]]] = []
+    for chart in charts:
+        if chart["kind"] == "table" or not rows or len(rows[-1]) == 2 or rows[-1][0]["kind"] == "table":
+            rows.append([chart])
+        else:
+            rows[-1].append(chart)
+    row_ids = [f"ROW-{index}" for index in range(len(rows))]
     positions: dict[str, Any] = {
         "DASHBOARD_VERSION_KEY": "v2",
         root: {"id": root, "type": "ROOT", "children": [grid]},
@@ -485,6 +555,10 @@ def _ensure_dashboard(
     dataset_id = _ensure_dataset(client, token, csrf_token, internal_url, database_id, dataset)
     columns = list(dataset.get("columns") or [])
     chart_specs = _dashboard_chart_specs(columns)
+    # Time-series charts need a real datetime column in Superset (staged text dates cannot take a time grain).
+    detail = client.get(f"{internal_url}/api/v1/dataset/{dataset_id}", headers={"Authorization": f"Bearer {token}"})
+    datetime_columns = {str(item.get("column_name")) for item in (detail.json().get("result", {}).get("columns", []) if detail.status_code == 200 else []) if item.get("is_dttm")}
+    chart_specs = [spec for spec in chart_specs if spec["kind"] != "echarts_timeseries_line" or spec.get("groupby") in datetime_columns]
     chart_ids: list[int] = []
     positioned_charts: list[dict[str, Any]] = []
     for spec in chart_specs:
@@ -500,9 +574,11 @@ def _ensure_dashboard(
             str(spec["kind"]),
             columns,
             str(spec["groupby"]) if spec.get("groupby") else None,
+            dashboard_key,
         )
         chart_ids.append(chart_id)
         positioned_charts.append({"id": chart_id, "kind": str(spec["kind"])})
+    _detach_foreign_charts(client, token, csrf_token, internal_url, dashboard_id, set(chart_ids))
     updated = client.put(
         f"{internal_url}/api/v1/dashboard/{dashboard_id}",
         headers=headers,
@@ -641,3 +717,57 @@ def create_editor_url(user_id: str, email: str, name: str, role: str) -> dict[st
         "url": f"{public_url}/datapilot/editor-login?{urlencode({'token': token})}",
         "expires_in": 30,
     }
+
+
+_availability_cache: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def superset_availability(max_age_seconds: float = 10.0) -> dict[str, Any]:
+    """Cheap reachability check (DNS + /health) so callers can fail early with guidance.
+
+    In Compose, Superset runs only with ``--profile analytics``; without it the
+    ``superset`` hostname does not resolve and every call fails with a DNS error.
+    """
+    import socket
+    import time
+    from urllib.parse import urlparse
+
+    now = time.monotonic()
+    if _availability_cache["value"] is not None and now - _availability_cache["at"] < max_age_seconds:
+        return _availability_cache["value"]
+    internal_url = os.getenv("SUPERSET_INTERNAL_URL", "").strip().rstrip("/")
+    public_url = os.getenv("SUPERSET_PUBLIC_URL", "http://localhost:8088").strip().rstrip("/")
+    result: dict[str, Any] = {"available": False, "internal_url": internal_url or None, "public_url": public_url, "reason": ""}
+    if not internal_url or not os.getenv("SUPERSET_ADMIN_PASSWORD", ""):
+        result["reason"] = "Embedded analytics is not configured (SUPERSET_INTERNAL_URL / SUPERSET_ADMIN_PASSWORD)."
+    else:
+        parsed = urlparse(internal_url)
+        try:
+            socket.getaddrinfo(parsed.hostname or "", parsed.port or 80)
+            response = httpx.get(f"{internal_url}/health", timeout=3.0)
+            result["available"] = response.status_code == 200
+            result["reason"] = "" if result["available"] else f"Superset health check returned HTTP {response.status_code}; it may still be starting."
+        except socket.gaierror:
+            result["reason"] = (
+                f"Superset host '{parsed.hostname}' does not resolve: the analytics service is not running. "
+                "Start it with `docker compose --profile analytics up -d` and wait until it is healthy."
+            )
+        except httpx.HTTPError as exc:
+            result["reason"] = f"Superset at {internal_url} is not reachable ({type(exc).__name__}); it may still be starting."
+    _availability_cache.update(at=now, value=result)
+    return result
+
+
+def describe_superset_error(exc: Exception) -> str:
+    """Actionable message for connection-level failures; the raw error otherwise."""
+    import socket
+
+    root = exc
+    while root.__cause__ is not None or root.__context__ is not None:
+        root = root.__cause__ or root.__context__
+        if isinstance(root, socket.gaierror):
+            break
+    if isinstance(root, socket.gaierror) or isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        _availability_cache.update(at=0.0, value=None)
+        return superset_availability()["reason"] or f"Superset is not reachable: {exc}"
+    return str(exc)

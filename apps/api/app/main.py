@@ -1,8 +1,8 @@
 """FastAPI application: lifespan, middleware and router registration.
 
-Shared services live in core.py and schemas in schemas.py; every public and
-private name from core is re-exported here so existing ``app.main`` imports
-keep working.
+Shared services live in app/services/ (re-exported by the core.py facade) and
+schemas in schemas.py; every public and private name from core is re-exported
+here so existing ``app.main`` imports keep working.
 """
 from __future__ import annotations
 
@@ -38,9 +38,14 @@ def _reindex_catalog() -> None:
 def startup() -> None:
     initialize_observability()
     initialize_governance()
-    Base.metadata.create_all(bind=engine)
     if migrations_on_startup():
+        # alembic upgrade head (advisory-locked); the baseline revision creates
+        # the whole schema on an empty database. See app/migrations.py.
         run_migrations(engine)
+    # Safety net: a table added to models.py before its Alembic revision exists
+    # is still created (checkfirst, so existing tables are untouched). Columns
+    # and indexes on existing tables still need a revision.
+    Base.metadata.create_all(bind=engine)
     if os.getenv("ENABLE_DEMO_DATA", "false").lower() in {"1", "true", "yes"}:
         ensure_demo_tables(engine)
     configure_read_only_access(engine)

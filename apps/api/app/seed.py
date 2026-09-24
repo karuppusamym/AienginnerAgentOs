@@ -55,14 +55,23 @@ DEFAULT_ROUTE_MODELS = {
     "agent_review": ("gemini", "gemini-3.6-flash"),
     "tool_parameters": ("openrouter", "deepseek/deepseek-v4.1-flash"),
     "conversation_summary": ("openrouter", "deepseek/deepseek-v4.1-flash"),
-    "decision_routing": ("gemini", "gemini-3.6-flash"),
+    "decision_routing": ("jev", "typesafe/jev-1.13"),  # evaluated: same accuracy as the LLM router at ~1/3 the latency
+    # Multi-model vote: two independent drafts beside the primary; the result most
+    # models agree on wins (see learning.vote_candidates).
+    "sql_candidate_2": ("openrouter", "deepseek/deepseek-v4.1-flash"),
+    "sql_candidate_3": ("openrouter", "anthropic/claude-sonnet-5"),
+    "risk_check": ("jev", "typesafe/jev-1.13"),
+    "sql_candidate_judge": ("jev", "typesafe/jev-1.13"),
+    "tool_selection": ("jev", "typesafe/jev-1.13"),
 }
 
 
 def _seed_default_model_routes(db: Session) -> None:
-    if db.scalar(select(ModelRoute).limit(1)) is not None:
-        return
+    """Fill platform routes only for purposes that have none (never overwrites admin choices)."""
+    routed = set(db.scalars(select(ModelRoute.purpose).where(ModelRoute.project_id.is_(None))).all())
     for purpose, (provider_type, model) in DEFAULT_ROUTE_MODELS.items():
+        if purpose in routed:
+            continue
         provider = db.scalar(select(ModelProvider).where(ModelProvider.provider_type == provider_type, ModelProvider.default_model == model, ModelProvider.enabled.is_(True)))
         if provider is not None and _secret_available(provider.secret_reference):
             db.add(ModelRoute(project_id=None, purpose=purpose, provider_id=provider.id))
@@ -77,6 +86,10 @@ def ensure_control_plane(db: Session) -> None:
         for name, model in [("Gemini 3.6 Flash", "gemini-3.6-flash"), ("Gemini 3.5 Flash", "gemini-3.5-flash")]:
             if not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "gemini", ModelProvider.default_model == model)):
                 db.add(ModelProvider(name=name, provider_type="gemini", base_url="https://generativelanguage.googleapis.com/v1beta", default_model=model, embedding_model="gemini-embedding-001", secret_reference="env:GEMINI_API_KEY", enabled=True, is_default=False, status="not_tested"))
+        db.flush()
+    if os.getenv("OPENROUTER_API_KEY") and not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "jev")):
+        # TypeSafe Jev, a decision model served by the OpenRouter Decisions API.
+        db.add(ModelProvider(name="Jev 1.13 (TypeSafe decision model)", provider_type="jev", base_url="https://openrouter.ai/api/alpha/decisions", default_model="typesafe/jev-1.13", secret_reference="env:OPENROUTER_API_KEY", enabled=True, is_default=False, status="not_tested"))
         db.flush()
     if os.getenv("OPENROUTER_API_KEY"):
         for name, model in [("OpenRouter Claude Sonnet 5", "anthropic/claude-sonnet-5"), ("OpenRouter DeepSeek V4.1 Flash", "deepseek/deepseek-v4.1-flash")]:

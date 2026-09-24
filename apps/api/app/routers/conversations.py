@@ -122,7 +122,7 @@ import queue
 import threading
 from collections.abc import Callable, Iterator
 
-from ..models import RouteDecision
+from ..models import QueryRun, RouteDecision
 
 from ..decision_router import decide, follow_up_questions
 
@@ -348,6 +348,10 @@ def _answer_question(
                 "error": str(exc),
             }
         analysis["execution"] = execution
+        # Keep the source-side timing on the query run so slow connector queries feed DDL suggestions.
+        run = db.scalar(select(QueryRun).where(QueryRun.project_id == project.id, QueryRun.created_by == user.id, QueryRun.question == payload.content).order_by(QueryRun.created_at.desc()).limit(1))
+        if run is not None:
+            run.result = {**(run.result or {}), "execution": {key: execution.get(key) for key in ("row_count", "duration_ms", "error", "columns")}}
         analysis["preview"] = execution.get("rows", [])
         checks = analysis.get("validation", {}).get("checks")
         if isinstance(checks, list):
@@ -365,7 +369,7 @@ def _answer_question(
         routing_model = selected_model_provider(db, user, "decision_routing")
     except HTTPException:
         routing_model = None
-    route = decide(db, project.id, payload.content, analysis.get("grounding"), llm_provider=routing_model)
+    route = decide(db, project.id, payload.content, analysis.get("grounding"), llm_provider=routing_model, user_id=user.id)
     progress("answering", "Writing the answer")
     try:
         provider = selected_model_provider(db, user, "conversation_summary")
@@ -408,6 +412,8 @@ def _answer_question(
         "memory": {"prior_messages_used": len(prior_messages), "persisted": True},
         "route": route,
         "follow_ups": follow_up_questions(payload.content, execution),
+        "learning": analysis.get("learning"),
+        "ensemble": analysis.get("ensemble"),
     }
     assistant_message = ConversationMessage(conversation_id=conversation.id, role="assistant", content=answer, structured=structured)
     db.add(assistant_message)

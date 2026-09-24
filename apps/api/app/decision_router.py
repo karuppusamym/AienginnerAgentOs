@@ -105,6 +105,7 @@ AGENT_TERMS = {
     "build", "create", "generate", "investigate", "diagnose", "monitor", "automate",
     "pipeline", "schedule", "publish", "deploy", "migrate", "profile", "remediate",
     "fix", "clean", "document", "orchestrate", "backfill", "refresh", "notify",
+    "reconcile", "reconciliation", "onboard", "migrate",
 }
 STOPWORDS = {
     "the", "a", "an", "of", "for", "to", "in", "on", "and", "or", "is", "are", "was",
@@ -246,23 +247,30 @@ def local_scores(
 
     agent_hits = token_set & AGENT_TERMS
     multi_step = len(re.findall(r"\b(then|and then|after that|next)\b", question.lower())) + question.count(";")
-    agent_intent = min(1.0, 0.45 * len(agent_hits) + 0.25 * multi_step)
+    named_agent = next((agent for agent in agents if _tokens(agent.name) and set(_tokens(agent.name)) <= token_set), None)
+    explicit_agent = bool(token_set & {"agent", "agents", "workflow", "workflows"}) or named_agent is not None
+    agent_intent = min(1.0, 0.45 * len(agent_hits) + 0.25 * multi_step + (0.5 if explicit_agent else 0.0))
     if agent_intent > 0:
-        best_agent = None
-        best_fit = 0.0
-        for agent in agents:
-            fit = _coverage(tokens, f"{agent.name} {agent.purpose}")
-            if fit > best_fit:
-                best_agent, best_fit = agent, fit
-        reasons = [f"action verbs: {', '.join(sorted(agent_hits))}" if agent_hits else "multi-step phrasing"]
-        if best_agent is not None and best_fit > 0:
-            reasons.append(f"closest agent: {best_agent.name}")
-        candidates.append({
-            "route": "agent_run",
-            "target": {"id": best_agent.id, "name": best_agent.name} if best_agent is not None and best_fit > 0 else None,
-            "score": round(weights["agent_intent"] * agent_intent, 4),
-            "reasons": reasons,
-        })
+        base_reason = f"action verbs: {', '.join(sorted(agent_hits))}" if agent_hits else ("names an agent or workflow" if explicit_agent else "multi-step phrasing")
+        fits = sorted(((agent, 1.0 if agent is named_agent else _coverage(tokens, f"{agent.name} {agent.purpose}")) for agent in agents), key=lambda item: item[1], reverse=True)
+        plausible = [(agent, fit) for agent, fit in fits if fit > 0][:MAX_AGENT_CANDIDATES]
+        if named_agent is None and plausible:
+            # Keyword fit misses synonyms: offer the next agents too, so the decision model can overrule it.
+            plausible += [(agent, fit) for agent, fit in fits if fit == 0][: MAX_AGENT_CANDIDATES - len(plausible)]
+        agent_score = weights["agent_intent"] * agent_intent
+        if not plausible:
+            candidates.append({"route": "agent_run", "target": None, "score": round(agent_score, 4), "reasons": [base_reason]})
+        best_fit = plausible[0][1] if plausible else 1.0
+        for rank, (agent, fit) in enumerate(plausible):
+            # The best-fitting agent keeps the full intent score; alternatives are offered so a
+            # decision model can pick between agents, scaled by how well their purpose fits.
+            share = 1.0 if rank == 0 else max(0.3, fit / best_fit) * 0.9
+            candidates.append({
+                "route": "agent_run",
+                "target": {"id": agent.id, "name": agent.name, "description": (agent.purpose or "")[:240]},
+                "score": round(agent_score * share, 4),
+                "reasons": [base_reason, f"{'named agent' if agent is named_agent else 'purpose fit'} {fit:.0%}: {agent.name}"],
+            })
 
     vague = len(tokens) <= 2 or (strength == 0 and analytic < 0.5)
     clarify_score = thresholds["clarify_below"] + (0.2 if vague else 0.0) - 0.1 * strength
@@ -275,53 +283,60 @@ def local_scores(
     return candidates
 
 
-def _jev_choice(question: str, candidates: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, float] | None:
-    """Ask a Jev-compatible decision endpoint for a probability per candidate.
+MAX_AGENT_CANDIDATES = 3
 
-    Only trusted metadata goes into the state: the user's question and the
-    registry descriptions. Tool output, query results and retrieved documents
-    are excluded because they are the injection surface.
+ROUTE_DESCRIPTIONS = {
+    "sql_analysis": "Answer a read-only analytical question with governed SQL over catalogued tables.",
+    "query_tool": "Run a pre-approved, parameterised governed query whose description matches the request.",
+    "agent_run": "A multi-step objective: build, schedule, publish, investigate, remediate or automate.",
+    "clarify": "The request is too vague or unrelated to the data catalog to answer yet.",
+}
+JEV_DEFAULT_URL = "https://openrouter.ai/api/alpha/decisions"
+JEV_DEFAULT_MODEL = "typesafe/jev-1.13"  # pinned: aliases like ~typesafe/jev-latest can shift verdicts
 
-    The request/response shape follows TypeSafe's published concepts (state +
-    typed ``choice`` question, probabilities per option). Verify it against the
-    API reference for your account before enabling; parsing is tolerant and any
-    mismatch falls back to the local scorer.
+
+def _jev_choice(question: str, candidates: list[dict[str, Any]], policy: dict[str, Any], provider: Any = None, agent_names: str = "", db: Any = None, project_id: str | None = None, user_id: str | None = None) -> dict[str, Any] | None:
+    """Route choice plus the consequential-action check from Jev in one parallel call.
+
+    State holds only the user's question; option descriptions come from the
+    registry. Query results, tool output and retrieved documents never go in.
     """
-    url = os.getenv("TYPESAFE_API_URL", "").strip()
-    key = os.getenv("TYPESAFE_API_KEY", "").strip()
-    if not url or not key:
-        return None
+    from . import jev_client
+
     options = [_option_label(item) for item in candidates]
-    payload = {
-        "model": os.getenv("TYPESAFE_MODEL", "jev"),
-        "state": {
-            "request": question[:4_000],
-            "capabilities": {label: "; ".join(item.get("reasons", []))[:400] for label, item in zip(options, candidates)},
-        },
-        "questions": {
-            "route": {"type": "choice", "instructions": policy["instructions"], "options": options},
-        },
-    }
-    timeout = float(os.getenv("TYPESAFE_TIMEOUT_SECONDS", "2.0"))
-    try:
-        response = httpx.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}, timeout=timeout)
-        response.raise_for_status()
-        body = response.json()
-    except (httpx.HTTPError, ValueError):
-        return None
-    answer = (body.get("answers") or body.get("results") or body.get("questions") or body).get("route") if isinstance(body, dict) else None
-    distribution = None
-    if isinstance(answer, dict):
-        distribution = answer.get("probabilities") or answer.get("distribution")
-    if not isinstance(distribution, dict):
+    criteria = {}
+    for label, item in zip(options, candidates):
+        target = item.get("target") or {}
+        detail = ROUTE_DESCRIPTIONS[item["route"]]
+        if item["route"] == "agent_run" and agent_names:
+            detail = f"{detail} Registered agents: {agent_names}."
+        if target.get("description"):
+            detail = f"{detail} {'Agent' if item['route'] == 'agent_run' else 'Tool'} {target.get('name', '')}: {target['description'][:200]}"
+        criteria[label] = detail
+    result = jev_client.ask(provider, {"request": question[:4_000]}, {
+        "route": {"type": "choice", "instructions": policy["instructions"] + " The request is in `request`.", "criteria": criteria},
+        "consequential": {"type": "noul", "instructions": "Does `request` ask to change, delete, move, publish, schedule, send or grant access to data or systems (not merely read or analyse)?"},
+    })
+    jev_client.log_call(db, provider, "decision_routing", result, project_id, user_id)
+    route = result["answers"].get("route") or {}
+    distribution = route.get("probabilities")
+    if not result["ok"] or not isinstance(distribution, dict):
         return None
     try:
-        return {str(label): float(value) for label, value in distribution.items() if label in options}
+        cleaned = {str(label): float(value) for label, value in distribution.items() if label in options}
     except (TypeError, ValueError):
         return None
+    consequential = (result["answers"].get("consequential") or {}).get("noul")
+    return {
+        "distribution": cleaned,
+        "consequential": float(consequential) if isinstance(consequential, (int, float)) else None,
+        "model": result["model"],
+        "latency_ms": result["latency_ms"],
+        "cost_usd": result["cost_usd"],
+    }
 
 
-def _llm_choice(question: str, candidates: list[dict[str, Any]], policy: dict[str, Any], provider: Any) -> dict[str, float] | None:
+def _llm_choice(question: str, candidates: list[dict[str, Any]], policy: dict[str, Any], provider: Any, agent_names: str = "", db: Any = None, project_id: str | None = None, user_id: str | None = None) -> dict[str, float] | None:
     """Ask the routed general-purpose model for a probability per option.
 
     Same trust boundary as Jev: only the question and the candidates' reasons
@@ -332,8 +347,9 @@ def _llm_choice(question: str, candidates: list[dict[str, Any]], policy: dict[st
     options = [_option_label(item) for item in candidates]
     state = {
         "request": question[:4_000],
-        "options": {label: "; ".join(item.get("reasons", []))[:400] for label, item in zip(options, candidates)},
+        "options": {label: (ROUTE_DESCRIPTIONS[item["route"]] + (f" Registered agents: {agent_names}." if item["route"] == "agent_run" and agent_names else "") + " Evidence: " + "; ".join(item.get("reasons", [])))[:600] for label, item in zip(options, candidates)},
     }
+    started = time.perf_counter()
     try:
         response = generate_text(
             provider,
@@ -346,10 +362,18 @@ def _llm_choice(question: str, candidates: list[dict[str, Any]], policy: dict[st
         text = text[text.find("{"): text.rfind("}") + 1]
         probabilities = json.loads(text).get("probabilities", {})
         cleaned = {str(label): max(0.0, float(value)) for label, value in probabilities.items() if label in options}
-    except Exception:
+        _log_router_call(db, provider, project_id, user_id, True, round((time.perf_counter() - started) * 1000), None)
+    except Exception as exc:
+        _log_router_call(db, provider, project_id, user_id, False, round((time.perf_counter() - started) * 1000), str(exc)[:300])
         return None
     total = sum(cleaned.values())
     return {label: value / total for label, value in cleaned.items()} if total > 0 else None
+
+
+def _log_router_call(db: Any, provider: Any, project_id: str | None, user_id: str | None, ok: bool, latency_ms: int, error: str | None) -> None:
+    from . import jev_client
+
+    jev_client.log_call(db, provider, "decision_routing", {"ok": ok, "model": getattr(provider, "default_model", ""), "latency_ms": latency_ms, "error": error}, project_id, user_id)
 
 
 def _option_label(candidate: dict[str, Any]) -> str:
@@ -364,18 +388,27 @@ def decide(
     grounding: dict[str, Any] | None = None,
     llm_provider: Any = None,
     backend_override: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
+    """``llm_provider`` is the model routed to ``decision_routing`` (a Jev decision model or a text model)."""
     started = time.perf_counter()
     policy = active_policy()
     tools = db.scalars(
         select(QueryTool).where(QueryTool.project_id == project_id, QueryTool.status == "published")
     ).all()
     agents = db.scalars(select(AgentDefinition).where(AgentDefinition.enabled.is_(True))).all()
-    candidates = local_scores(question, grounding, tools, agents, policy)[:6]
+    candidates = local_scores(question, grounding, tools, agents, policy)[:8]
     backend = "local"
-    requested = (backend_override or os.getenv("DECISION_ROUTER_BACKEND", "local")).strip().lower()
+    jev_consequential: float | None = None
+    jev_detail: dict[str, Any] | None = None
+    agent_names = ", ".join(agent.name for agent in agents)[:600]
+    routed_type = getattr(llm_provider, "provider_type", "") if llm_provider is not None else ""
+    requested = (backend_override or os.getenv("DECISION_ROUTER_BACKEND", "auto")).strip().lower()
+    if requested == "auto":
+        requested = "jev" if routed_type == "jev" else ("llm" if routed_type and routed_type != "local_mock" else "local")
     if requested == "llm":
-        distribution = _llm_choice(question, candidates, policy, llm_provider) if llm_provider is not None and getattr(llm_provider, "provider_type", "") != "local_mock" else None
+        text_model = llm_provider if routed_type not in ("", "local_mock", "jev") else None
+        distribution = _llm_choice(question, candidates, policy, text_model, agent_names, db, project_id, user_id) if text_model is not None else None
         if distribution:
             backend = f"llm:{llm_provider.default_model}"
             for item in candidates:
@@ -385,12 +418,20 @@ def decide(
         else:
             backend = "local (llm unavailable)"
     elif requested == "jev":
-        distribution = _jev_choice(question, candidates, policy)
-        if distribution:
-            backend = f"jev:{os.getenv('TYPESAFE_MODEL', 'jev')}"
+        verdict = _jev_choice(question, candidates, policy, llm_provider if routed_type == "jev" else None, agent_names, db, project_id, user_id)
+        if verdict:
+            backend = f"jev:{verdict['model']}"
+            jev_consequential = verdict["consequential"]
+            jev_detail = {
+                "model": verdict["model"],
+                "probabilities": {label: round(value, 4) for label, value in verdict["distribution"].items()},
+                "consequential": verdict["consequential"],
+                "latency_ms": verdict.get("latency_ms"),
+                "cost_usd": verdict.get("cost_usd"),
+            }
             for item in candidates:
                 item["local_score"] = item["score"]
-                item["score"] = round(distribution.get(_option_label(item), 0.0), 4)
+                item["score"] = round(verdict["distribution"].get(_option_label(item), 0.0), 4)
             candidates.sort(key=lambda item: item["score"], reverse=True)
         else:
             backend = "local (jev unavailable)"
@@ -403,6 +444,9 @@ def decide(
     share = top["score"] / total
     confidence = round(share if backend.startswith(("jev", "llm")) else share * min(1.0, top["score"] / 0.6), 4)
     risk = assess_risk(question)
+    # A decision model may escalate risk, never lower it (it is steerable by adversarial text).
+    if jev_consequential is not None and jev_consequential >= 0.7 and not risk["requires_approval"]:
+        risk = {"level": "medium", "requires_approval": True, "triggers": ["jev:consequential"], "escalated_by": "jev", "jev_probability": round(jev_consequential, 3)}
     suggest_min = policy["thresholds"]["suggest_min"]
     suggestions = [
         {"route": item["route"], "label": ROUTE_LABELS[item["route"]], "target": item.get("target"), "score": item["score"], "reasons": item["reasons"]}
@@ -418,6 +462,7 @@ def decide(
         "suggested_actions": suggestions,
         "risk": risk,
         "backend": backend,
+        "jev": jev_detail,
         "policy_version": policy["version"],
         "latency_ms": round((time.perf_counter() - started) * 1000, 2),
     }

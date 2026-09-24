@@ -23,7 +23,7 @@ from sqlalchemy import select, text
 
 from app.database import SessionLocal, engine
 from app.main import app
-from app.migrations import MIGRATIONS, run_migrations
+from app.migrations import current_revisions, head_revisions, run_migrations
 from app.model_runtime import ProviderGenerationResult, resolve_secret
 from app.models import ModelProvider, Project, RouteDecision, SQLQueryCache
 from app.notebook_runtime import _validate_python
@@ -122,10 +122,14 @@ class HardeningApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/conversations", headers={**self.headers, "X-Project-Id": str(uuid4())}).status_code, 403)
 
     def test_migrations_are_versioned_and_idempotent(self) -> None:
+        """Startup ran ``alembic upgrade head``; a second upgrade applies nothing."""
+        heads = head_revisions()
+        self.assertEqual(len(heads), 1, "Alembic history must have a single head")
         with engine.connect() as connection:
-            versions = {row[0] for row in connection.execute(text("SELECT version FROM schema_versions"))}
-        self.assertEqual(versions, {version for version, _, _ in MIGRATIONS})
+            versions = {row[0] for row in connection.execute(text("SELECT version_num FROM alembic_version"))}
+        self.assertEqual(versions, set(heads))
         self.assertEqual(run_migrations(engine), [])
+        self.assertEqual(current_revisions(engine), heads)
 
     def test_model_routing_rejects_unknown_purposes_and_unavailable_models(self) -> None:
         routing = self.client.get("/model-routing", headers=self.headers).json()

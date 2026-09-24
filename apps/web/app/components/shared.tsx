@@ -9,7 +9,6 @@ import { statusTone } from "../lib/constants";
 import type {
   SecurityCategoryKey,
   SecurityOverview,
-  ConversationMessage,
 } from "../types";
 
 export function StatusPill({ value }: { value: string }) {
@@ -46,12 +45,8 @@ export function EmptyState({
   );
 }
 
-export function AnalysisChart({ chart }: { chart?: ConversationMessage["structured"]["chart"] }) {
-  if (!chart?.data?.length || !chart.x || !chart.y) return <div className="chart-empty">No chartable result</div>;
-  const values = chart.data.map((row) => Number(row[chart.y!] || 0));
-  const maximum = Math.max(...values.map((value) => Math.abs(value)), 1);
-  return <div className="result-chart"><h4>{chart.title}</h4>{chart.data.slice(0, 12).map((row, index) => <div className="chart-row" key={`${String(row[chart.x!])}-${index}`}><span title={String(row[chart.x!])}>{String(row[chart.x!])}</span><i><b style={{ width: `${Math.max(2, Math.abs(Number(row[chart.y!] || 0)) / maximum * 100)}%` }} /></i><strong>{String(row[chart.y!])}</strong></div>)}</div>;
-}
+/** Result charts live in ./charts (kpi, line, bar, grouped/stacked bar, pie, scatter). */
+export { AnalysisChart, ChartTypeSwitcher, chartAlternatives, formatChartValue } from "./charts";
 
 export function Metric({ label, value, detail, icon, tone }: { label: string; value: ReactNode; detail: string; icon: ReactNode; tone: string }) {
   return (
@@ -345,4 +340,45 @@ export function useConfirm() {
     </Modal>
   ) : null;
   return [confirm, dialog] as const;
+}
+
+/**
+ * Formats an evaluation score. The API reports 0–1 fractions (shown as a
+ * percentage, or percentage points for a delta); larger values are shown as-is.
+ */
+export function formatScore(value?: number | null, delta = false) {
+  if (value == null || Number.isNaN(value)) return "-";
+  if (Math.abs(value) <= 1) return `${(value * 100).toFixed(1)}${delta ? " pp" : "%"}`;
+  return value.toFixed(2);
+}
+
+/**
+ * Formats a USD amount with enough precision for per-call model costs:
+ * $12.34, $0.0421, $0.000017 (two significant digits below one cent).
+ */
+export function formatUsd(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  if (value === 0) return "$0";
+  const abs = Math.abs(value);
+  if (abs >= 1) return `$${value.toFixed(2)}`;
+  if (abs >= 0.01) return `$${value.toFixed(4)}`;
+  const digits = Math.min(12, Math.ceil(-Math.log10(abs)) + 1);
+  return `$${value.toFixed(digits).replace(/(\.\d*?[1-9])0+$/, "$1")}`;
+}
+
+/** Probability 0-1 as a percentage (one decimal below 10%). */
+export function formatProbability(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  const percent = value * 100;
+  return `${percent.toFixed(percent < 10 && percent > 0 ? 1 : 0)}%`;
+}
+
+/** Shown when a feature's endpoint returns 404/405 on this API build. */
+export function EndpointUnavailable({ feature, endpoint }: { feature: string; endpoint: string }) {
+  return (
+    <div className="endpoint-unavailable" role="note">
+      <AlertCircle size={16} />
+      <span><strong>{feature} is not available from this API yet.</strong><small><code>{endpoint}</code> returned 404. The view will work once the API version that provides it is deployed.</small></span>
+    </div>
+  );
 }

@@ -24,7 +24,8 @@ import {
   XCircle,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { api, SessionUser } from "../lib/api";
+import { scopes, useConnectors, useInvalidate, useModelProviders, useModelRouting, useModelUsage, useQueryErrorToast, useSchemaDrift } from "../lib/queries";
 import type {
   NavKey,
   Connector,
@@ -45,9 +46,10 @@ import type {
 } from "../types";
 import {
   connectorLabels,
+  providerCapability,
   providerTypeOptions,
 } from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm } from "./shared";
+import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm, formatUsd } from "./shared";
 
 
 export function AdminView({ currentUser, notify, setActive: setAppActive }: { currentUser: SessionUser; notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
@@ -228,15 +230,23 @@ export function ProjectsAdmin({ notify }: { notify: (message: string, tone?: "ok
   return <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">WORKSPACE ACCESS</span><h3>Projects and memberships</h3><p>Create projects from the sidebar switcher, then assign users and project roles here.</p></div><select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>{projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></div><div className="table-header project-member-grid"><span>User</span><span>Application role</span><span>Project role</span></div>{members.map((member) => <div className="data-row project-member-grid" key={member.id}><span><strong>{member.user.name}</strong><small>{member.user.email}</small></span><StatusPill value={member.user.role} /><StatusPill value={member.role} /></div>)}<form className="inline-admin-form" onSubmit={add}><select value={form.user_id} onChange={(event) => setForm({ ...form, user_id: event.target.value })} required><option value="">Select user</option>{users.map((user) => <option value={user.id} key={user.id}>{user.name} / {user.email}</option>)}</select><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="owner">Owner</option><option value="maintainer">Maintainer</option><option value="member">Member</option><option value="viewer">Viewer</option></select><button className="primary-button"><UserPlus size={16} />Assign</button></form></section>;
 }
 
+const NO_CONNECTORS: Connector[] = [];
+const NO_DRIFT: SchemaDrift[] = [];
+const NO_PROVIDERS: ModelProvider[] = [];
+
 export function ConnectorsAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const [confirm, confirmDialog] = useConfirm();
-  const [connectors, setConnectors] = useState<Connector[]>([]);
-  const [drift, setDrift] = useState<SchemaDrift[]>([]);
+  const connectorsQuery = useConnectors();
+  const driftQuery = useSchemaDrift();
+  const connectors = connectorsQuery.data ?? NO_CONNECTORS;
+  const drift = driftQuery.data ?? NO_DRIFT;
+  useQueryErrorToast(connectorsQuery.error || driftQuery.error, notify, "Connectors could not be loaded");
+  const invalidate = useInvalidate();
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<Connector | null>(null);
   const [form, setForm] = useState({ name: "", connector_type: "sql_server", connection_mode: "direct" as "direct" | "mcp", description: "", host: "", database: "", mcp_server_url: "", secret_reference: "" });
-  const load = useCallback(() => Promise.all([api<Connector[]>("/connectors"), api<SchemaDrift[]>("/schema-drift")]).then(([connectorData, driftData]) => { setConnectors(connectorData); setDrift(driftData); }), []);
-  useEffect(() => { load(); }, [load]);
+  // Connector changes also change the catalog (datasets) that scans discover.
+  const load = () => invalidate(scopes.connectors, scopes.schemaDrift, scopes.datasets);
   function openForm(connector?: Connector) {
     setEditing(connector || null);
     setForm(connector ? { name: connector.name, connector_type: connector.connector_type, connection_mode: connector.connection_mode || "direct", description: connector.description || "", host: connector.host || "", database: connector.database || "", mcp_server_url: connector.mcp_server_url || "", secret_reference: connector.secret_reference || "" } : { name: "", connector_type: "sql_server", connection_mode: "direct", description: "", host: "", database: "", mcp_server_url: "", secret_reference: "" });
@@ -269,8 +279,12 @@ export function ConnectorsAdmin({ notify }: { notify: (message: string, tone?: "
 }
 
 export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
-  const [providers, setProviders] = useState<ModelProvider[]>([]);
-  const [usage, setUsage] = useState<ModelUsage | null>(null);
+  const providersQuery = useModelProviders();
+  const usageQuery = useModelUsage();
+  const providers = providersQuery.data ?? NO_PROVIDERS;
+  const usage: ModelUsage | null = usageQuery.data ?? null;
+  useQueryErrorToast(providersQuery.error || usageQuery.error, notify, "Model providers could not be loaded");
+  const invalidate = useInvalidate();
   const [showForm, setShowForm] = useState(false);
   const emptyProviderForm = { name: "", provider_type: "company_gateway", base_url: "", default_model: "", embedding_model: "", secret_reference: "" };
   const [form, setForm] = useState(emptyProviderForm);
@@ -284,10 +298,14 @@ export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" 
       provider_type: next.value,
       base_url: !current.base_url || current.base_url === previous.baseUrl ? next.baseUrl : current.base_url,
       secret_reference: !current.secret_reference || current.secret_reference === previous.secretReference ? next.secretReference : current.secret_reference,
+      default_model: !current.default_model || current.default_model === (previous.defaultModel || "") ? next.defaultModel || "" : current.default_model,
     }));
   }
-  const load = useCallback(() => Promise.all([api<ModelProvider[]>("/model-providers"), api<ModelUsage>("/model-usage")]).then(([providerData, usageData]) => { setProviders(providerData); setUsage(usageData); }), []);
-  useEffect(() => { load(); }, [load]);
+  const routingQuery = useModelRouting();
+  const purposeLabels = Object.fromEntries((routingQuery.data?.purposes || []).map((item) => [item.purpose, item.label]));
+  const decisionForm = (providerType.capability || "generation") === "decision";
+  // Provider health and defaults feed the routing table and the top-bar model picker.
+  const load = () => invalidate(scopes.modelProviders, scopes.modelUsage, scopes.modelRouting, scopes.projects);
   async function create(event: FormEvent) { event.preventDefault(); try { await api("/model-providers", { method: "POST", body: JSON.stringify({ ...form, enabled: true, is_default: false }) }); setShowForm(false); setForm(emptyProviderForm); await load(); notify("Model provider added"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not add provider", "error"); } }
   async function test(id: string) { try { const result = await api<{ message: string }>(`/model-providers/${id}/test`, { method: "POST" }); notify(result.message); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Provider test failed", "error"); } }
   async function setDefault(id: string) { try { await api(`/model-providers/${id}/default`, { method: "POST" }); notify("Default model provider updated"); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Provider could not be selected", "error"); } }
@@ -305,10 +323,32 @@ export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" 
   }
   return (
     <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">MODEL ROUTING</span><h3>Provider registry</h3><p>Company gateway first, with Gemini, OpenAI, Claude, OpenRouter, compatible, and local providers.</p></div><div style={{ display: "flex", gap: 8 }}><button className="secondary-button" disabled={reindexing} onClick={reindex} title="Re-embed all catalog assets and glossary documents under the active embedding model">{reindexing ? "Reindexing…" : "Reindex embeddings"}</button><button className="primary-button" onClick={() => setShowForm(true)}><Plus size={17} />Add provider</button></div></div>
-      <div className="provider-grid">{providers.map((provider) => <article className="provider-card" key={provider.id}><div className="provider-heading"><span className="provider-icon"><Bot size={20} /></span><span>{provider.is_default && <span className="tag">default</span>}<StatusPill value={provider.status} /></span></div><h4>{provider.name}</h4><p>{provider.provider_type.replaceAll("_", " ")}</p><dl><div><dt>Chat model</dt><dd>{provider.default_model}</dd></div><div><dt>Embeddings</dt><dd>{provider.embedding_model || "Not configured"}</dd></div><div><dt>Secret</dt><dd>{provider.secret_reference || "Not required"}</dd></div></dl><div className="provider-actions"><button className="secondary-button" onClick={() => test(provider.id)}><Gauge size={16} />Test</button><button className="secondary-button" disabled={provider.is_default || provider.status !== "healthy"} onClick={() => setDefault(provider.id)}><Check size={16} />Set default</button></div></article>)}</div>
-      <ModelRoutingPanel notify={notify} providers={providers} />
-      {usage && <section className="usage-strip"><div><span>Calls</span><strong>{usage.totals.calls}</strong></div><div><span>Input tokens</span><strong>{usage.totals.input_tokens.toLocaleString()}</strong></div><div><span>Output tokens</span><strong>{usage.totals.output_tokens.toLocaleString()}</strong></div><div><span>Estimated cost</span><strong>{usage.pricing_configured ? `$${usage.totals.estimated_cost_usd.toFixed(4)}` : "Rates not set"}</strong></div></section>}
-      {showForm && <Modal title="Add model provider" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><div className="form-grid"><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Type<select value={form.provider_type} onChange={(event) => chooseProviderType(event.target.value)}>{providerTypeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label></div><label>Base URL<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder={providerType.baseUrl || "Provider default"} /></label><div className="form-grid"><label>Default chat model<input value={form.default_model} onChange={(event) => setForm({ ...form, default_model: event.target.value })} placeholder={providerType.modelPlaceholder} required /></label><label>Embedding model<input value={form.embedding_model} onChange={(event) => setForm({ ...form, embedding_model: event.target.value })} /></label></div><label>Secret reference<input value={form.secret_reference} onChange={(event) => setForm({ ...form, secret_reference: event.target.value })} placeholder={providerType.secretPlaceholder} /></label>{form.provider_type === "openrouter" && <div className="modal-note"><ShieldCheck size={16} />OpenRouter is OpenAI-compatible. Model names are namespaced by vendor, for example anthropic/claude-sonnet-5; the key is read from OPENROUTER_API_KEY.</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Add provider</button></div></form></Modal>}
+      <div className="provider-grid">{providers.map((provider) => {
+        const decision = providerCapability(provider) === "decision";
+        return <article className="provider-card" key={provider.id}><div className="provider-heading"><span className="provider-icon"><Bot size={20} /></span><span>{decision && <span className="tag tag-decision" title="Returns typed choices with probabilities, not text">decision model</span>}{provider.is_default && <span className="tag">default</span>}<StatusPill value={provider.status} /></span></div><h4>{provider.name}</h4><p>{provider.provider_type === "jev" ? "TypeSafe Jev via OpenRouter Decisions" : provider.provider_type.replaceAll("_", " ")}</p><dl><div><dt>{decision ? "Decision model" : "Chat model"}</dt><dd>{provider.default_model}</dd></div>{!decision && <div><dt>Embeddings</dt><dd>{provider.embedding_model || "Not configured"}</dd></div>}<div><dt>Secret</dt><dd>{provider.secret_reference || "Not required"}</dd></div></dl><div className="provider-actions"><button className="secondary-button" onClick={() => test(provider.id)}><Gauge size={16} />Test</button><button className="secondary-button" disabled={decision || provider.is_default || provider.status !== "healthy"} title={decision ? "A decision model cannot answer chat requests, so it cannot be the default" : undefined} onClick={() => setDefault(provider.id)}><Check size={16} />Set default</button></div></article>;
+      })}</div>
+      <ModelRoutingPanel notify={notify} />
+      {usage && <section className="usage-strip"><div><span>Calls</span><strong>{usage.totals.calls}</strong></div><div><span>Input tokens</span><strong>{usage.totals.input_tokens.toLocaleString()}</strong></div><div><span>Output tokens</span><strong>{usage.totals.output_tokens.toLocaleString()}</strong></div><div><span>Estimated cost</span><strong title={`${usage.totals.estimated_cost_usd} USD`}>{usage.pricing_configured || usage.totals.estimated_cost_usd > 0 ? formatUsd(usage.totals.estimated_cost_usd) : "Rates not set"}</strong></div></section>}
+      {usage && usage.items.length > 0 && (
+        <div className="usage-table">
+          <div className="subheading"><h4>Model usage</h4><span>Calls per purpose and provider in this project. Decision-model calls (Jev) are listed under routing, risk-check and SQL tie-breaker purposes.</span></div>
+          <div className="table-header usage-grid"><span>Purpose</span><span>Provider / model</span><span>Calls</span><span>Tokens in / out</span><span>Cost</span><span>Avg latency</span></div>
+          {[...usage.items].sort((a, b) => (a.purpose || "").localeCompare(b.purpose || "") || b.calls - a.calls).map((item, index) => {
+            const decision = providerCapability({ capability: item.capability, provider_type: item.provider_type }) === "decision" || /jev/i.test(item.model);
+            return (
+              <div className="data-row usage-grid" key={`${item.provider_id}-${item.model}-${item.purpose || ""}-${index}`}>
+                <span><strong>{item.purpose ? purposeLabels[item.purpose] || item.purpose.replaceAll("_", " ") : "Unattributed"}</strong>{item.purpose && <small className="mono">{item.purpose}</small>}</span>
+                <span><strong>{item.provider_name}{decision && <span className="tag tag-decision">decision model</span>}</strong><small className="mono" title={item.model}>{item.model}</small></span>
+                <span className="mono">{item.calls.toLocaleString()}</span>
+                <span className="mono">{item.input_tokens.toLocaleString()} / {item.output_tokens.toLocaleString()}</span>
+                <span className="mono" title={`${item.estimated_cost_usd} USD`}>{item.estimated_cost_usd > 0 || usage.pricing_configured ? formatUsd(item.estimated_cost_usd) : "-"}</span>
+                <span className="mono">{Math.round(item.average_latency_ms).toLocaleString()} ms</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {showForm && <Modal title="Add model provider" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><div className="form-grid"><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Type<select value={form.provider_type} onChange={(event) => chooseProviderType(event.target.value)}>{providerTypeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label></div>{providerType.hint && <p className="modal-hint provider-type-hint"><span className="tag tag-decision">decision model</span>{providerType.hint}</p>}<label>Base URL<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder={providerType.baseUrl || "Provider default"} /></label><div className="form-grid"><label>{decisionForm ? "Decision model" : "Default chat model"}<input value={form.default_model} onChange={(event) => setForm({ ...form, default_model: event.target.value })} placeholder={providerType.modelPlaceholder} required /></label>{!decisionForm && <label>Embedding model<input value={form.embedding_model} onChange={(event) => setForm({ ...form, embedding_model: event.target.value })} /></label>}</div><label>Secret reference<input value={form.secret_reference} onChange={(event) => setForm({ ...form, secret_reference: event.target.value })} placeholder={providerType.secretPlaceholder} /></label>{form.provider_type === "jev" && <div className="modal-note"><ShieldCheck size={16} />Jev is served by the OpenRouter Decisions API and reads OPENROUTER_API_KEY. Assign it to decision purposes (decision routing, consequential-action check, SQL candidate tie-breaker) under Model routing; it can only escalate risk, never approve an action.</div>}{form.provider_type === "openrouter" && <div className="modal-note"><ShieldCheck size={16} />OpenRouter is OpenAI-compatible. Model names are namespaced by vendor, for example anthropic/claude-sonnet-5; the key is read from OPENROUTER_API_KEY.</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Add provider</button></div></form></Modal>}
     </section>
   );
 }
@@ -356,34 +396,25 @@ export function UsersAdmin({ notify, currentUser }: { notify: (message: string, 
  * Per-purpose model assignment (GET/PUT /model-routing). `null` means the purpose
  * follows the project's pinned provider, then the global default.
  */
-function ModelRoutingPanel({ notify, providers: registry }: { notify: (message: string, tone?: "ok" | "error") => void; providers: ModelProvider[] }) {
-  const [routing, setRouting] = useState<ModelRouting | null>(null);
+function ModelRoutingPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const routingQuery = useModelRouting();
+  const invalidate = useInvalidate();
+  const routing: ModelRouting | null = routingQuery.data ?? null;
   const [draft, setDraft] = useState<Record<string, string | null>>({});
-  const [state, setState] = useState<"loading" | "ready" | "unavailable">("loading");
   const [saving, setSaving] = useState(false);
-  const apply = useCallback((data: ModelRouting) => {
-    setRouting(data);
-    setDraft(Object.fromEntries(data.purposes.map((item) => [item.purpose, item.provider_id ?? null])));
-    setState("ready");
-  }, []);
-  useEffect(() => {
-    let active = true;
-    api<ModelRouting>("/model-routing")
-      .then((data) => { if (active) apply(data); })
-      .catch((reason) => {
-        if (!active) return;
-        setState("unavailable");
-        if (!(reason instanceof ApiError && (reason.status === 404 || reason.status === 405))) notify(reason instanceof Error ? reason.message : "Model routing could not be loaded", "error");
-      });
-    return () => { active = false; };
-  }, [apply, notify, registry]);
+  useQueryErrorToast(routingQuery.error, notify, "Model routing could not be loaded", { ignoreUnavailable: true });
+  const state: "loading" | "ready" | "unavailable" = routingQuery.isPending ? "loading" : routingQuery.isError ? "unavailable" : "ready";
+  const reset = useCallback((data: ModelRouting) => setDraft(Object.fromEntries(data.purposes.map((item) => [item.purpose, item.provider_id ?? null]))), []);
+  // Fresh server data (load, save, provider changes) resets the draft.
+  useEffect(() => { if (routing) reset(routing); }, [routing, reset]);
   const purposes = routing?.purposes || [];
   const options = routing?.providers || [];
   const dirty = purposes.some((item) => (draft[item.purpose] ?? null) !== (item.provider_id ?? null));
   async function save() {
     setSaving(true);
     try {
-      apply(await api<ModelRouting>("/model-routing", { method: "PUT", body: JSON.stringify({ assignments: draft }) }));
+      await api<ModelRouting>("/model-routing", { method: "PUT", body: JSON.stringify({ assignments: draft }) });
+      await invalidate(scopes.modelRouting);
       notify("Model routing saved");
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Model routing could not be saved", "error");
@@ -397,19 +428,30 @@ function ModelRoutingPanel({ notify, providers: registry }: { notify: (message: 
       <div className="subheading"><h4>Model routing</h4><span>Choose which provider answers each kind of request. &quot;Project/global default&quot; follows the project&apos;s pinned model, then the global default.</span></div>
       {state === "loading" ? <LoadingBlock label="Loading model routing" /> : <>
         <div className="table-header routing-grid"><span>Purpose</span><span>Provider</span><span>Effective model</span></div>
-        {purposes.map((item) => (
-          <div className="data-row routing-grid" key={item.purpose}>
-            <span><strong>{item.label}</strong><small>{item.purpose}</small></span>
-            <select className="table-select" aria-label={`Provider for ${item.label}`} value={draft[item.purpose] ?? ""} onChange={(event) => setDraft((current) => ({ ...current, [item.purpose]: event.target.value || null }))}>
-              <option value="">Project/global default</option>
-              {options.map((provider) => <option key={provider.id} value={provider.id} disabled={!provider.enabled}>{provider.name} / {provider.default_model}{provider.status !== "healthy" ? ` (${provider.status.replaceAll("_", " ")})` : ""}</option>)}
-            </select>
-            <span>{item.effective_provider ? `${item.effective_provider.name} / ${item.effective_provider.model}` : "No provider resolved"}{item.scope && <small>via {item.scope}</small>}</span>
-          </div>
-        ))}
+        {purposes.map((item) => {
+          // kind: generation → text models only, decision → decision models (Jev) only, either → both.
+          const kind = item.kind || "generation";
+          const selectedId = draft[item.purpose] ?? "";
+          const allowed = options.filter((provider) => kind === "either" || providerCapability(provider) === kind || provider.id === selectedId);
+          const effective = item.effective_provider ? options.find((provider) => provider.id === item.effective_provider!.id) : undefined;
+          return (
+            <div className="data-row routing-grid" key={item.purpose}>
+              <span><strong>{item.label}{kind !== "generation" && <span className={`tag ${kind === "decision" ? "tag-decision" : ""}`} title={kind === "decision" ? "Answered by a decision model" : "Text or decision model"}>{kind === "decision" ? "decision" : "text or decision"}</span>}</strong><small>{item.purpose}</small></span>
+              <select className="table-select" aria-label={`Provider for ${item.label}`} value={selectedId} onChange={(event) => setDraft((current) => ({ ...current, [item.purpose]: event.target.value || null }))}>
+                <option value="">{kind === "decision" ? "Not assigned (platform default)" : "Project/global default"}</option>
+                {allowed.map((provider) => {
+                  const capability = providerCapability(provider);
+                  const mismatch = kind !== "either" && capability !== kind;
+                  return <option key={provider.id} value={provider.id} disabled={!provider.enabled || mismatch}>{provider.name} / {provider.default_model}{capability === "decision" ? " · decision model" : ""}{provider.status !== "healthy" ? ` (${provider.status.replaceAll("_", " ")})` : ""}{mismatch ? " (incompatible)" : ""}</option>;
+                })}
+              </select>
+              <span>{item.effective_provider ? <>{item.effective_provider.name} / {item.effective_provider.model}{effective && providerCapability(effective) === "decision" && <span className="tag tag-decision">decision model</span>}</> : "No provider resolved"}{item.scope && <small>via {item.scope}</small>}</span>
+            </div>
+          );
+        })}
         {!purposes.length && <p className="admin-hint">The API reported no routable purposes.</p>}
         <div className="form-end">
-          <button type="button" className="secondary-button" disabled={!dirty || saving} onClick={() => routing && apply(routing)}>Reset</button>
+          <button type="button" className="secondary-button" disabled={!dirty || saving} onClick={() => routing && reset(routing)}>Reset</button>
           <button type="button" className="primary-button" disabled={!dirty || saving} onClick={() => void save()}>{saving ? <RefreshCw size={16} className="spin" /> : <Check size={16} />}Save routing</button>
         </div>
       </>}
@@ -424,10 +466,31 @@ type RouterEvaluation = {
 const ROUTER_BACKENDS = ["local", "llm", "jev"] as const;
 const ROUTER_SAMPLE_CASES = "How many orders were placed per month? | sql_analysis\nRun the monthly revenue reconciliation agent | agent_run\nWhat does it mean? | clarify";
 
+const BACKEND_KIND_LABELS: Record<string, string> = { llm: "LLM", jev: "Jev", local: "Local" };
+
+/**
+ * The backend that actually answered: "llm:gemini-3.6-flash" / "jev:typesafe/jev-1.13-…" show
+ * the kind and model; only "local (…)" — e.g. "local (jev unavailable)" — is a fallback.
+ */
+function EffectiveBackend({ value }: { value: string | null }) {
+  if (!value) return <span>-</span>;
+  if (value.startsWith("local (")) {
+    const reason = value.slice("local (".length).replace(/\)$/, "");
+    return <span className="effective-backend"><strong>Local</strong><span className="chip fallback-chip" title={`Fell back to local rules: ${reason}`}>fallback</span><small>{reason}</small></span>;
+  }
+  const separator = value.indexOf(":");
+  if (separator > 0) {
+    const kind = value.slice(0, separator);
+    const model = value.slice(separator + 1);
+    return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[kind] || kind}</strong><small className="mono">{model}</small></span>;
+  }
+  return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[value] || value}</strong></span>;
+}
+
 /** Replays labelled questions through each decision-router backend (POST /router/evaluate). */
-function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+export function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const [casesText, setCasesText] = useState(ROUTER_SAMPLE_CASES);
-  const [backends, setBackends] = useState<Record<string, boolean>>({ local: true, llm: true, jev: false });
+  const [backends, setBackends] = useState<Record<string, boolean>>({ local: true, llm: true, jev: true });
   const [includeFeedback, setIncludeFeedback] = useState(true);
   const [running, setRunning] = useState(false);
   const [report, setReport] = useState<RouterEvaluation | null>(null);
@@ -448,6 +511,9 @@ function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "o
     }
   }
   const rows = report ? Object.entries(report.backends) : [];
+  // Best = highest accuracy; ties go to the lowest average latency.
+  const best = rows.filter(([, item]) => item.accuracy != null).sort(([, a], [, b]) => (b.accuracy! - a.accuracy!) || ((a.avg_latency_ms ?? Infinity) - (b.avg_latency_ms ?? Infinity)))[0]?.[0] || "";
+  const openItem = openBackend ? report?.backends[openBackend] : undefined;
   return (
     <section className="surface admin-surface">
       <div className="section-heading"><div><span className="eyebrow">DECISION ROUTER</span><h3>Router evaluation</h3><p>Replay labelled questions, plus answers users rated, through each routing backend. Enable a backend only if it wins on your own data.</p></div></div>
@@ -463,17 +529,20 @@ function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "o
         <div className="subheading"><h4>Results</h4><span>{report.cases} case{report.cases === 1 ? "" : "s"}</span></div>
         <div className="table-header router-eval-grid"><span>Backend</span><span>Effective</span><span>Accuracy</span><span>Avg latency</span><span /></div>
         {rows.map(([name, item]) => (
-          <div key={name}>
-            <div className="data-row router-eval-grid">
-              <span><strong>{name}</strong></span>
-              <span>{item.effective_backend || "-"}{item.effective_backend && item.effective_backend !== name ? " (fallback)" : ""}</span>
-              <span>{item.accuracy == null ? "-" : `${Math.round(item.accuracy * 100)}%`}</span>
-              <span>{item.avg_latency_ms == null ? "-" : `${item.avg_latency_ms} ms`}</span>
-              <button type="button" className="text-button" onClick={() => setOpenBackend(openBackend === name ? "" : name)} aria-expanded={openBackend === name}>{openBackend === name ? "Hide cases" : "Cases"}</button>
-            </div>
-            {openBackend === name && <div className="router-eval-cases">{item.results.map((result, index) => <div key={index} className={result.correct ? "" : "miss"}>{result.correct ? <Check size={13} /> : <XCircle size={13} />}<span><strong>{result.question}</strong><small>expected {result.expected} · got {result.got} ({Math.round(result.confidence * 100)}%)</small></span></div>)}</div>}
+          <div key={name} className={`data-row router-eval-grid${name === best ? " best" : ""}${openBackend === name ? " selected" : ""}`}>
+            <span><strong>{name}</strong>{name === best && <span className="chip best-chip" title="Highest accuracy (ties: lowest latency)">best</span>}</span>
+            <EffectiveBackend value={item.effective_backend} />
+            <span className="mono">{item.accuracy == null ? "-" : `${Math.round(item.accuracy * 100)}%`}</span>
+            <span className="mono">{item.avg_latency_ms == null ? "-" : `${Math.round(item.avg_latency_ms)} ms`}</span>
+            <button type="button" className="text-button" onClick={() => setOpenBackend(openBackend === name ? "" : name)} aria-expanded={openBackend === name} aria-controls="router-eval-cases">{openBackend === name ? "Hide cases" : "Cases"}</button>
           </div>
         ))}
+        {openItem && (
+          <div className="router-eval-case-panel" id="router-eval-cases">
+            <div className="subheading"><h4>Cases for {openBackend}</h4><span>{openItem.results.filter((result) => result.correct).length} of {openItem.results.length} correct</span></div>
+            <div className="router-eval-cases">{openItem.results.map((result, index) => <div key={index} className={result.correct ? "" : "miss"}>{result.correct ? <Check size={13} aria-label="correct" /> : <XCircle size={13} aria-label="wrong" />}<span><strong>{result.question}</strong><small>expected {result.expected} · got {result.got} ({Math.round(result.confidence * 100)}%)</small></span></div>)}</div>
+          </div>
+        )}
       </>}
     </section>
   );

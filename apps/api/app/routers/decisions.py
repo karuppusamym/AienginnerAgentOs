@@ -28,6 +28,12 @@ from ..core import require_current_project
 
 router = APIRouter()
 
+# Learning-loop endpoints are mounted through this router so the app shell
+# (main.py) does not need to change when they grow.
+from .learning import router as learning_router  # noqa: E402
+
+router.include_router(learning_router)
+
 
 class RouteRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4_000)
@@ -37,7 +43,13 @@ class RouteRequest(BaseModel):
 def preview_route(payload: RouteRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     project = require_current_project(db, user)
     grounding = grounding_context(db, project.id, payload.question, limit=5)
-    return decide(db, project.id, payload.question, grounding)
+    try:
+        routing_model = selected_model_provider(db, user, "decision_routing")
+    except HTTPException:
+        routing_model = None
+    decision = decide(db, project.id, payload.question, grounding, llm_provider=routing_model, user_id=user.id)
+    db.commit()  # keep the decision model's call log (latency, cost) in Model usage
+    return decision
 
 
 @router.get("/router/policy")
@@ -127,7 +139,7 @@ def evaluate_router(payload: RouterEvaluationRequest, user: User = Depends(get_c
         latencies: list[float] = []
         results = []
         for case in cases:
-            decision = decide(db, project.id, case["question"], groundings[case["question"]], llm_provider=routing_model, backend_override=backend)
+            decision = decide(db, project.id, case["question"], groundings[case["question"]], llm_provider=routing_model, backend_override=backend, user_id=user.id)
             latencies.append(decision["latency_ms"])
             hit = (decision["route"] != case["expect"]) if case["negative"] else (decision["route"] == case["expect"])
             correct += int(hit)
@@ -138,4 +150,5 @@ def evaluate_router(payload: RouterEvaluationRequest, user: User = Depends(get_c
             "effective_backend": results[0]["backend"] if results else None,
             "results": results,
         }
+    db.commit()  # keep the evaluated backends' call logs in Model usage
     return report

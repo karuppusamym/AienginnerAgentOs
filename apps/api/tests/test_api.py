@@ -124,6 +124,33 @@ class DataPilotApiTests(unittest.TestCase):
         restored = self.client.post(f"/projects/{original_project['id']}/select", headers=self.headers)
         self.assertEqual(restored.status_code, 200)
 
+    def test_analytics_catalog_lists_project_dashboards_and_dataset_embeds_are_governed(self) -> None:
+        with patch("app.routers.analytics.superset_availability", return_value={"available": True, "reason": ""}):
+            catalog = self.client.get("/analytics/dashboards", headers=self.headers)
+        self.assertEqual(catalog.status_code, 200, catalog.text)
+        body = catalog.json()
+        self.assertEqual(body["scope"], "project")
+        self.assertIn("primary", body)
+        self.assertIsInstance(body["published"], list)
+        self.assertTrue(body["datasets"], "seeded local datasets should be offered")
+        relations = {item["relation"] for item in body["datasets"]}
+        self.assertFalse({"public.users", "main.users", "users"} & relations)  # never DataPilot metadata tables
+        dataset = body["datasets"][0]
+        captured = {}
+
+        def fake_config(project_name, project_slug, dataset_payload, dashboard_key=None):
+            captured["dataset"], captured["key"] = dataset_payload, dashboard_key
+            return {"embedded_id": "asset-embed", "superset_domain": "http://localhost:8088", "dashboard_id": 5, "dashboard_title": "t", "dataset_relation": dataset["relation"], "chart_count": 3}
+
+        with patch("app.routers.analytics.superset_availability", return_value={"available": True, "reason": ""}),                 patch("app.routers.analytics.main.get_embed_configuration", side_effect=fake_config),                 patch("app.routers.analytics.create_guest_token", return_value={"token": "tok"}):
+            opened = self.client.post(f"/analytics/datasets/{dataset['asset_id']}/guest-token", headers=self.headers)
+            missing = self.client.post("/analytics/datasets/not-a-dataset/guest-token", headers=self.headers)
+        self.assertEqual(opened.status_code, 200, opened.text)
+        self.assertEqual(opened.json()["embedded_id"], "asset-embed")
+        self.assertEqual(captured["key"], f"asset-{dataset['asset_id']}")
+        self.assertFalse(any(column.get("name") in {"email", "phone", "ssn"} for column in captured["dataset"]["columns"]))
+        self.assertEqual(missing.status_code, 404)
+
     def test_embedded_analytics_uses_the_current_project_dataset_mapping(self) -> None:
         projects = self.client.get("/projects", headers=self.headers).json()
         seeded_project = next(item for item in projects if item["slug"] == "retail-banking")
@@ -199,11 +226,17 @@ class DataPilotApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(artifact.status_code, 201)
-        requested = self.client.post(
-            "/analytics/publish-sql",
-            headers=self.headers,
-            json={"artifact_id": artifact.json()["id"], "name": "One row analytics"},
-        )
+        # Superset down (no analytics profile): fail early with guidance, no approval created.
+        with patch("app.routers.analytics.superset_availability", return_value={"available": False, "reason": "Superset host 'superset' does not resolve: the analytics service is not running."}):
+            blocked = self.client.post("/analytics/publish-sql", headers=self.headers, json={"artifact_id": artifact.json()["id"], "name": "One row analytics"})
+        self.assertEqual(blocked.status_code, 503)
+        self.assertIn("analytics service is not running", blocked.json()["detail"])
+        with patch("app.routers.analytics.superset_availability", return_value={"available": True, "reason": ""}):
+            requested = self.client.post(
+                "/analytics/publish-sql",
+                headers=self.headers,
+                json={"artifact_id": artifact.json()["id"], "name": "One row analytics"},
+            )
         self.assertEqual(requested.status_code, 202)
         approval_id = requested.json()["approval_id"]
         artifact_id = artifact.json()["id"]
@@ -1142,7 +1175,7 @@ class DataPilotApiTests(unittest.TestCase):
             def record_event(self, event) -> None:
                 captured.append(event)
 
-        with patch("app.core.current_membership", return_value=SimpleNamespace(project_id="project-1")):
+        with patch("app.services.audit.current_membership", return_value=SimpleNamespace(project_id="project-1")):
             with patch("app.governance._adapters", return_value=[CaptureAdapter()]):
                 audit(
                     SimpleNamespace(add=stored.append),
@@ -2981,7 +3014,7 @@ class DataPilotApiTests(unittest.TestCase):
 
         rate_limit.configure_client(fakeredis.FakeRedis())
         try:
-            with patch("app.core.EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", 2):
+            with patch("app.services.query_tools.EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", 2):
                 first = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
                 second = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
                 third = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})

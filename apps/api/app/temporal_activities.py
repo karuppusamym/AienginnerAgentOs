@@ -94,6 +94,12 @@ def _parameters_for_tool(schema: dict, objective: str, db=None, project_id: str 
     assets = db.scalars(select(DataAsset).where(DataAsset.project_id == project_id)).all() if db is not None and project_id else []
     relations = {f"{asset.schema_name}.{asset.table_name}": asset for asset in assets}
     matched_asset = next((asset for relation, asset in relations.items() if relation.lower() in objective_lower), None)
+    if matched_asset is None:
+        # A bare table name ("the transactions dataset") counts only when exactly one catalogued asset has it.
+        words = set(re.findall(r"[a-z0-9_]+", objective_lower))
+        by_name = [asset for asset in assets if asset.table_name.lower() in words or asset.table_name.lower().rstrip("s") in words]
+        if len(by_name) == 1:  # the same name in two schemas or sources is ambiguous: skip, never guess
+            matched_asset = by_name[0]
     uuid_candidates = set(re.findall(r"\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b", objective_lower))
     for name, declaration in properties.items():
         if name in {"query", "objective"} and declaration.get("type") == "string":
@@ -289,6 +295,75 @@ def _execute_bound_query_tool(db, job: Job, query_tool: QueryTool, parameters: d
     )
 
 
+TOOL_SELECTION_MIN_PROBABILITY = 0.25
+TOOL_SELECTION_MAX_PER_STEP = 2
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _eligible_step_tools(db, job: Job, tool_names: list[str], query_tool_names: list[str], autonomy_level: int) -> dict[str, str]:
+    """Bound tools that could run in this step, name -> registry description (same filters as the loop)."""
+    eligible: dict[str, str] = {}
+    for name in tool_names:
+        tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == name, ToolDefinition.enabled.is_(True)))
+        if tool is None or tool.requires_approval or tool.risk_level != "low":
+            continue
+        tool_version = db.scalar(select(ToolVersion).where(ToolVersion.tool_id == tool.id, ToolVersion.status == "published").order_by(ToolVersion.version.desc()).limit(1))
+        if tool_version is None or tool_version.implementation_type != "builtin":
+            continue
+        if autonomy_level == 1 and not _is_read_only_builtin(tool, tool_version):
+            continue
+        eligible[name] = tool.description or name
+    for name in query_tool_names:
+        query_tool = db.scalar(select(QueryTool).where(QueryTool.project_id == job.project_id, QueryTool.name == name, QueryTool.status == "published"))
+        if query_tool is not None and not query_tool.requires_approval:
+            eligible[name] = f"{query_tool.description} {query_tool.purpose}".strip() or name
+    return eligible
+
+
+def _local_tool_scores(text: str, options: dict[str, str]) -> dict[str, float]:
+    words = set(_WORD.findall(text.lower()))
+    scores = {}
+    for name, description in options.items():
+        terms = set(_WORD.findall(f"{name.replace('.', ' ').replace('_', ' ')} {description}".lower()))
+        scores[name] = len(words & terms) / max(1, len(terms)) ** 0.5
+    total = sum(scores.values())
+    return {name: (value / total if total else 1 / len(options)) for name, value in scores.items()}
+
+
+def _select_step_tools(db, job: Job, agent_name: str, step: dict, objective: str, eligible: dict[str, str], evidence: list[dict], outputs: list[dict]) -> set[str] | None:
+    """Pick the tools that fit this step instead of firing every bound tool.
+
+    The decision model routed to ``tool_selection`` (Jev) chooses from the
+    registry descriptions; without one, a local word-overlap score chooses.
+    Returns None (run all) only when there is nothing to choose between.
+    """
+    if len(eligible) < 2:
+        return None
+    action = str(step.get("action", ""))
+    from . import jev_client
+
+    choice = None
+    provider = _job_routed_provider(db, job, "tool_selection")
+    if provider is not None:
+        choice = jev_client.choose_tools(db, provider, action, objective, eligible, job.project_id, job.created_by)
+    if choice is None:
+        choice = {"by": "local", "model": None, "probabilities": _local_tool_scores(f"{action} {objective}", eligible), "latency_ms": 0, "cost_usd": None}
+    ranked = sorted(choice["probabilities"].items(), key=lambda item: item[1], reverse=True)
+    selected = [ranked[0][0], *[name for name, p in ranked[1:TOOL_SELECTION_MAX_PER_STEP] if p >= TOOL_SELECTION_MIN_PROBABILITY]]
+    by = f"jev:{choice['model']}" if choice["by"] == "jev" else "local word overlap"
+    summary = ", ".join(f"{name} {p:.0%}" for name, p in ranked[:4])
+    evidence.append({"type": "tool_choice", "label": f"{agent_name}: {by} chose {', '.join(selected)} ({summary})", "agent": agent_name, "selected": selected, "by": choice["by"]})
+    outputs.append({
+        "type": "tool_choice",
+        "agent": agent_name,
+        "title": f"{agent_name} chose {', '.join(selected)}",
+        "summary": f"{by} over {len(eligible)} eligible tools: {summary}",
+        "data": {"by": choice["by"], "model": choice["model"], "probabilities": {name: round(p, 4) for name, p in ranked}, "selected": selected, "step": action[:300], "latency_ms": choice.get("latency_ms"), "cost_usd": choice.get("cost_usd")},
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    return set(selected)
+
+
 def _execute_bound_tools(
     db,
     job: Job,
@@ -341,9 +416,14 @@ def _execute_bound_tools(
             continue
         version = db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent.id, AgentVersion.status == "published").order_by(AgentVersion.version.desc()).limit(1))
         tool_names = version.tool_names if version else agent.tool_names
+        bound_query_tools = (version.query_tool_names if version else agent.query_tool_names) or []
+        eligible = _eligible_step_tools(db, job, tool_names, bound_query_tools, autonomy_level)
+        selected_tools = _select_step_tools(db, job, agent.name, step, objective, eligible, evidence, outputs)
         for tool_name in tool_names:
             if calls_remaining <= 0:
                 break
+            if selected_tools is not None and tool_name not in selected_tools:
+                continue
             tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == tool_name, ToolDefinition.enabled.is_(True)))
             if tool is None or tool.requires_approval or tool.risk_level != "low":
                 continue
@@ -354,11 +434,12 @@ def _execute_bound_tools(
                 logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {tool.name}: autonomy level 1 allows read-only tools only"})
                 continue
             parameter_source = "heuristic"
-            parameters = _parameters_for_tool(tool_version.parameter_schema, objective, db, job.project_id)
+            parameters = _parameters_for_tool(tool_version.parameter_schema, f"{step.get('action', '')}\n{objective}", db, job.project_id)
             if parameters is None:
                 parameters = _llm_parameters_for_tool(db, provider, tool_version.parameter_schema, objective, job.project_id, tool.name, job)
                 parameter_source = "model"
             if parameters is None:
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {tool.name}: its required parameters could not be grounded in this project"})
                 continue
             calls_remaining -= 1
             for attempt_idx in range(3):
@@ -427,6 +508,8 @@ def _execute_bound_tools(
         for query_tool_name in query_tool_names:
             if calls_remaining <= 0:
                 break
+            if selected_tools is not None and query_tool_name not in selected_tools:
+                continue
             query_tool = db.scalar(
                 select(QueryTool).where(
                     QueryTool.project_id == job.project_id,
@@ -437,11 +520,12 @@ def _execute_bound_tools(
             if query_tool is None or query_tool.requires_approval:
                 continue
             parameter_source = "heuristic"
-            parameters = _parameters_for_tool(query_tool.parameter_schema, objective, db, job.project_id)
+            parameters = _parameters_for_tool(query_tool.parameter_schema, f"{step.get('action', '')}\n{objective}", db, job.project_id)
             if parameters is None:
                 parameters = _llm_parameters_for_tool(db, provider, query_tool.parameter_schema, objective, job.project_id, query_tool.name, job)
                 parameter_source = "model"
             if parameters is None:
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {query_tool.name}: its required parameters could not be grounded in this project"})
                 continue
             try:
                 validate_parameters(query_tool.parameter_schema, parameters)
@@ -603,7 +687,7 @@ def _approved_steps(plan: list[dict]) -> list[dict]:
     return [step for step in plan if step.get("origin", "planner") != "reviewer"]
 
 
-def agent_runtime_evidence(autonomy_level: int, objective: str) -> dict:
+def agent_runtime_evidence(autonomy_level: int, objective: str, lead_agent: str | None = None) -> dict:
     """Evidence entry that carries run metadata the worker reads back.
 
     It doubles as the human-readable "Autonomy level N" policy evidence the UI
@@ -615,6 +699,7 @@ def agent_runtime_evidence(autonomy_level: int, objective: str) -> dict:
         "agent_runtime": True,
         "autonomy_level": level,
         "objective": objective,
+        **({"lead_agent": lead_agent} if lead_agent else {}),
     }
 
 
@@ -682,6 +767,20 @@ def _job_provider(db, job: Job, purpose: str | None = None):
         active_project_id.reset(token)
 
 
+def _job_routed_provider(db, job: Job, purpose: str):
+    """The provider explicitly routed for ``purpose`` in this job's project, or None (no default chain)."""
+    from .provider_selection import routed_only_provider
+
+    token = active_project_id.set(job.project_id)
+    try:
+        user = db.get(User, job.created_by)
+        return routed_only_provider(db, user, purpose) if user is not None else None
+    except Exception:
+        return None
+    finally:
+        active_project_id.reset(token)
+
+
 def _plan_for_job(db, job: Job, objective: str) -> dict:
     """Ground the objective and produce a bounded plan (model or deterministic)."""
     plan = [dict(step) for step in FALLBACK_PLAN]
@@ -701,20 +800,26 @@ def _plan_for_job(db, job: Job, objective: str) -> dict:
     )
     logs = [_log("info", f"Retrieved {len(grounding['catalog_matches'])} catalog matches and {len(grounding['semantic_matches'])} semantic metrics")]
     enabled_agent_names = _enabled_agent_names(db)
+    lead_agent = _runtime(job).get("lead_agent")
+    lead_agent = lead_agent if lead_agent in enabled_agent_names else None
     provider = _job_provider(db, job, "agent_planning")
     if provider and provider.provider_type != "local_mock":
         try:
             generated = generate_text(
                 provider,
-                f"You are the governed planner for a local data engineering product. Return JSON only: an array of 3 to 6 objects with agent and action string fields. Configured agents are {', '.join(sorted(enabled_agent_names))}. Deterministic policy enforcement remains authoritative even when the Policy agent is configured. Every action must be read-only unless it explicitly says approval is required.",
-                f"Create a bounded specialist plan for this objective: {objective}\n\n{grounding_prompt_text(grounding)}",
-                800,
+                f"You are the governed planner for a local data engineering product. Return JSON only: an array of 3 to 6 objects with agent and action string fields; keep each action under 25 words. Configured agents are {', '.join(sorted(enabled_agent_names))}. Deterministic policy enforcement remains authoritative even when the Policy agent is configured. Every action must be read-only unless it explicitly says approval is required.",
+                f"Create a bounded specialist plan for this objective: {objective}\n"
+                + (f"The lead agent chosen by the decision router is {lead_agent}; it must own at least one step.\n" if lead_agent else "")
+                + f"\n{grounding_prompt_text(grounding)}",
+                1600,
                 governance_feature="agent_planning",
                 governance_business_id=job.project_id,
                 governance_session_id=job.id,
                 governance_user_id=job.created_by,
             )
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", generated.content.strip(), flags=re.I)
+            if "[" in content and "]" in content:
+                content = content[content.find("["): content.rfind("]") + 1]  # tolerate prose around the array
             parsed = json.loads(content)
             if not isinstance(parsed, list) or not 3 <= len(parsed) <= 6:
                 raise ValueError("Planner output must contain 3 to 6 steps")
@@ -753,6 +858,10 @@ def _plan_for_job(db, job: Job, objective: str) -> dict:
                 "at": _now(),
             }
         )
+    if lead_agent and all(step["agent"] != lead_agent for step in plan):
+        plan.insert(1 if plan and plan[0]["agent"] == "Planner" else 0, {"agent": lead_agent, "action": f"Lead the objective: {objective[:300]}"})
+        plan = plan[:7]
+        logs.append(_log("info", f"Added a step for lead agent {lead_agent} (chosen by the decision router)"))
     if model_log:
         logs.append(model_log)
     return {
@@ -836,6 +945,7 @@ def hold_agent_run_for_approval(
         evidence = {
             "objective": objective,
             "risk_triggers": risk.get("triggers", []),
+            "jev": risk.get("jev"),
             "guardrails": guardrails or list(DEFAULT_GUARDRAILS),
             "hold": "objective",
             "autonomy_level": job_autonomy_level(job),

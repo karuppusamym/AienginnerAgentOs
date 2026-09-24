@@ -90,7 +90,7 @@ class LocalScorerTests(unittest.TestCase):
 
     def test_jev_distribution_reorders_candidates(self) -> None:
         with mock.patch.dict(os.environ, {"DECISION_ROUTER_BACKEND": "jev"}), \
-                mock.patch.object(decision_router, "_jev_choice", return_value={"clarify": 0.9, "sql_analysis": 0.1}):
+                mock.patch.object(decision_router, "_jev_choice", return_value={"distribution": {"clarify": 0.9, "sql_analysis": 0.1}, "consequential": 0.1, "model": "typesafe/jev-1.13"}):
             db = mock.MagicMock()
             db.scalars.return_value.all.return_value = []
             decision = decision_router.decide(db, "p1", "How many accounts?", {"catalog_matches": []})
@@ -98,6 +98,42 @@ class LocalScorerTests(unittest.TestCase):
         self.assertTrue(decision["backend"].startswith("jev"))
         # Risk stays deterministic regardless of the decision model.
         self.assertEqual(decision["risk"], assess_risk("How many accounts?"))
+
+    def test_jev_can_escalate_but_never_lower_risk(self) -> None:
+        db = mock.MagicMock()
+        db.scalars.return_value.all.return_value = []
+        verdict = {"distribution": {"sql_analysis": 0.8, "clarify": 0.2}, "consequential": 0.92, "model": "typesafe/jev-1.13"}
+        with mock.patch.object(decision_router, "_jev_choice", return_value=verdict):
+            escalated = decision_router.decide(db, "p1", "Copy customer records to the marketing share", {"catalog_matches": []}, backend_override="jev")
+            deterministic_high = decision_router.decide(db, "p1", "delete stale accounts", {"catalog_matches": []}, backend_override="jev")
+        self.assertEqual(escalated["risk"]["escalated_by"], "jev")
+        self.assertTrue(escalated["risk"]["requires_approval"])
+        with mock.patch.object(decision_router, "_jev_choice", return_value={**verdict, "consequential": 0.0}):
+            not_lowered = decision_router.decide(db, "p1", "delete stale accounts", {"catalog_matches": []}, backend_override="jev")
+        self.assertEqual(not_lowered["risk"]["level"], "high")
+        self.assertEqual(deterministic_high["risk"]["level"], "high")
+
+    def test_jev_request_matches_openrouter_decisions_api(self) -> None:
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None: ...
+            def json(self) -> dict:
+                return {"model": "typesafe/jev-1.13-20260917", "answers": {"route": {"type": "choice", "choice": "clarify", "probabilities": {"clarify": 1, "sql_analysis": 0}}, "consequential": {"type": "noul", "noul": 0.1}}}
+
+        def fake_post(url, json, headers, timeout):
+            captured.update(url=url, body=json, headers=headers)
+            return FakeResponse()
+
+        candidates = [{"route": "sql_analysis", "score": 0.5, "reasons": []}, {"route": "clarify", "score": 0.2, "reasons": []}]
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "", "TYPESAFE_API_URL": "", "TYPESAFE_MODEL": ""}), mock.patch("app.jev_client.httpx.post", side_effect=fake_post):
+            verdict = decision_router._jev_choice("stuff", candidates, DEFAULT_POLICY)
+        self.assertEqual(captured["url"], "https://openrouter.ai/api/alpha/decisions")
+        self.assertEqual(captured["body"]["model"], "typesafe/jev-1.13")
+        self.assertEqual(set(captured["body"]["questions"]["route"]["criteria"]), {"sql_analysis", "clarify"})
+        self.assertEqual(captured["body"]["questions"]["consequential"]["type"], "noul")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer or-key")
+        self.assertEqual(verdict["distribution"], {"clarify": 1.0, "sql_analysis": 0.0})
 
     def test_follow_ups_use_result_columns(self) -> None:
         ideas = follow_up_questions("accounts", {"columns": ["open_month", "branch", "total"], "rows": [{"open_month": "2026-01", "branch": "A", "total": 3}], "row_count": 1})
@@ -159,6 +195,19 @@ class LocalSqlTests(unittest.TestCase):
         self.assertTrue(_cacheable_sql_result({"execution": {"rows": []}, "provider": {"mode": "deterministic_local"}}))
         self.assertFalse(_cacheable_sql_result({"execution": {"error": "syntax error"}, "provider": {"mode": "deterministic_local"}}))
         self.assertFalse(_cacheable_sql_result({"execution": None, "provider": {"mode": "deterministic_safety_fallback"}}))
+
+    def test_casts_on_calls_and_numbered_types(self) -> None:
+        # Found live: DeepSeek/Claude candidates wrote COUNT(...)::numeric, which the first rewrite mangled.
+        rewritten = sqlite_compatible_sql("select count(case when s = 'x' then 1 end)::numeric / count(*), sum(v)::float8, (a+b)::double precision from core.accounts", {"accounts"})
+        self.assertIn("CAST(count(case when s = 'x' then 1 end) AS REAL)", rewritten)
+        self.assertIn("CAST(sum(v) AS REAL)", rewritten)
+        self.assertIn("CAST((a+b) AS REAL)", rewritten)
+        self.assertNotIn("::", rewritten)
+        # Also found live: aggregate FILTER / window OVER clauses belong inside the cast.
+        filtered = sqlite_compatible_sql("SELECT COUNT(*) FILTER (WHERE status = 'active')::decimal / COUNT(*) FROM core.accounts", {"accounts"})
+        self.assertIn("CAST(COUNT(*) FILTER (WHERE status = 'active') AS REAL)", filtered)
+        windowed = sqlite_compatible_sql("SELECT SUM(x) OVER (PARTITION BY a)::float8 FROM core.accounts", {"accounts"})
+        self.assertIn("CAST(SUM(x) OVER (PARTITION BY a) AS REAL)", windowed)
 
     def test_schema_stripping_cannot_reach_app_tables(self) -> None:
         Base.metadata.create_all(engine)  # this class can run before the app's startup creates tables
@@ -276,6 +325,21 @@ class RouterApiTests(unittest.TestCase):
         self.assertIn(field["name"], applied.json()["columns_updated"])
         project_package = self.client.get("/datapackage", headers=self.headers).json()
         self.assertGreaterEqual(len(project_package["resources"]), 1)
+
+
+class AgentCandidateTests(unittest.TestCase):
+    def test_router_offers_each_plausible_agent_so_the_decision_model_picks_which(self) -> None:
+        from app.decision_router import active_policy, local_scores
+        agents = [SimpleNamespace(id="a1", name="Quality", purpose="Validate data quality rules and null checks"),
+                  SimpleNamespace(id="a2", name="Troubleshooter", purpose="Investigate failed jobs and lineage"),
+                  SimpleNamespace(id="a3", name="Pipeline", purpose="Stage files and schedule loads")]
+        candidates = local_scores("Run the quality agent to validate null checks on transactions", None, [], agents, active_policy())
+        agent_targets = [item["target"]["name"] for item in candidates if item["route"] == "agent_run" and item.get("target")]
+        self.assertEqual(agent_targets, ["Quality"])  # a named agent is not second-guessed
+        candidates = local_scores("Validate null checks then investigate why the nightly loads failed", None, [], agents, active_policy())
+        agent_targets = [item["target"]["name"] for item in candidates if item["route"] == "agent_run" and item.get("target")]
+        self.assertGreaterEqual(len(agent_targets), 2)
+        self.assertEqual(set(agent_targets[:2]), {"Quality", "Troubleshooter"})
 
 
 if __name__ == "__main__":

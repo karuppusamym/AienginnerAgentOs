@@ -16,6 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# Alembic migration environment (python -m app.migrate / alembic upgrade head).
+COPY alembic.ini ./
+COPY alembic ./alembic
 RUN mkdir -p /data/uploads
 
 # Run as a fixed non-root UID, group 0 ("root group"). This is deliberately

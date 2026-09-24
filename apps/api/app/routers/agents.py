@@ -119,6 +119,8 @@ from fastapi import APIRouter
 from starlette.concurrency import run_in_threadpool
 
 from ..decision_router import assess_risk
+from ..jev_client import consequential_probability
+from ..provider_selection import routed_only_provider
 
 from .. import core as main
 from ..core import (
@@ -208,7 +210,23 @@ async def start_agent_run(
     main.require_any_permission(user, db, main.AGENT_RUNNERS, "Your role cannot start agent runs")
     project = require_current_project(db, user)
     autonomy_level = int(payload.autonomy_level)
+    lead_agent = None
+    if payload.agent_id:
+        chosen = db.get(AgentDefinition, payload.agent_id)
+        if chosen is None or not chosen.enabled:
+            raise HTTPException(status_code=422, detail="The selected lead agent does not exist or is disabled")
+        lead_agent = chosen.name
     risk = assess_risk(payload.objective)
+    jev_evidence = None
+    if not risk["requires_approval"]:
+        # A decision model can escalate an innocuous-looking objective, never waive a deterministic hold.
+        checker = routed_only_provider(db, user, "risk_check")
+        if checker is not None:
+            probability, jev_model = await run_in_threadpool(consequential_probability, db, checker, payload.objective, project.id, user.id)
+            if probability is not None and probability >= 0.7:
+                risk = {"level": "medium", "requires_approval": True, "triggers": ["jev:consequential"], "escalated_by": "jev"}
+            jev_evidence = {"consequential": probability, "model": jev_model}
+            risk = {**risk, "jev": jev_evidence}
     # Autonomy 0 is plan-only: nothing executes, so there is nothing for a
     # human to approve. Levels 1-3 hold risky objectives exactly as before
     # (level 3 never widens past level 2).
@@ -229,7 +247,8 @@ async def start_agent_run(
         plan=plan,
         evidence=[
             # Carries autonomy_level + the full objective for the worker.
-            agent_runtime_evidence(autonomy_level, payload.objective),
+            agent_runtime_evidence(autonomy_level, payload.objective, lead_agent),
+            *([{"type": "agent_choice", "label": f"Lead agent: {lead_agent}", "agent": lead_agent}] if lead_agent else []),
             {"type": "catalog", "label": f"{catalog_size} assets in project catalog (tools run only after approval)" if requires_approval else f"{catalog_size} assets in project catalog"},
             {"type": "limit", "label": "5 agents / 12 tool calls / 5 minute budget"},
             *([{"type": "policy", "label": "Plan only: approval not required because nothing executes"}] if autonomy_level == 0 and risk["requires_approval"] else []),
@@ -239,7 +258,7 @@ async def start_agent_run(
     )
     db.add(job)
     db.flush()
-    audit(db, user, "agent.run_started", "job", job.id, {"autonomy_level": autonomy_level})
+    audit(db, user, "agent.run_started", "job", job.id, {"autonomy_level": autonomy_level, "lead_agent": lead_agent})
     db.commit()
     approval_id = None
     workflow_id = None

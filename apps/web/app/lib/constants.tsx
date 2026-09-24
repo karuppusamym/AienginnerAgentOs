@@ -11,6 +11,7 @@ import {
   FlaskConical,
   Gauge,
   GitBranch,
+  GraduationCap,
   LayoutDashboard,
   MessageSquare,
   Network,
@@ -36,6 +37,7 @@ export const navItems: { key: NavKey; label: string; icon: typeof LayoutDashboar
   { key: "agents", label: "Agents", icon: Bot },
   { key: "semantic", label: "Semantic layer", icon: Braces },
   { key: "evaluations", label: "Evaluations", icon: FlaskConical },
+  { key: "learning", label: "Learning", icon: GraduationCap },
   { key: "admin", label: "Admin", icon: Settings },
 ];
 
@@ -43,7 +45,7 @@ export const navGroups: { key: string; label: string; items: NavKey[] }[] = [
   { key: "overview", label: "Overview", items: ["workspace", "conversations"] },
   { key: "data", label: "Data workspace", items: ["datasets", "files", "sql", "notebooks"] },
   { key: "delivery", label: "Build & operate", items: ["pipelines", "jobs", "quality", "artifacts", "approvals"] },
-  { key: "governance", label: "Governance & agents", items: ["semantic", "tools", "agents", "evaluations", "superset"] },
+  { key: "governance", label: "Governance & agents", items: ["semantic", "tools", "agents", "evaluations", "learning", "superset"] },
   { key: "administration", label: "Administration", items: ["admin"] },
 ];
 
@@ -84,7 +86,20 @@ export const defaultTourSteps: { key: NavKey; title: string; body: string }[] = 
   },
 ];
 
-export type ProviderTypeOption = { value: string; label: string; baseUrl: string; modelPlaceholder: string; secretReference: string; secretPlaceholder: string };
+export type ProviderTypeOption = {
+  value: string;
+  label: string;
+  baseUrl: string;
+  modelPlaceholder: string;
+  secretReference: string;
+  secretPlaceholder: string;
+  /** Pre-filled model id (only for providers with a single well-known model). */
+  defaultModel?: string;
+  /** Short note shown under the type selector. */
+  hint?: string;
+  /** "decision" providers return typed choices with probabilities, never text. */
+  capability?: "generation" | "decision";
+};
 
 // Provider types offered when registering a model provider. `baseUrl` and
 // `secretReference` pre-fill the form (empty = API default / nothing pre-filled);
@@ -96,8 +111,15 @@ export const providerTypeOptions: ProviderTypeOption[] = [
   { value: "claude", label: "Claude", baseUrl: "", modelPlaceholder: "claude-sonnet-5", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
   { value: "openai_compatible", label: "OpenAI compatible", baseUrl: "", modelPlaceholder: "model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
   { value: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", modelPlaceholder: "anthropic/claude-sonnet-5", secretReference: "env:OPENROUTER_API_KEY", secretPlaceholder: "env:OPENROUTER_API_KEY" },
+  { value: "jev", label: "TypeSafe Jev (decision model)", baseUrl: "https://openrouter.ai/api/alpha/decisions", modelPlaceholder: "typesafe/jev-1.13", defaultModel: "typesafe/jev-1.13", secretReference: "env:OPENROUTER_API_KEY", secretPlaceholder: "env:OPENROUTER_API_KEY", hint: "Decision model: returns typed choices with probabilities, not text", capability: "decision" },
   { value: "local_mock", label: "Local mock", baseUrl: "", modelPlaceholder: "local-deterministic", secretReference: "", secretPlaceholder: "Not required" },
 ];
+
+/** A provider's capability; older APIs omit it, so it is derived from the provider type. */
+export const providerCapability = (provider: { capability?: string | null; provider_type?: string }) =>
+  provider.capability === "decision" || provider.capability === "generation"
+    ? provider.capability
+    : providerTypeOptions.find((option) => option.value === provider.provider_type)?.capability || "generation";
 
 export const connectorLabels: Record<string, string> = {
   postgres: "PostgreSQL",
@@ -119,11 +141,11 @@ export const connectorDialectForType = (connectorType: string) => {
 
 export const statusTone = (status: string) => {
   const normalized = status.toLowerCase();
-  if (["healthy", "succeeded", "approved", "passed", "reachable", "staged"].includes(normalized)) {
+  if (["healthy", "succeeded", "approved", "passed", "reachable", "staged", "completed", "helpful"].includes(normalized)) {
     return "positive";
   }
-  if (["failed", "rejected", "cancelled"].includes(normalized)) return "negative";
-  if (["pending", "waiting_for_approval", "retrying", "configuration_required"].includes(normalized)) {
+  if (["failed", "rejected", "cancelled", "not helpful"].includes(normalized)) return "negative";
+  if (["pending", "waiting_for_approval", "retrying", "configuration_required", "needs_review"].includes(normalized)) {
     return "warning";
   }
   return "neutral";

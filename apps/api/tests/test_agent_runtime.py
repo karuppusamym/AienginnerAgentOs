@@ -401,6 +401,70 @@ class AgentRuntimeTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TEMPORAL_ADDRESS": ""}):
             self.assertIsNone(asyncio.run(temporal_runtime.start_agent_workflow("j1", "objective")))
 
+    # -- tool and agent choice -------------------------------------------
+    def test_step_tools_are_chosen_not_all_fired_and_jev_decides_when_routed(self) -> None:
+        job_id = self._job("Profile the transactions dataset")
+        step = {"agent": "Metadata", "action": "Profile the dataset columns and null rates"}
+        eligible = {"catalog.search": "Search the catalog for datasets", "dataset.profile": "Profile a dataset: column types, null rates, distinct values", "lineage.query": "Upstream and downstream lineage"}
+        with SessionLocal() as db:
+            job = db.get(Job, job_id)
+            # No decision model routed: local word overlap chooses, and says so.
+            with mock.patch.object(runtime, "_job_routed_provider", return_value=None):
+                evidence, outputs = [], []
+                chosen = runtime._select_step_tools(db, job, "Metadata", step, job.title, eligible, evidence, outputs)
+            self.assertIn("dataset.profile", chosen)
+            self.assertLess(len(chosen), len(eligible))
+            self.assertEqual(outputs[0]["data"]["by"], "local")
+            # Jev routed: its probabilities decide, and the choice is recorded as evidence.
+            verdict = {"by": "jev", "model": "typesafe/jev-1.13", "probabilities": {"catalog.search": 0.1, "dataset.profile": 0.05, "lineage.query": 0.85}, "latency_ms": 300, "cost_usd": 0.00002}
+            with mock.patch.object(runtime, "_job_routed_provider", return_value=SimpleNamespace(provider_type="jev")), \
+                    mock.patch("app.jev_client.choose_tools", return_value=verdict):
+                evidence, outputs = [], []
+                chosen = runtime._select_step_tools(db, job, "Metadata", step, job.title, eligible, evidence, outputs)
+        self.assertEqual(chosen, {"lineage.query"})
+        self.assertEqual(outputs[0]["type"], "tool_choice")
+        self.assertIn("jev:typesafe/jev-1.13", evidence[0]["label"])
+        self.assertIsNone(runtime._select_step_tools(None, None, "X", step, "", {"only.tool": "d"}, [], []))
+
+    def test_bare_table_name_grounds_only_when_unambiguous(self) -> None:
+        from collections import Counter
+        from app.models import DataAsset
+        schema = {"type": "object", "required": ["asset_id"], "properties": {"asset_id": {"type": "string"}}}
+        with SessionLocal() as db:
+            assets = db.scalars(select(DataAsset).where(DataAsset.project_id == self.project_id)).all()
+            counts = Counter(asset.table_name.lower() for asset in assets)
+            unique = next(asset for asset in assets if counts[asset.table_name.lower()] == 1)
+            grounded = runtime._parameters_for_tool(schema, f"Profile the {unique.table_name} dataset", db, self.project_id)
+            self.assertEqual(grounded, {"asset_id": unique.id})
+            self.assertIsNone(runtime._parameters_for_tool(schema, "Profile the zzz_not_a_table dataset", db, self.project_id))
+            duplicated = next((name for name, count in counts.items() if count > 1), None)
+            if duplicated:
+                self.assertIsNone(runtime._parameters_for_tool(schema, f"Profile the {duplicated} dataset", db, self.project_id))
+
+    def test_lead_agent_from_router_owns_a_plan_step(self) -> None:
+        with SessionLocal() as db:
+            job = Job(project_id=self.project_id, title="Investigate failed loads", job_type="agent_run", status="PLANNING", progress=5, plan=[],
+                      evidence=[runtime.agent_runtime_evidence(2, "Investigate failed loads", "Troubleshooter")], logs=[], outputs=[], created_by=self.admin_id)
+            db.add(job)
+            db.commit()
+            self.created_jobs.append(job.id)
+            with mock.patch.object(runtime, "_job_provider", return_value=None):
+                planned = runtime._plan_for_job(db, job, "Investigate failed loads")
+        self.assertIn("Troubleshooter", [step["agent"] for step in planned["plan"]])
+
+    def test_run_request_accepts_a_lead_agent(self) -> None:
+        agents = self.client.get("/agents", headers=self.headers).json()
+        quality = next(agent for agent in agents if agent["name"] == "Quality")
+        bad = self.client.post("/agents/runs", headers=self.headers, json={"objective": "Check data quality", "autonomy_level": 0, "agent_id": "missing"})
+        self.assertEqual(bad.status_code, 422)
+        with mock.patch("app.routers.agents.start_agent_workflow", new=mock.AsyncMock(return_value=None)), \
+                mock.patch("app.routers.agents.run_agent_plan_locally"):
+            started = self.client.post("/agents/runs", headers=self.headers, json={"objective": "Check data quality of transactions", "autonomy_level": 0, "agent_id": quality["id"]})
+        self.assertEqual(started.status_code, 201, started.text)
+        self.created_jobs.append(started.json()["job_id"])
+        job = self._load(started.json()["job_id"])
+        self.assertEqual(runtime._runtime(job).get("lead_agent"), "Quality")
+
     def test_temporal_client_is_cached_and_reconnects(self) -> None:
         connect = mock.AsyncMock(side_effect=lambda address: SimpleNamespace(address=address))
         temporal_runtime.reset_temporal_client()

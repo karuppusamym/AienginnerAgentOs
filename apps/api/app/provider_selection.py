@@ -46,7 +46,25 @@ MODEL_PURPOSES: dict[str, str] = {
     "agent_planning": "Agent planning",
     "agent_review": "Agent plan review",
     "tool_parameters": "Tool parameter filling",
+    "sql_candidate_2": "Second SQL candidate (multi-model vote)",
+    "sql_candidate_3": "Third SQL candidate (multi-model vote)",
+    "risk_check": "Consequential-action check (escalates approvals only)",
+    "sql_candidate_judge": "SQL candidate tie-breaker",
+    "tool_selection": "Tool choice for each agent step",
 }
+# generation: needs a text model; decision: needs a decision model (Jev); either: both work.
+PURPOSE_KIND: dict[str, str] = {purpose: "generation" for purpose in MODEL_PURPOSES}
+PURPOSE_KIND.update({"decision_routing": "either", "risk_check": "decision", "sql_candidate_judge": "decision", "tool_selection": "decision"})
+DECISION_PROVIDER_TYPES = {"jev"}
+
+
+def provider_capability(provider: ModelProvider) -> str:
+    return "decision" if provider.provider_type in DECISION_PROVIDER_TYPES else "generation"
+
+
+def purpose_accepts(purpose: str, provider: ModelProvider) -> bool:
+    kind = PURPOSE_KIND.get(purpose, "generation")
+    return kind == "either" or kind == provider_capability(provider)
 _FAILED_STATUSES = {"failed", "error", "unhealthy", "configuration_required"}
 
 
@@ -59,6 +77,16 @@ def _usable(provider: ModelProvider | None) -> bool:
     return bool(provider and provider.enabled and provider.status not in _FAILED_STATUSES)
 
 
+def routed_only_provider(db: Session, user: User, purpose: str) -> ModelProvider | None:
+    """The provider explicitly routed for ``purpose`` (project, then platform), or None — no default chain."""
+    membership = current_membership(db, user)
+    project_id = membership.project_id if membership is not None else None
+    route = db.scalar(select(ModelRoute).where(ModelRoute.purpose == purpose, ModelRoute.project_id == project_id)) if project_id else None
+    route = route or db.scalar(select(ModelRoute).where(ModelRoute.purpose == purpose, ModelRoute.project_id.is_(None)))
+    provider = db.get(ModelProvider, route.provider_id) if route is not None else None
+    return provider if _usable(provider) and purpose_accepts(purpose, provider) else None
+
+
 def selected_model_provider(db: Session, user: User, purpose: str | None = None) -> ModelProvider | None:
     membership = current_membership(db, user)
     project = db.get(Project, membership.project_id) if membership is not None else None
@@ -69,7 +97,7 @@ def selected_model_provider(db: Session, user: User, purpose: str | None = None)
         route = route or db.scalar(select(ModelRoute).where(ModelRoute.purpose == purpose, ModelRoute.project_id.is_(None)))
         if route is not None:
             routed = db.get(ModelProvider, route.provider_id)
-            if _usable(routed):
+            if _usable(routed) and purpose_accepts(purpose, routed):
                 return routed
             raise ModelProviderUnavailable(
                 f"The model routed for {MODEL_PURPOSES.get(purpose, purpose)} ({routed.name if routed else 'deleted provider'}) is unavailable. "
@@ -89,8 +117,9 @@ def selected_model_provider(db: Session, user: User, purpose: str | None = None)
         select(ModelProvider).where(
             ModelProvider.is_default.is_(True),
             ModelProvider.enabled.is_(True),
+            ModelProvider.provider_type.not_in(DECISION_PROVIDER_TYPES),
         )
-    ) or db.scalar(select(ModelProvider).where(ModelProvider.enabled.is_(True)).limit(1))
+    ) or db.scalar(select(ModelProvider).where(ModelProvider.enabled.is_(True), ModelProvider.provider_type.not_in(DECISION_PROVIDER_TYPES)).limit(1))
 
 
 def default_embedding_provider(db: Session) -> ModelProvider | None:

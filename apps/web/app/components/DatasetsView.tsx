@@ -7,8 +7,9 @@ import {
   MessageSquare,
   Search,
 } from "lucide-react";
-import { ChangeEvent, useCallback, useEffect, useRef, useState } from "react";
+import { ChangeEvent, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
+import { scopes, useDatasets, useInvalidate, useQueryErrorToast } from "../lib/queries";
 import type {
   Dataset,
 } from "../types";
@@ -18,12 +19,18 @@ import {
 import { LoadingBlock, Modal } from "./shared";
 
 
+const NO_DATASETS: Dataset[] = [];
+
 export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL: (dataset: Dataset) => void; onStartAnalysis?: (dataset: Dataset) => void; notify?: (message: string, tone?: "ok" | "error") => void }) {
-  const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const datasetsQuery = useDatasets();
+  const datasets = datasetsQuery.data ?? NO_DATASETS;
+  useQueryErrorToast(datasetsQuery.error, notify, "Datasets could not be loaded");
+  const invalidate = useInvalidate();
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
-  const [selected, setSelected] = useState<Dataset | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = datasets.find((item) => item.id === selectedId) || datasets[0] || null;
   const [editing, setEditing] = useState(false);
   const [editDescription, setEditDescription] = useState("");
   const [editTags, setEditTags] = useState("");
@@ -33,15 +40,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
   const [editMetadataStatus, setEditMetadataStatus] = useState("scanned");
   const [editColumnNotes, setEditColumnNotes] = useState<Record<string, { business_name: string; description: string }>>({});
   const [saving, setSaving] = useState(false);
-  const load = useCallback(() => {
-    api<Dataset[]>("/datasets").then((data) => {
-      setDatasets(data);
-      setSelected((current) => data.find((item) => item.id === current?.id) || data[0] || null);
-    });
-  }, []);
-  useEffect(() => {
-    load();
-  }, [load]);
+  const load = () => { void invalidate(scopes.datasets); };
   const openEdit = () => {
     if (!selected) return;
     setEditDescription(selected.description || "");
@@ -138,7 +137,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
         <section className="surface dataset-list">
           <div className="table-header dataset-grid"><span>Dataset</span><span>Rows</span><span>Category</span><span /></div>
           {filtered.map((dataset) => (
-            <button className={`data-row dataset-grid ${selected?.id === dataset.id ? "selected" : ""}`} key={dataset.id} onClick={() => setSelected(dataset)}>
+            <button className={`data-row dataset-grid ${selected?.id === dataset.id ? "selected" : ""}`} key={dataset.id} onClick={() => setSelectedId(dataset.id)}>
               <span className="dataset-name"><Database size={17} /><span><strong>{dataset.schema_name}.{dataset.table_name}</strong><small>{dataset.source?.name || dataset.source_name} / {connectorLabels[dataset.source?.connector_type || ""] || dataset.source?.connector_type || "registered source"}</small></span></span>
               <span className="mono">{dataset.row_count?.toLocaleString() || "-"}</span>
               <span className="tag-list"><span className="tag">{dataset.category}</span>{dataset.tags.slice(0, 2).map((tag) => <span className="tag" key={tag}>{tag}</span>)}</span>
@@ -163,7 +162,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
               <button className="secondary-button wide" onClick={() => onStartAnalysis?.(selected)}><MessageSquare size={17} />Start analysis</button>
               <button className="secondary-button wide" onClick={() => onOpenSQL(selected)}><Code2 size={17} />Open in SQL workspace</button>
             </>
-          ) : <LoadingBlock label="Loading catalog" />}
+          ) : datasetsQuery.isPending ? <LoadingBlock label="Loading catalog" /> : <div className="inline-empty">No datasets are catalogued in this project yet.</div>}
         </aside>
       </div>
       {editing && selected && (

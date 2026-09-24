@@ -118,6 +118,7 @@ from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
 
 from ..models import RouteDecision
+from ..learning import learn_from_feedback
 
 from .. import core as main
 from ..core import (
@@ -235,6 +236,8 @@ def create_feedback(
     item = UserFeedback(project_id=project.id, created_by=user.id, **payload.model_dump())
     db.add(item)
     db.flush()
+    if payload.context_id and payload.context_type == "sql":
+        learn_from_feedback(db, project.id, payload.context_id, payload.rating, user.id)
     if payload.context_id:
         decision = db.scalar(select(RouteDecision).where(RouteDecision.project_id == project.id, RouteDecision.message_id == payload.context_id))
         if decision is not None:

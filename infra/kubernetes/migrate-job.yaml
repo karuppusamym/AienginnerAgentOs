@@ -1,7 +1,9 @@
 # Run once per release before rolling out api/worker (e.g. a Helm/Argo pre-sync hook):
 #   kubectl -n datapilot delete job datapilot-migrate --ignore-not-found && kubectl apply -k infra/kubernetes
-# Migrations are versioned and recorded in the schema_versions table; on PostgreSQL the
-# run holds an advisory lock, so an accidental concurrent run waits instead of racing.
+# `python -m app.migrate` runs `alembic upgrade head` (apps/api/alembic/, recorded in the
+# alembic_version table; databases from the old schema_versions runner are stamped, not
+# re-migrated). On PostgreSQL the run holds an advisory lock, so an accidental concurrent
+# run waits instead of racing.
 apiVersion: batch/v1
 kind: Job
 metadata:

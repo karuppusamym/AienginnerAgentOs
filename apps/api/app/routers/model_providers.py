@@ -116,9 +116,10 @@ from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_meta
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, reindex_all, search_documents
 from fastapi import APIRouter
+from sqlalchemy import case
 
 from ..models import ModelRoute
-from ..provider_selection import MODEL_PURPOSES
+from ..provider_selection import MODEL_PURPOSES, PURPOSE_KIND, provider_capability, purpose_accepts
 
 from .. import core as main
 from ..core import (
@@ -359,7 +360,17 @@ def model_usage(user: User = Depends(get_current_user), db: Session = Depends(ge
     for provider_id, model, calls, input_tokens, output_tokens, cost, latency in rows:
         provider = db.get(ModelProvider, provider_id)
         items.append({"provider_id": provider_id, "provider_name": provider.name if provider else "Deleted provider", "model": model, "calls": calls, "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0, "estimated_cost_usd": round(float(cost or 0), 8), "average_latency_ms": round(float(latency or 0), 1)})
-    return {"project_id": project.id, "currency": "USD", "pricing_configured": bool(float(os.getenv("MODEL_INPUT_COST_PER_MILLION", "0")) or float(os.getenv("MODEL_OUTPUT_COST_PER_MILLION", "0"))), "items": items, "totals": {"calls": sum(item["calls"] for item in items), "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items), "estimated_cost_usd": round(sum(item["estimated_cost_usd"] for item in items), 8)}}
+    # Per purpose (which decision or generation step made the call), e.g. Jev's routing / risk / tool choice.
+    purpose_rows = db.execute(
+        select(ModelCallLog.purpose, ModelCallLog.model, func.count(ModelCallLog.id), func.sum(ModelCallLog.estimated_cost_usd), func.avg(ModelCallLog.latency_ms), func.sum(case((ModelCallLog.status == "failed", 1), else_=0)))
+        .where(ModelCallLog.project_id == project.id)
+        .group_by(ModelCallLog.purpose, ModelCallLog.model)
+    ).all()
+    by_purpose = sorted(
+        ({"purpose": purpose, "model": model, "calls": calls, "failed": int(failed or 0), "estimated_cost_usd": round(float(cost or 0), 8), "average_latency_ms": round(float(latency or 0), 1)} for purpose, model, calls, cost, latency, failed in purpose_rows),
+        key=lambda item: (-item["calls"], item["purpose"]),
+    )
+    return {"project_id": project.id, "currency": "USD", "by_purpose": by_purpose, "pricing_configured": bool(float(os.getenv("MODEL_INPUT_COST_PER_MILLION", "0")) or float(os.getenv("MODEL_OUTPUT_COST_PER_MILLION", "0"))), "items": items, "totals": {"calls": sum(item["calls"] for item in items), "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items), "estimated_cost_usd": round(sum(item["estimated_cost_usd"] for item in items), 8)}}
 
 
 class ModelRoutingUpdate(BaseModel):
@@ -381,10 +392,11 @@ def _model_routing_output(db: Session, project_id: str) -> dict[str, Any]:
             "provider_id": project_route.provider_id if project_route else (global_route.provider_id if global_route else None),
             "scope": "project" if project_route else ("platform" if global_route else "default"),
             "effective_provider": {"id": effective.id, "name": effective.name, "model": effective.default_model} if effective else None,
+            "kind": PURPOSE_KIND.get(purpose, "generation"),
         })
     return {
         "purposes": purposes,
-        "providers": [as_dict(provider, ["id", "name", "provider_type", "default_model", "status", "enabled"]) for provider in providers],
+        "providers": [{**as_dict(provider, ["id", "name", "provider_type", "default_model", "status", "enabled"]), "capability": provider_capability(provider)} for provider in providers],
     }
 
 
@@ -410,6 +422,8 @@ def update_model_routing(payload: ModelRoutingUpdate, admin: User = Depends(requ
         provider = db.get(ModelProvider, provider_id)
         if provider is None or not provider.enabled:
             raise HTTPException(status_code=400, detail=f"Provider for {purpose} must exist and be enabled")
+        if not purpose_accepts(purpose, provider):
+            raise HTTPException(status_code=400, detail=f"{provider.name} is a {provider_capability(provider)} model and cannot serve {purpose} ({PURPOSE_KIND.get(purpose)})")
         if existing is None:
             db.add(ModelRoute(project_id=project.id, purpose=purpose, provider_id=provider_id, updated_by=admin.id))
         else:

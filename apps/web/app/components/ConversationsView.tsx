@@ -32,10 +32,14 @@ import {
   XCircle,
 } from "lucide-react";
 import { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, apiStream, apiWithHeaders, SessionUser } from "../lib/api";
-import type { AnswerStage, Connector, Conversation, ConversationMessage, RouteCandidate, RouteDecision, SQLExecutionResult } from "../types";
+import { useQueryClient } from "@tanstack/react-query";
+import { api, ApiError, apiStream, SessionUser } from "../lib/api";
+import type { AnswerEnsemble, AnswerLearning, AnswerStage, ChartType, Connector, Conversation, ConversationMessage, JevDecision, RouteCandidate, RouteDecision, SQLExecutionResult } from "../types";
+import { projectKey, scopes, useConnectors, useConversationMessages, useConversations, useInvalidate, useQueryErrorToast, type MessagePages } from "../lib/queries";
+import { useWorkspace } from "../lib/workspace";
 import { connectorLabels, connectorDialectForType } from "../lib/constants";
-import { StatusPill, EmptyState, Modal, AnalysisChart } from "./shared";
+import { StatusPill, EmptyState, Modal, formatProbability, formatUsd } from "./shared";
+import { AnalysisChart, ChartTypeSwitcher, chartAlternatives } from "./charts";
 
 type Notify = (message: string, tone?: "ok" | "error") => void;
 type InspectorTab = "result" | "sql" | "context" | "decision";
@@ -48,7 +52,9 @@ type Dialog =
   | { kind: "feedback"; messageId: string; comment: string };
 
 const PANEL_STORAGE_KEY = "datapilot.analysis.panels";
-const PAGE_SIZE = 100;
+const NO_CONVERSATIONS: Conversation[] = [];
+const NO_CONNECTORS: Connector[] = [];
+const NO_MESSAGES: ConversationMessage[] = [];
 // Server-sent stages of one answer, in pipeline order (see POST /conversations/{id}/messages/stream).
 const ANSWER_STAGES: { key: string; label: string }[] = [
   { key: "grounding", label: "Ground" },
@@ -113,9 +119,9 @@ function toCsv(result: SQLExecutionResult) {
   return [result.columns.map(escape).join(","), ...result.rows.map((row) => result.columns.map((column) => escape(row[column])).join(","))].join("\n");
 }
 
-function ScoreBar({ value, tone = "brand" }: { value: number; tone?: "brand" | "blue" | "muted" }) {
+function ScoreBar({ value, tone = "brand", label }: { value: number; tone?: "brand" | "blue" | "muted"; label?: string }) {
   const width = Math.max(2, Math.min(100, Math.round(value * 100)));
-  return <span className={`score-bar score-bar--${tone}`} role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={width}><i style={{ width: `${width}%` }} /></span>;
+  return <span className={`score-bar score-bar--${tone}`} role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={width}><i style={{ width: `${width}%` }} /></span>;
 }
 
 function ResultTable({ result }: { result: SQLExecutionResult }) {
@@ -157,11 +163,20 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   /** Reports thread / inspected answer so the shell can sync the URL (push = new history entry). */
   onRouteChange?: (conversationId: string, messageId: string, push: boolean) => void;
 }) {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [connectors, setConnectors] = useState<Connector[]>([]);
+  const { projectId } = useWorkspace();
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidate();
+  const conversationsQuery = useConversations();
+  const connectorsQuery = useConnectors();
+  const conversations = conversationsQuery.data ?? NO_CONVERSATIONS;
+  const connectors = connectorsQuery.data ?? NO_CONNECTORS;
+  useQueryErrorToast(conversationsQuery.error || connectorsQuery.error, notify, "Conversations unavailable");
   const [selectedId, setSelectedId] = useState(routeConversationId || "");
-  const [messages, setMessages] = useState<ConversationMessage[]>([]);
-  const [loadingMessages, setLoadingMessages] = useState(false);
+  const messagesQuery = useConversationMessages(selectedId);
+  useQueryErrorToast(messagesQuery.error, notify, "Conversation unavailable");
+  // Client-only turns not (yet) confirmed by the server: the optimistic question
+  // while it is answered, and failed / stopped questions offering Retry.
+  const [localMessages, setLocalMessages] = useState<ConversationMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [connectorId, setConnectorId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -172,11 +187,11 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [feedback, setFeedback] = useState<Record<string, "positive" | "negative">>({});
   const [toolResults, setToolResults] = useState<Record<string, { tool: string; result: SQLExecutionResult }>>({});
+  // Chart type the user picked per answer (inspector Result tab); unset = the API's choice.
+  const [chartTypes, setChartTypes] = useState<Record<string, ChartType>>({});
   const [showJump, setShowJump] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [stage, setStage] = useState<AnswerStage | null>(null);
-  const [hasMore, setHasMore] = useState(false);
-  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const activeIdRef = useRef("");
   const abortRef = useRef<AbortController | null>(null);
   const streamSupportRef = useRef<boolean | null>(null);
@@ -187,11 +202,19 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   const unmountedRef = useRef(false);
   const prevRouteRef = useRef(routeConversationId || "");
   const prevRouteMessageRef = useRef(routeMessageId || "");
-  const skipLoadRef = useRef("");
   const seededRef = useRef(false);
   const listRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const canEdit = ["admin", "engineer", "analyst"].includes(currentUser.role);
+  const serverMessages = useMemo(() => (messagesQuery.data ? [...messagesQuery.data.pages].reverse().flatMap((page) => page.items) : NO_MESSAGES), [messagesQuery.data]);
+  const messages = useMemo(() => {
+    const local = localMessages.filter((item) => item.conversation_id === selectedId);
+    return local.length ? [...serverMessages, ...local] : serverMessages;
+  }, [serverMessages, localMessages, selectedId]);
+  const loadingMessages = !!selectedId && messagesQuery.isPending;
+  const hasMore = !!messagesQuery.hasNextPage;
+  const loadingEarlier = messagesQuery.isFetchingNextPage;
+  const messagesKey = useCallback((conversationId: string) => projectKey(projectId, ...scopes.messages(conversationId)), [projectId]);
 
   const localConnector = connectors.find((connector) => connector.connector_type === "local_files");
   const externalConnectors = connectors.filter((connector) => connector.connector_type !== "local_files");
@@ -213,40 +236,34 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
     });
   }
 
-  const loadConversations = useCallback(async () => {
-    const data = await api<Conversation[]>("/conversations");
-    setConversations(data);
-    // A seeded question must start a fresh analysis, not land in the newest thread.
-    // A deep-linked id that is not in this project's list falls back to the newest thread.
-    if (!seededRef.current) setSelectedId((current) => (current && data.some((item) => item.id === current) ? current : data[0]?.id || ""));
-  }, []);
+  const refreshConversations = useCallback(() => invalidate(scopes.conversations), [invalidate]);
 
+  // A seeded question must start a fresh analysis, not land in the newest thread.
+  // A deep-linked id that is not in this project's list falls back to the newest thread.
+  const conversationList = conversationsQuery.data;
   useEffect(() => {
-    Promise.all([loadConversations(), api<Connector[]>("/connectors").then(setConnectors)])
-      .catch((reason) => notify(reason instanceof Error ? reason.message : "Conversations unavailable", "error"));
-  }, [loadConversations, notify]);
+    if (!conversationList || seededRef.current) return;
+    setSelectedId((current) => (current && conversationList.some((item) => item.id === current) ? current : conversationList[0]?.id || ""));
+  }, [conversationList]);
 
   useEffect(() => {
     activeIdRef.current = selectedId;
     setInspectId("");
-    if (!selectedId) { setMessages([]); return; }
-    if (skipLoadRef.current === selectedId) { skipLoadRef.current = ""; setHasMore(false); return; }
-    const controller = new AbortController();
-    setLoadingMessages(true);
-    setHasMore(false);
-    apiWithHeaders<ConversationMessage[]>(`/conversations/${selectedId}/messages?limit=${PAGE_SIZE}`, { signal: controller.signal })
-      .then(({ data, headers }) => {
-        if (activeIdRef.current !== selectedId) return;
-        setMessages(data);
-        setHasMore(headers.get("X-Has-More") === "true");
-        const pending = pendingInspectRef.current;
-        pendingInspectRef.current = "";
-        if (pending && data.some((item) => item.id === pending && item.role === "assistant")) setInspectId(pending);
-      })
-      .catch((reason) => { if (!controller.signal.aborted) notify(reason instanceof Error ? reason.message : "Conversation unavailable", "error"); })
-      .finally(() => { if (!controller.signal.aborted) setLoadingMessages(false); });
-    return () => controller.abort();
-  }, [selectedId, notify]);
+  }, [selectedId]);
+
+  // A deep-linked `?m=` is applied once the thread's messages are available.
+  const messagePages = messagesQuery.data;
+  const messagesFetching = messagesQuery.isFetching;
+  useEffect(() => {
+    const pending = pendingInspectRef.current;
+    if (!pending || !messagePages) return;
+    if (messagePages.pages.some((page) => page.items.some((item) => item.id === pending && item.role === "assistant"))) {
+      pendingInspectRef.current = "";
+      setInspectId(pending);
+    } else if (!messagesFetching) {
+      pendingInspectRef.current = "";
+    }
+  }, [messagePages, messagesFetching]);
 
   useEffect(() => {
     if (!seed) return;
@@ -277,14 +294,17 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   }, [routeMessageId, messages]);
 
   // State -> URL. Only explicit thread changes add a history entry; auto-selection replaces.
+  // Only an answer of the open thread belongs in `?m=`: right after a thread switch
+  // inspectId still holds the previous thread's answer until the reset effect runs.
+  const routeInspectId = inspectId && results.some((item) => item.id === inspectId) ? inspectId : "";
   useEffect(() => {
     if (!onRouteChange) return;
     const push = pushRouteRef.current;
     pushRouteRef.current = false;
     prevRouteRef.current = selectedId;
-    prevRouteMessageRef.current = inspectId;
-    onRouteChange(selectedId, inspectId, push);
-  }, [selectedId, inspectId, onRouteChange]);
+    prevRouteMessageRef.current = routeInspectId;
+    onRouteChange(selectedId, routeInspectId, push);
+  }, [selectedId, routeInspectId, onRouteChange]);
 
   // Abort an in-flight answer if the view unmounts (navigation, project switch).
   useEffect(() => { unmountedRef.current = false; return () => { unmountedRef.current = true; abortRef.current?.abort(); }; }, []);
@@ -315,31 +335,19 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
     seededRef.current = true;
     pushRouteRef.current = true;
     setSelectedId("");
-    setMessages([]);
-    setHasMore(false);
     setQuestion("");
     composerRef.current?.focus();
   }
 
   async function loadEarlier() {
-    const conversationId = selectedId;
-    const oldest = messages.find((item) => !item.id.startsWith("pending-"));
-    if (!conversationId || !oldest || loadingEarlier) return;
+    if (!selectedId || !hasMore || loadingEarlier) return;
     const node = listRef.current;
-    setLoadingEarlier(true);
-    try {
-      const { data, headers } = await apiWithHeaders<ConversationMessage[]>(`/conversations/${conversationId}/messages?limit=${PAGE_SIZE}&before=${encodeURIComponent(oldest.id)}`);
-      if (activeIdRef.current !== conversationId) return;
-      preserveScrollRef.current = { height: node?.scrollHeight ?? 0, top: node?.scrollTop ?? 0 };
-      setMessages((items) => {
-        const seen = new Set(items.map((item) => item.id));
-        return [...data.filter((item) => !seen.has(item.id)), ...items];
-      });
-      setHasMore(headers.get("X-Has-More") === "true" && data.length > 0);
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Earlier messages could not be loaded", "error");
-    } finally {
-      setLoadingEarlier(false);
+    // Keep the reader's position when older messages are prepended above.
+    preserveScrollRef.current = { height: node?.scrollHeight ?? 0, top: node?.scrollTop ?? 0 };
+    const result = await messagesQuery.fetchNextPage();
+    if (result.isError) {
+      preserveScrollRef.current = null;
+      notify(result.error instanceof Error ? result.error.message : "Earlier messages could not be loaded", "error");
     }
   }
 
@@ -382,7 +390,7 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
     if (!content || busy) return;
     setBusy(true);
     setStage(null);
-    setMessages((items) => items.filter((item) => !item.failed));
+    setLocalMessages((items) => items.filter((item) => !item.failed));
     const pendingId = `pending-${Date.now()}`;
     let conversationId = selectedId;
     const controller = new AbortController();
@@ -391,34 +399,43 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
       if (!conversationId) {
         const created = await api<Conversation>("/conversations", { method: "POST", body: JSON.stringify({ title: "New analysis" }) });
         conversationId = created.id;
-        skipLoadRef.current = created.id;
+        // A brand-new thread has no messages: seed the cache instead of fetching.
+        queryClient.setQueryData<MessagePages>(messagesKey(created.id), { pages: [{ items: [], hasMore: false }], pageParams: [""] });
+        queryClient.setQueryData<Conversation[]>(projectKey(projectId, ...scopes.conversations), (items) => [created, ...(items || [])]);
         pushRouteRef.current = true;
-        setConversations((items) => [created, ...items]);
         setSelectedId(created.id);
         activeIdRef.current = created.id;
       }
-      setMessages((items) => [...items, { id: pendingId, conversation_id: conversationId, role: "user", content, structured: {}, created_at: new Date().toISOString() }]);
+      const userTurn: ConversationMessage = { id: pendingId, conversation_id: conversationId, role: "user", content, structured: {}, created_at: new Date().toISOString() };
+      setLocalMessages((items) => [...items, userTurn]);
       setQuestion("");
       const dialect = resolvedConnector ? connectorDialectForType(resolvedConnector.connector_type) : "postgres";
       const response = await requestAnswer(conversationId, JSON.stringify({ content, dialect, connector_id: resolvedConnector?.id || null }), controller.signal);
+      // Move the confirmed turn and its answer into the thread's cached newest page;
+      // the thread is marked stale so the next visit refetches the server copy.
+      const key = messagesKey(conversationId);
+      queryClient.setQueryData<MessagePages>(key, (current) => {
+        if (!current?.pages.length) return { pages: [{ items: [userTurn, response], hasMore: false }], pageParams: [""] };
+        const [newest, ...older] = current.pages;
+        return { ...current, pages: [{ ...newest, items: [...newest.items, userTurn, response] }, ...older] };
+      });
+      void queryClient.invalidateQueries({ queryKey: key, refetchType: "none" });
+      setLocalMessages((items) => items.filter((item) => item.id !== pendingId));
       if (activeIdRef.current === conversationId) {
-        setMessages((items) => [...items, response]);
         setInspectId(response.id);
         setTab(response.structured.execution?.error ? "sql" : "result");
       }
       seededRef.current = false;
-      await loadConversations();
+      await refreshConversations();
     } catch (reason) {
       const stopped = controller.signal.aborted;
-      if (activeIdRef.current === conversationId) {
-        setMessages((items) => items.map((item) => item.id === pendingId ? { ...item, failed: true, stopped } : item));
-        setQuestion(content);
-      }
+      setLocalMessages((items) => items.map((item) => item.id === pendingId ? { ...item, failed: true, stopped } : item));
+      if (activeIdRef.current === conversationId) setQuestion(content);
       if (stopped && unmountedRef.current) {
         // Navigated away mid-answer: nothing to report.
       } else if (stopped) {
         notify("Stopped. The question was not answered; use Retry to ask it again.");
-        void loadConversations().catch(() => undefined);
+        void refreshConversations().catch(() => undefined);
       } else {
         notify(reason instanceof Error ? reason.message : "Analysis failed", "error");
       }
@@ -444,13 +461,16 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
     try {
       if (dialog.kind === "rename") {
         await api(`/conversations/${selectedId}`, { method: "PUT", body: JSON.stringify({ title: dialog.name.trim() }) });
-        await loadConversations();
+        await refreshConversations();
         notify("Analysis renamed");
       } else if (dialog.kind === "delete") {
-        await api(`/conversations/${selectedId}`, { method: "DELETE" });
-        setSelectedId(""); setMessages([]);
+        const deletedId = selectedId;
+        await api(`/conversations/${deletedId}`, { method: "DELETE" });
+        setSelectedId("");
+        setLocalMessages((items) => items.filter((item) => item.conversation_id !== deletedId));
+        queryClient.removeQueries({ queryKey: messagesKey(deletedId) });
         seededRef.current = false;
-        await loadConversations();
+        await refreshConversations();
         notify("Conversation deleted");
       } else if (dialog.kind === "report") {
         await api(`/conversations/${selectedId}/report`, { method: "POST", body: JSON.stringify({ name: dialog.name }) });
@@ -468,6 +488,7 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
           parameter_schema: { type: "object", properties: {}, additionalProperties: false },
           requires_approval: true,
         }) });
+        await invalidate(scopes.approvals);
         notify("Tool publication requested and sent to Approvals");
       } else if (dialog.kind === "notebook") {
         await api("/notebooks", { method: "POST", body: JSON.stringify({ name: dialog.name, cells: [{ id: `cell-${Date.now()}`, type: "sql", source: dialog.sql }] }) });
@@ -498,7 +519,8 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   async function runSuggestion(message: ConversationMessage, action: RouteCandidate) {
     try {
       if (action.route === "agent_run") {
-        const run = await api<{ job_id: string; status: string; approval_id?: string; plan_hash?: string; plan_bound?: boolean }>("/agents/runs", { method: "POST", body: JSON.stringify({ objective: message.structured.question || "", autonomy_level: 2 }) });
+        const run = await api<{ job_id: string; status: string; approval_id?: string; plan_hash?: string; plan_bound?: boolean }>("/agents/runs", { method: "POST", body: JSON.stringify({ objective: message.structured.question || "", autonomy_level: 2, ...(action.target?.id ? { agent_id: action.target.id } : {}) }) });
+        void invalidate(scopes.approvals, scopes.jobs);
         notify(run.approval_id ? (run.plan_bound && run.plan_hash ? `Plan ${run.plan_hash.slice(0, 12)} is waiting in Approvals` : "Agent run is waiting in Approvals") : `Agent run ${run.status.toLowerCase()}`);
       } else if (action.route === "query_tool" && action.target) {
         const result = await api<SQLExecutionResult>(`/query-tools/${action.target.id}/test`, { method: "POST", body: JSON.stringify({ parameters: {} }) });
@@ -627,7 +649,7 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
                         return (
                           <div className="suggested-action" key={`${action.route}-${index}`}>
                             <span>{ROUTE_ICONS[action.route]}<strong>{action.target?.name || action.label}</strong><small>{action.reasons[0]}</small></span>
-                            {runnable && canEdit && <button className="secondary-button compact" onClick={() => void runSuggestion(message, action)}><Play size={12} />{action.route === "agent_run" ? "Start agent run" : "Run tool"}</button>}
+                            {runnable && canEdit && <button className="secondary-button compact" onClick={() => void runSuggestion(message, action)}><Play size={12} />{action.route === "agent_run" ? (action.target?.name ? `Start ${action.target.name} agent` : "Start agent run") : "Run tool"}</button>}
                           </div>
                         );
                       })}
@@ -679,6 +701,8 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
               tab={tab}
               onTab={setTab}
               toolResult={toolResults[inspected.id]}
+              chartType={chartTypes[inspected.id]}
+              onChartType={(type) => setChartTypes((current) => ({ ...current, [inspected.id]: type }))}
               canEdit={canEdit}
               onCopy={copySql}
               onCsv={downloadCsv}
@@ -738,11 +762,13 @@ function ThinkingBubble({ stage, onStop }: { stage: AnswerStage | null; onStop: 
   );
 }
 
-function Inspector({ message, tab, onTab, toolResult, canEdit, onCopy, onCsv, onPublish, onNotebook }: {
+function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, canEdit, onCopy, onCsv, onPublish, onNotebook }: {
   message: ConversationMessage;
   tab: InspectorTab;
   onTab: (tab: InspectorTab) => void;
   toolResult?: { tool: string; result: SQLExecutionResult };
+  chartType?: ChartType;
+  onChartType: (type: ChartType) => void;
   canEdit: boolean;
   onCopy: (sql: string) => void;
   onCsv: (result: SQLExecutionResult, name: string) => void;
@@ -751,6 +777,8 @@ function Inspector({ message, tab, onTab, toolResult, canEdit, onCopy, onCsv, on
 }) {
   const s = message.structured;
   const execution = toolResult?.result || s.execution;
+  const chartOptions = useMemo(() => chartAlternatives(s.chart), [s.chart]);
+  const shownChart: ChartType | undefined = chartType && chartOptions.includes(chartType) ? chartType : chartOptions[0];
   const tabs: { key: InspectorTab; label: string }[] = [
     { key: "result", label: "Result" },
     { key: "sql", label: "SQL" },
@@ -770,7 +798,12 @@ function Inspector({ message, tab, onTab, toolResult, canEdit, onCopy, onCsv, on
               <div className="conversation-memory execution-error"><span>Query error</span><p>{execution.error}</p></div>
             ) : execution ? (
               <>
-                {!toolResult && <AnalysisChart chart={s.chart} />}
+                {!toolResult && (s.chart?.data?.length && shownChart ? (
+                  <>
+                    <ChartTypeSwitcher options={chartOptions} value={shownChart} onChange={onChartType} reason={s.chart.reason} />
+                    {shownChart !== "table" && <AnalysisChart chart={s.chart} type={shownChart} />}
+                  </>
+                ) : <AnalysisChart chart={s.chart} />)}
                 <ResultTable result={execution} />
                 <div className="inspector-actions"><button className="secondary-button compact" onClick={() => onCsv(execution, s.question || "result")}><Download size={13} />CSV</button></div>
               </>
@@ -826,6 +859,7 @@ function Inspector({ message, tab, onTab, toolResult, canEdit, onCopy, onCsv, on
               <h4>Validation</h4>
               <ul className="inspector-checks">{(s.validation?.checks || []).map((check) => <li key={check}><ShieldCheck size={12} />{check}</li>)}</ul>
             </section>
+            <LearningSection learning={s.learning} />
             <section className="inspector-section">
               <h4>CONVERSATION CONTEXT</h4>
               <p className="inspector-muted">{s.memory?.prior_messages_used ? `${s.memory.prior_messages_used} earlier message(s) used as context.` : "First question in this thread."}</p>
@@ -833,7 +867,13 @@ function Inspector({ message, tab, onTab, toolResult, canEdit, onCopy, onCsv, on
             </section>
           </>
         )}
-        {tab === "decision" && (s.route ? <DecisionPanel route={s.route} /> : <p className="inspector-muted">This answer predates the decision router.</p>)}
+        {tab === "decision" && (
+          <>
+            {s.route ? <DecisionPanel route={s.route} /> : <p className="inspector-muted inspector-pad">This answer predates the decision router.</p>}
+            {s.route?.jev && <JevSection jev={s.route.jev} />}
+            <EnsembleSection ensemble={s.ensemble} />
+          </>
+        )}
       </div>
     </>
   );
@@ -848,11 +888,13 @@ function DecisionPanel({ route }: { route: RouteDecision }) {
         <p className="inspector-strong">{ROUTE_ICONS[route.route]} {route.label}{route.target?.name ? `: ${route.target.name}` : ""}</p>
         <div className="score-row"><span className="score-label">Confidence</span><small>{Math.round(route.confidence * 100)}%</small><ScoreBar value={route.confidence} /></div>
         <dl className="fact-grid">
-          <div><dt>Backend</dt><dd>{route.backend}</dd></div>
+          <div><dt>Backend</dt><dd title={route.backend}>{backendLabel(route.backend)}</dd></div>
           <div><dt>Policy</dt><dd>{route.policy_version}</dd></div>
           <div><dt>Latency</dt><dd>{route.latency_ms} ms</dd></div>
           <div><dt>Risk</dt><dd className={`risk-${route.risk.level}`}>{route.risk.level}</dd></div>
         </dl>
+        {route.backend.startsWith("jev:") && <p className="inspector-muted">Routed by Jev model <code>{route.backend.slice(4)}</code>.</p>}
+        {route.risk.escalated_by && <p className="inspector-muted escalated-note"><ShieldCheck size={12} /> Risk escalated by {route.risk.escalated_by === "jev" ? "Jev" : route.risk.escalated_by}.</p>}
         {!!route.risk.triggers.length && <p className="inspector-muted">Approval triggers: {route.risk.triggers.join(", ")}</p>}
       </section>
       <section className="inspector-section">
@@ -865,5 +907,116 @@ function DecisionPanel({ route }: { route: RouteDecision }) {
         ))}
       </section>
     </>
+  );
+}
+
+const ROUTE_OPTION_LABELS: Record<string, string> = { sql_analysis: "SQL analysis", query_tool: "Query tool", agent_run: "Agent run", clarify: "Clarify" };
+
+/** What the Jev decision model (typed choices with probabilities, not text) said about this question. */
+function JevSection({ jev }: { jev: JevDecision }) {
+  const options = Object.entries(jev.probabilities || {}).filter(([, value]) => Number.isFinite(value)).sort((a, b) => b[1] - a[1]);
+  return (
+    <section className="inspector-section jev-section">
+      <h4>Jev decision</h4>
+      <p className="inspector-line">Decision model <code>{jev.model || "typesafe/jev"}</code></p>
+      {options.length ? options.map(([option, probability], index) => (
+        <div className="score-row" key={option}>
+          <span className="score-label" title={option}>{ROUTE_ICONS[option]} {ROUTE_OPTION_LABELS[option] || option.replaceAll("_", " ")}</span>
+          <small>{formatProbability(probability)}</small>
+          <ScoreBar value={probability} tone={index === 0 ? "brand" : "muted"} label={`${option} probability`} />
+        </div>
+      )) : <p className="inspector-muted">No option probabilities were returned.</p>}
+      {jev.consequential != null && (
+        <>
+          <div className="score-row jev-consequential">
+            <span className="score-label"><ShieldCheck size={13} /> Consequential action</span>
+            <small>{formatProbability(jev.consequential)}</small>
+            <ScoreBar value={jev.consequential} tone="blue" label="Consequential action probability" />
+          </div>
+          <p className="inspector-muted">Jev can only escalate risk: a high probability sends the action to approval; a low one never removes an approval the rules require.</p>
+        </>
+      )}
+      <dl className="fact-grid">
+        <div><dt>Latency</dt><dd>{jev.latency_ms != null ? `${Math.round(jev.latency_ms)} ms` : "-"}</dd></div>
+        <div><dt>Cost</dt><dd title={jev.cost_usd != null ? `${jev.cost_usd} USD` : undefined}>{formatUsd(jev.cost_usd)}</dd></div>
+      </dl>
+    </section>
+  );
+}
+
+/** "jev:typesafe/jev-1.13-…" → "Jev (typesafe/jev-1.13-…)"; other backends unchanged. */
+function backendLabel(backend: string) {
+  return backend.startsWith("jev:") ? `Jev (${backend.slice(4)})` : backend;
+}
+
+const ENSEMBLE_STRATEGY_LABELS: Record<string, string> = {
+  result_majority: "Majority of identical results",
+  sql_majority: "Majority of equivalent SQL",
+  single: "Single model (no vote)",
+};
+
+/** Examples, reused verified query and prompt version the learning loop contributed to this answer. */
+function LearningSection({ learning }: { learning?: AnswerLearning }) {
+  if (!learning) return null;
+  const examples = learning.verified_examples || [];
+  const reused = learning.reused_verified_query;
+  return (
+    <section className="inspector-section">
+      <h4>Learning</h4>
+      {reused ? (
+        <p className="inspector-line"><ShieldCheck size={12} /> Reused verified query <strong>{reused.question}</strong> <small>#{reused.id.slice(0, 8)}</small></p>
+      ) : <p className="inspector-muted">No verified query was reused verbatim.</p>}
+      {examples.length ? (
+        <>
+          <small>{examples.length} verified example{examples.length === 1 ? "" : "s"} used as few-shot context</small>
+          <ul className="inspector-examples">{examples.map((item) => <li key={item.id} title={item.id}>{item.question}</li>)}</ul>
+        </>
+      ) : <p className="inspector-muted">No verified examples were used.</p>}
+      <dl className="fact-grid">
+        <div><dt>Prompt version</dt><dd>{learning.prompt_version != null ? `v${learning.prompt_version}` : "Default"}</dd></div>
+      </dl>
+    </section>
+  );
+}
+
+/** Multi-model SQL candidates and how the answer was chosen. */
+function EnsembleSection({ ensemble }: { ensemble?: AnswerEnsemble }) {
+  if (!ensemble) return null;
+  const candidates = ensemble.candidates || [];
+  const tieBreak = ensemble.tie_break;
+  const tieOptions = Object.entries(tieBreak?.probabilities || {}).filter(([, value]) => Number.isFinite(value)).sort((a, b) => b[1] - a[1]);
+  const chosenProbability = tieBreak?.chosen != null ? tieBreak.probabilities?.[tieBreak.chosen] : undefined;
+  return (
+    <section className="inspector-section">
+      <h4>Ensemble</h4>
+      <dl className="fact-grid">
+        <div><dt>Agreement</dt><dd>{ensemble.agreement || "-"}</dd></div>
+        <div><dt>Strategy</dt><dd title={ensemble.strategy}>{ensemble.strategy ? ENSEMBLE_STRATEGY_LABELS[ensemble.strategy] || ensemble.strategy : "-"}</dd></div>
+      </dl>
+      {tieBreak && (
+        <div className="tie-break">
+          <p className="inspector-line"><Sparkles size={12} /> No majority — {tieBreak.by === "jev" || !tieBreak.by ? "Jev" : tieBreak.by} picked <strong>{tieBreak.chosen || "-"}</strong>{chosenProbability != null ? ` (${formatProbability(chosenProbability)})` : ""}{tieBreak.model && <small> · <code>{tieBreak.model}</code></small>}</p>
+          {tieOptions.map(([model, probability]) => (
+            <div className="score-row" key={model}><span className="score-label" title={model}>{model}</span><small>{formatProbability(probability)}</small><ScoreBar value={probability} tone={model === tieBreak.chosen ? "brand" : "muted"} label={`${model} probability`} /></div>
+          ))}
+        </div>
+      )}
+      {candidates.length ? (
+        <table className="ensemble-table">
+          <thead><tr><th scope="col">Model</th><th scope="col">Result</th><th scope="col">Rows</th><th scope="col">Fingerprint</th></tr></thead>
+          <tbody>
+            {candidates.map((item, index) => (
+              <tr key={`${item.model}-${index}`} className={item.chosen ? "chosen" : undefined} aria-current={item.chosen ? "true" : undefined}>
+                <td title={item.model}>{item.chosen && <span className="chosen-mark" aria-label="chosen">✓</span>}{item.model}</td>
+                <td>{item.ok ? <span className="ensemble-ok">ok</span> : <span className="ensemble-error" title={item.error || undefined}>failed</span>}</td>
+                <td>{item.row_count ?? "-"}</td>
+                <td><code title={item.fingerprint || undefined}>{item.fingerprint ? item.fingerprint.slice(0, 10) : "-"}</code></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : <p className="inspector-muted">No candidates were recorded.</p>}
+      {candidates.filter((item) => !item.ok && item.error).map((item, index) => <p key={index} className="inspector-muted ensemble-error-line"><strong>{item.model}:</strong> {item.error}</p>)}
+    </section>
   );
 }

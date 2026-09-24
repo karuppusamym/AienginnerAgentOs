@@ -114,6 +114,31 @@ npm run dev
 The API uses SQLite when `DATABASE_URL` is not set, which keeps the direct local
 development path self-contained.
 
+### Database migrations (Alembic)
+
+Schema changes are Alembic revisions in `apps/api/alembic/versions/` (recorded in
+the `alembic_version` table). API startup runs `alembic upgrade head` unless
+`RUN_MIGRATIONS_ON_STARTUP=false`; Kubernetes runs it once per release through
+`python -m app.migrate` (`infra/kubernetes/migrate-job.yaml`). On PostgreSQL the
+upgrade holds an advisory lock, so replicas starting together wait instead of racing.
+Databases migrated by the earlier `schema_versions` runner are stamped at the
+matching revision automatically. From `apps/api` (uses `DATABASE_URL`):
+
+```powershell
+alembic upgrade head        # or: python -m app.migrate
+alembic current             # alembic history
+alembic revision --autogenerate -m "add widgets table"   # after editing app/models.py
+alembic check               # fails if models.py has changes no revision covers
+```
+
+When you change `app/models.py`, add a revision (autogenerate, then review it).
+The baseline builds new databases from the current models, so guard every step in
+a revision (`app.migrations.has_table` / `has_column` / `has_index`) to keep it a
+no-op where the object already exists. As a safety net, startup and `app.migrate`
+also run `Base.metadata.create_all` (checkfirst) after the upgrade. That way a
+brand-new table appears even before its revision exists. New columns, indexes and
+data changes on existing tables still need a revision.
+
 The web app calls its API through a same-origin `/api/*` path that Next.js rewrites
 to `INTERNAL_API_URL` (see `apps/web/next.config.ts`), defaulting to `http://api:8000`
 for the Docker Compose network. Running the web app directly (outside Compose) needs

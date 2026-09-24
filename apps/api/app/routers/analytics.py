@@ -118,6 +118,9 @@ from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
 
+from ..superset_client import superset_availability
+from ..charts import infer_column_types
+
 from .. import core as main
 from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
@@ -290,6 +293,10 @@ def request_sql_publication(
 
     if not _safe_read_only_sql(sql):
         raise HTTPException(status_code=400, detail="Only one read-only SELECT statement can be published")
+    availability = superset_availability()
+    if not availability["available"]:
+        # Fail before creating an approval that could never be fulfilled.
+        raise HTTPException(status_code=503, detail=f"Superset is unavailable: {availability['reason']}")
     try:
         preview = execute_read_only(engine, sql, 1)
     except Exception as exc:
@@ -405,6 +412,12 @@ def analytics_query_guest_token(
         "sql": state.sql,
     }
     dashboard_key = f"query-{artifact.id}"
+    if all(str(column.get("type", "text")) == "text" for column in dataset["columns"]):
+        # Published before types were inferred: re-sample so charts use measures and time axes.
+        try:
+            dataset["columns"] = infer_column_types(execute_read_only(engine, state.sql, 200)) or dataset["columns"]
+        except Exception:
+            pass
     try:
         config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
         token = create_guest_token(project.name, project.slug, dataset, user.id, user.email, user.name, dashboard_key)
@@ -419,4 +432,123 @@ def analytics_query_guest_token(
         "embedded_id": config["embedded_id"],
         "superset_domain": config["superset_domain"],
         "dashboard_title": config.get("dashboard_title", state.dashboard_title),
+        "dataset_relation": config.get("dataset_relation"),
+        "chart_count": config.get("chart_count"),
+        "access_mode": config.get("access_mode"),
+    }
+
+
+@router.get("/analytics/status")
+def analytics_status(_: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Whether embedded analytics (Superset) is reachable, with guidance when it is not."""
+    return superset_availability()
+
+
+@router.get("/analytics/dashboards")
+def analytics_dashboards(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Everything the current project can show in embedded analytics, in one list.
+
+    Scope is the project: every entry belongs to the current project and is
+    embedded with a guest token limited to that one dashboard. Entries are
+    grouped by where the data comes from: the project's primary dashboard,
+    approved published queries, and catalogued local datasets (by source).
+    """
+    from ..services.superset import local_analytics_datasets
+
+    project = require_current_project(db, user)
+    primary = db.scalar(select(SupersetProjectDashboard).where(SupersetProjectDashboard.project_id == project.id))
+    try:
+        default_dataset = resolve_superset_dataset(db, project)
+        default_relation = f"{default_dataset['schema_name']}.{default_dataset['table_name']}"
+    except ValueError:
+        default_relation = None
+    published = db.execute(
+        select(SupersetQueryDashboard, Artifact)
+        .join(Artifact, Artifact.id == SupersetQueryDashboard.artifact_id)
+        .where(SupersetQueryDashboard.project_id == project.id)
+        .order_by(SupersetQueryDashboard.updated_at.desc())
+    ).all()
+    datasets = local_analytics_datasets(db, project)
+    return {
+        "scope": "project",
+        "project": {"id": project.id, "name": project.name},
+        "superset": superset_availability(),
+        "primary": {
+            "key": "project",
+            "title": (primary.dashboard_title if primary and primary.dashboard_title else f"{project.name} analytics"),
+            "dataset_relation": default_relation,
+            "chart_count": len(primary.chart_ids or []) if primary else None,
+            "updated_at": primary.updated_at.isoformat() if primary and primary.updated_at else None,
+            "available": default_relation is not None,
+        },
+        "published": [
+            {
+                "key": f"query:{artifact.id}",
+                "artifact_id": artifact.id,
+                "title": artifact.name,
+                "artifact_type": artifact.artifact_type,
+                "artifact_version": state.artifact_version,
+                "columns": [str(column.get("name")) for column in state.columns or []],
+                "chart_count": len(state.chart_ids or []),
+                "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+            }
+            for state, artifact in published
+        ],
+        "datasets": [
+            {
+                "key": f"dataset:{asset.id}",
+                "asset_id": asset.id,
+                "relation": f"{asset.schema_name}.{asset.table_name}",
+                "source": asset.source_name,
+                "asset_type": asset.asset_type,
+                "row_count": asset.row_count,
+                "column_count": len(asset.columns or []),
+                "sensitivity": asset.sensitivity,
+                "is_default": f"{asset.schema_name}.{asset.table_name}" == default_relation,
+                "restricted": asset.sensitivity == "restricted" and user.role != "admin",
+            }
+            for asset in sorted(datasets, key=lambda item: (item.source_name, item.schema_name, item.table_name))
+        ],
+    }
+
+
+@router.post("/analytics/datasets/{asset_id}/guest-token")
+def analytics_dataset_guest_token(asset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Embed a dashboard built directly on one catalogued local dataset of the current project.
+
+    Same trust model as the project dashboard (which is also built from a
+    catalogued dataset without approval): project membership, local data only,
+    no DataPilot metadata tables, restricted datasets for admins only, and
+    PII-named columns left out of the charts.
+    """
+    from ..services.superset import dataset_dashboard_payload, local_analytics_datasets
+
+    project = require_current_project(db, user)
+    asset = next((item for item in local_analytics_datasets(db, project) if item.id == asset_id), None)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Dataset is not a local, queryable dataset of this project")
+    if asset.sensitivity == "restricted" and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Restricted datasets can only be charted by an admin")
+    availability = superset_availability()
+    if not availability["available"]:
+        raise HTTPException(status_code=503, detail=f"Superset is unavailable: {availability['reason']}")
+    dataset = dataset_dashboard_payload(asset, project)
+    if not dataset["columns"]:
+        raise HTTPException(status_code=422, detail="Dataset has no chartable columns")
+    dashboard_key = f"asset-{asset.id}"
+    try:
+        config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
+        token = create_guest_token(project.name, project.slug, dataset, user.id, user.email, user.name, dashboard_key)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=503, detail=f"Embedded analytics is unavailable: {exc}") from exc
+    audit(db, user, "analytics.dataset_dashboard_opened", "data_asset", asset.id, {"dashboard_id": config.get("dashboard_id")})
+    db.commit()
+    return {
+        "token": token["token"],
+        "embedded_id": config["embedded_id"],
+        "superset_domain": config["superset_domain"],
+        "dashboard_title": config.get("dashboard_title"),
+        "dataset_relation": config.get("dataset_relation"),
+        "chart_count": config.get("chart_count"),
+        "access_mode": config.get("access_mode"),
     }

@@ -28,7 +28,7 @@ _INTERVAL_FROM_NOW = re.compile(rf"{_NOW}\s*([-+])\s*INTERVAL\s*'\s*(\d+)\s*([a-
 _CAST = re.compile(r"((?:\"[^\"]+\"|\b[\w]+)(?:\.(?:\"[^\"]+\"|[\w]+))?|\))::\s*([a-z_]+(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)", re.IGNORECASE)
 _CAST_TYPES = {"date": "TEXT", "timestamp": "TEXT", "timestamptz": "TEXT", "text": "TEXT", "varchar": "TEXT",
                "int": "INTEGER", "integer": "INTEGER", "bigint": "INTEGER", "numeric": "REAL", "decimal": "REAL",
-               "float": "REAL", "double": "REAL", "real": "REAL", "boolean": "INTEGER"}
+               "float": "REAL", "float8": "REAL", "double": "REAL", "real": "REAL", "boolean": "INTEGER", "int4": "INTEGER", "int8": "INTEGER"}
 
 
 def _parse(value: Any) -> datetime | None:
@@ -82,10 +82,57 @@ def _interval(match: re.Match[str]) -> str:
     return f"datetime('now', '{'-' if sign == '-' else '+'}{amount} {modifier_unit}')"
 
 
+_CAST_SUFFIX = re.compile(r"::\s*([a-z_][a-z0-9_]*(?:\s+precision)?(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?)", re.IGNORECASE)
+
+
+def _operand_start(sql: str, end: int) -> int:
+    """Index where the operand ending at ``end`` (exclusive) begins: identifier chain, literal or call."""
+    index = end - 1
+    while index >= 0 and sql[index].isspace():
+        index -= 1
+    if index >= 0 and sql[index] == ")":
+        depth = 0
+        while index >= 0:
+            depth += {")": 1, "(": -1}.get(sql[index], 0)
+            if depth == 0:
+                break
+            index -= 1
+        index -= 1  # include a function name directly before "("
+        name_end = index + 1
+        while index >= 0 and (sql[index].isalnum() or sql[index] in "_."):
+            index -= 1
+        start = index + 1
+        if sql[start:name_end].strip().lower() in {"filter", "over"} or (start == name_end and sql[:start].rstrip().lower().endswith(("filter", "over"))):
+            # "COUNT(*) FILTER (WHERE ...)::numeric": the clause belongs to the aggregate before it.
+            keyword_start = start if start < name_end else len(sql[:start].rstrip()) - (6 if sql[:start].rstrip().lower().endswith("filter") else 4)
+            return _operand_start(sql, keyword_start)
+        return start
+    if index >= 0 and sql[index] == "'":
+        index -= 1
+        while index >= 0 and sql[index] != "'":
+            index -= 1
+        return max(index, 0)
+    while index >= 0 and (sql[index].isalnum() or sql[index] in '_."'):
+        index -= 1
+    return index + 1
+
+
+def _rewrite_casts(sql: str) -> str:
+    """``expr::type`` -> ``CAST(expr AS <sqlite affinity>)``, handling calls and nested parentheses."""
+    while True:
+        match = _CAST_SUFFIX.search(sql)
+        if match is None:
+            return sql
+        start = _operand_start(sql, match.start())
+        operand = sql[start:match.start()].strip()
+        affinity = _CAST_TYPES.get(match.group(1).split("(")[0].split()[0].strip().lower(), "TEXT")
+        sql = f"{sql[:start]}CAST({operand} AS {affinity}){sql[match.end():]}"
+
+
 def sqlite_compatible_sql(sql: str, main_tables: set[str]) -> str:
     """Rewrite common PostgreSQL syntax and drop schemas for tables stored in SQLite's main database."""
     rewritten = _INTERVAL_FROM_NOW.sub(_interval, sql)
-    rewritten = _CAST.sub(lambda m: f"CAST({m.group(1)} AS {_CAST_TYPES.get(m.group(2).split('(')[0].strip().lower(), 'TEXT')})", rewritten)
+    rewritten = _rewrite_casts(rewritten)
     rewritten = re.sub(r"\bILIKE\b", "LIKE", rewritten, flags=re.IGNORECASE)
     lowered = {table.lower() for table in main_tables}
 

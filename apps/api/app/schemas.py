@@ -40,7 +40,7 @@ class PasswordChange(BaseModel):
 class ProviderCreate(BaseModel):
     name: str
     provider_type: Literal[
-        "company_gateway", "gemini", "openai", "claude", "openai_compatible", "openrouter", "local_mock"
+        "company_gateway", "gemini", "openai", "claude", "openai_compatible", "openrouter", "jev", "local_mock"
     ]
     base_url: str | None = None
     default_model: str
@@ -303,6 +303,8 @@ class QualityRuleCreate(BaseModel):
 class AgentRunRequest(BaseModel):
     objective: str
     autonomy_level: int = Field(default=2, ge=0, le=3)
+    # Lead agent chosen by the decision router (or the user); the planner must include it.
+    agent_id: str | None = Field(default=None, max_length=36)
 
 
 class AgentDefinitionCreate(BaseModel):

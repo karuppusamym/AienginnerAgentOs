@@ -15,6 +15,7 @@ export type NavKey =
   | "agents"
   | "semantic"
   | "evaluations"
+  | "learning"
   | "admin";
 
 export type Overview = {
@@ -110,6 +111,7 @@ export type ModelProvider = {
   enabled: boolean;
   is_default: boolean;
   status: string;
+  capability?: ProviderCapability;
 };
 
 export type Project = {
@@ -170,6 +172,21 @@ export type Approval = {
     autonomy_level?: number;
     planner?: string;
     plan_binding_note?: string;
+    // action_type "prompt_activation": a GEPA-optimised prompt waiting to go live.
+    prompt_name?: string;
+    version?: number;
+    instructions?: string;
+    baseline_score?: number | null;
+    best_score?: number | null;
+    optimization_id?: string;
+    // action_type "create_index": DDL that runs only after approval.
+    relation?: string;
+    columns?: string[];
+    statement?: string;
+    occurrences?: number;
+    // Agent-run approvals: why the run was held ("jev:consequential" = escalated by the decision model).
+    risk_triggers?: string[];
+    jev?: { consequential?: number | null; model?: string } | null;
   };
   created_at: string;
 };
@@ -358,18 +375,40 @@ export type ConversationMessage = {
     validation?: { status: string; checks: string[] };
     sources?: { asset?: string; term?: string }[];
     execution?: SQLExecutionResult;
-    chart?: { type: "bar" | "line" | "table"; title: string; x?: string; y?: string; data: Record<string, string | number>[] };
+    chart?: ChartSpec;
     source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string };
     memory?: { prior_messages_used: number; persisted: boolean; summary?: string | null };
     question?: string;
     route?: RouteDecision;
     follow_ups?: string[];
+    learning?: AnswerLearning;
+    ensemble?: AnswerEnsemble;
   };
   // Client-only: an optimistic user turn whose request failed.
   failed?: boolean;
   // Client-only: the user pressed Stop before the answer arrived.
   stopped?: boolean;
 };
+export type ChartType = "kpi" | "line" | "bar" | "grouped_bar" | "stacked_bar" | "pie" | "scatter" | "table";
+export type ChartUnit = "percent" | "fraction" | "currency" | "count" | "number";
+/**
+ * Chart chosen by the API for a result set. Older answers only carry
+ * {type: "bar" | "line" | "table", title, x, y, data}; every other field is optional.
+ */
+export type ChartSpec = {
+  type: ChartType | string;
+  title: string;
+  x?: string | null;
+  y?: string | null;
+  measures?: string[];
+  series?: string | null;
+  data: Record<string, string | number | null>[];
+  alternatives?: (ChartType | string)[];
+  reason?: string;
+  units?: Record<string, ChartUnit | string>;
+};
+/** Jev decision-model output attached to a routing decision. */
+export type JevDecision = { model?: string; probabilities?: Record<string, number>; consequential?: number | null; latency_ms?: number | null; cost_usd?: number | null };
 export type RouteKind = "sql_analysis" | "query_tool" | "agent_run" | "clarify";
 export type RouteTarget = { id: string; name: string; description?: string; required_parameters?: string[]; requires_approval?: boolean } | null;
 export type RouteCandidate = { route: RouteKind; target?: RouteTarget; score: number; local_score?: number; reasons: string[] };
@@ -380,10 +419,11 @@ export type RouteDecision = {
   confidence: number;
   candidates: RouteCandidate[];
   suggested_actions: (RouteCandidate & { label: string })[];
-  risk: { level: "low" | "medium" | "high"; requires_approval: boolean; triggers: string[] };
+  risk: { level: "low" | "medium" | "high"; requires_approval: boolean; triggers: string[]; escalated_by?: string };
   backend: string;
   policy_version: string;
   latency_ms: number;
+  jev?: JevDecision | null;
 };
 export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; token?: string };
 export type QueryTool = { id: string; name: string; description: string; purpose: string; data_source: string; line_of_business: string; owner: string; tags: string[]; connector_id?: string; upstream_tool_name?: string | null; sql_template: string; parameter_schema: Record<string, unknown>; result_schema: Record<string, unknown>; allowed_relations: string[]; row_limit: number; timeout_seconds: number; requires_approval: boolean; status: string; version: number; updated_at: string };
@@ -394,14 +434,17 @@ export type QueryToolRegistrySummary = { total: number; published: number; draft
 export type PromptArtifact = { id: string; name: string; status: string; version: number; content: { system_prompt?: string; template?: string; variables?: string[] }; metadata: Record<string, unknown>; updated_at: string };
 export type RetentionPolicy = { id: string; resource_type: string; retention_days: number; enabled: boolean; updated_at: string };
 export type SchemaDrift = { id: string; connector_id: string; relation: string; changes: { kind: string; column: string; from?: string; to?: string; type?: string }[]; status: string; detected_at: string };
-export type ModelUsage = { pricing_configured: boolean; totals: { calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number }; items: { provider_id: string; provider_name: string; model: string; calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number; average_latency_ms: number }[] };
+export type ModelUsage = { pricing_configured: boolean; totals: { calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number }; items: { provider_id: string; provider_name: string; provider_type?: string; capability?: ProviderCapability; purpose?: string | null; model: string; calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number; average_latency_ms: number }[] };
 export type LearningSuggestion = { id: string; feedback_id: string; category: string; status: "open" | "accepted" | "dismissed"; title: string; rationale: string; proposed_change: { review_target?: string; context_id?: string; action?: string; recent_signals?: { feedback_id: string; context_id?: string; comment?: string }[]; occurrence_count?: number }; reviewed_by: string | null; review_note: string | null; occurrence_count: number; severity: "normal" | "elevated" | "high"; created_at: string; reviewed_at: string | null };
 
 export type AnswerStage = { stage: string; label: string };
 
+export type ProviderCapability = "generation" | "decision";
 export type ModelRoutingPurpose = {
   purpose: string;
   label: string;
+  /** Which provider capability can serve this purpose (older APIs omit it: treat as "generation"). */
+  kind?: "generation" | "decision" | "either";
   provider_id: string | null;
   effective_provider: { id: string; name: string; model: string } | null;
   // Where the effective provider comes from: a project assignment, the platform table, or the default chain.
@@ -409,5 +452,99 @@ export type ModelRoutingPurpose = {
 };
 export type ModelRouting = {
   purposes: ModelRoutingPurpose[];
-  providers: { id: string; name: string; provider_type: string; default_model: string; status: string; enabled: boolean }[];
+  providers: { id: string; name: string; provider_type: string; default_model: string; status: string; enabled: boolean; capability?: ProviderCapability }[];
+};
+
+/** What the learning loop contributed to one answer (all optional; older answers carry none). */
+export type AnswerLearning = {
+  verified_examples?: { id: string; question: string }[];
+  reused_verified_query?: { id: string; question: string } | null;
+  prompt_version?: number | null;
+};
+export type EnsembleCandidate = { model: string; ok: boolean; row_count?: number | null; fingerprint?: string | null; error?: string | null; chosen?: boolean };
+/** Multi-model SQL generation: every candidate and how the winner was picked. */
+export type AnswerEnsemble = {
+  candidates?: EnsembleCandidate[];
+  agreement?: string;
+  strategy?: "result_majority" | "sql_majority" | "single" | string;
+  /** No majority: a decision model picked among the candidates. */
+  tie_break?: { by?: "jev" | string; model?: string; probabilities?: Record<string, number>; chosen?: string } | null;
+};
+
+export type VerifiedQuerySource = "feedback" | "evaluation" | "manual" | "optimization";
+export type VerifiedQueryStatus = "active" | "needs_review" | "retired";
+export type VerifiedQuery = {
+  id: string;
+  question: string;
+  sql: string;
+  dialect: string;
+  connector_id?: string | null;
+  source: VerifiedQuerySource | string;
+  status: VerifiedQueryStatus | string;
+  uses: number;
+  last_used_at?: string | null;
+  created_at: string;
+};
+
+export type PromptOptimizationStatus = "queued" | "running" | "completed" | "failed";
+export type PromptOptimization = {
+  id: string;
+  purpose: string;
+  status: PromptOptimizationStatus | string;
+  baseline_score?: number | null;
+  best_score?: number | null;
+  iterations_done?: number | null;
+  iterations?: number | null;
+  created_at: string;
+  completed_at?: string | null;
+  error?: string | null;
+};
+export type PromptCandidate = {
+  id: string;
+  parent_id?: string | null;
+  instructions: string;
+  mean_score?: number | null;
+  scores?: Record<string, number>;
+  on_pareto_front?: boolean;
+  origin?: "baseline" | "reflection" | string;
+};
+export type PromptOptimizationDetail = PromptOptimization & {
+  candidates?: PromptCandidate[];
+  cases?: { id: string; question: string; source?: string }[];
+  best_candidate_id?: string | null;
+  log?: { at: string; message: string }[];
+};
+
+export type IndexRecommendation = {
+  relation: string;
+  columns: string[];
+  occurrences: number;
+  reason: string;
+  statement: string;
+  exists: boolean;
+  /** "local" or the connector name the queries ran against. */
+  source?: string;
+  dialect?: string;
+  slow_queries?: number;
+  avg_ms?: number | null;
+  max_ms?: number | null;
+  threshold_ms?: number | null;
+  verify_note?: string | null;
+};
+/** Index DDL saved for a DBA to review; DataPilot never runs it itself. */
+export type DdlSuggestion = { id: string; relation: string; columns: string[]; statement: string; rationale?: string | null; dialect?: string; created_at: string; created_by?: string | null };
+
+export type RouterDecisionRecord = {
+  id: string;
+  message_id?: string | null;
+  conversation_id?: string | null;
+  created_at: string;
+  question: string;
+  route: RouteKind | string;
+  confidence: number;
+  backend: string;
+  policy_version?: string;
+  candidates?: RouteCandidate[];
+  risk?: Partial<RouteDecision["risk"]>;
+  outcome?: { feedback?: string | null; [key: string]: unknown } | null;
 };

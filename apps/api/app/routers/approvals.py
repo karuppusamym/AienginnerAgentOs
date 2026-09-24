@@ -116,6 +116,12 @@ from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_meta
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
+
+from ..superset_client import describe_superset_error
+from ..charts import infer_column_types
+
+from .. import learning
+from ..index_advisor import create_index
 from starlette.concurrency import run_in_threadpool
 
 from .. import core as main
@@ -383,6 +389,31 @@ async def decide_approval(
             job.progress = 100
             job.evidence = [*job.evidence, {"type": "deleted_records", "label": str(deleted_count)}]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
+    if approval.action_type == "prompt_activation":
+        if payload.decision == "approved":
+            learning.activate_runtime_prompt(db, str(approval.evidence.get("artifact_id", "")), int(approval.evidence.get("version", 0)))
+            audit(db, user, "prompt.activated", "artifact", str(approval.evidence.get("artifact_id", "")), {"version": approval.evidence.get("version")})
+        if job:
+            job.status = "SUCCEEDED" if payload.decision == "approved" else "CANCELLED"
+            job.progress = 100
+    if approval.action_type == "create_index":
+        if job:
+            job.status, job.progress = ("CANCELLED", 100)
+        if payload.decision == "approved":
+            try:
+                statement = create_index(engine, db, project.id, str(approval.evidence.get("relation", "")), [str(column) for column in approval.evidence.get("columns", [])])
+                if job:
+                    job.status = "SUCCEEDED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Executed: {statement}"}]
+                audit(db, user, "index.created", "approval", approval.id, {"statement": statement})
+            except PermissionError as exc:
+                if job:
+                    job.status = "CANCELLED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": str(exc)}]
+            except Exception as exc:
+                if job:
+                    job.status = "FAILED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Index creation failed: {str(exc)[:400]}"}]
     if approval.action_type == "publish_superset_query" and payload.decision == "approved":
         artifact_id = str(approval.evidence.get("artifact_id", ""))
         artifact_version = int(approval.evidence.get("artifact_version", 0) or 0)
@@ -406,11 +437,12 @@ async def decide_approval(
         if not sql or not _safe_read_only_sql(sql):
             raise HTTPException(status_code=409, detail="The approved source is no longer a safe read-only query")
         try:
-            preview = execute_read_only(engine, sql, 1)
+            preview = execute_read_only(engine, sql, 200)
             query_name = safe_identifier(
                 f"dp_query_{artifact.id[:8]}_v{artifact_version}", "datapilot_query"
             )
-            columns = [{"name": column, "type": "text"} for column in preview["columns"]]
+            # Real types from sampled values so Superset gets measures, categories and time axes right.
+            columns = infer_column_types(preview)
             dataset = {
                 "project_id": project.id,
                 "project_slug": project.slug,
@@ -431,8 +463,9 @@ async def decide_approval(
             state = main.save_superset_query_dashboard_state(
                 db, project, artifact, artifact_version, sql.strip().rstrip(";"), columns, config, user.id
             )
-        except (RuntimeError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=503, detail=f"Superset publication failed: {exc}") from exc
+        except (RuntimeError, httpx.HTTPError, OSError) as exc:
+            # Raised before commit, so the approval stays pending and can be approved again once Superset is up.
+            raise HTTPException(status_code=503, detail=f"Superset publication failed: {describe_superset_error(exc)} The approval is still pending.") from exc
         if job:
             job.status = "SUCCEEDED"
             job.progress = 100
@@ -457,7 +490,7 @@ async def decide_approval(
     db.commit()
     workflow_id = None
     approval_evidence = approval.evidence or {}
-    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query"}:
+    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index"}:
         # Plan-bound approvals (review finding H5): the worker loads the plan
         # frozen in approval.evidence, re-verifies plan_hash and executes it
         # verbatim -- it never re-plans, and a hash mismatch fails the job

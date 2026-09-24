@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -914,3 +914,53 @@ class RouteDecision(Base):
     outcome: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VerifiedQuery(Base):
+    """Question→SQL pairs confirmed correct (helpful feedback, evaluations, manual review).
+
+    Used as retrieved few-shot examples and, on an exact normalized-question
+    match, reused directly. Only active rows influence generation.
+    """
+
+    __tablename__ = "verified_queries"
+    __table_args__ = (Index("ix_verified_queries_project_norm", "project_id", "normalized_question"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    connector_id: Mapped[str | None] = mapped_column(ForeignKey("connectors.id"), nullable=True)
+    question: Mapped[str] = mapped_column(Text)
+    normalized_question: Mapped[str] = mapped_column(String(500))
+    sql: Mapped[str] = mapped_column(Text)
+    dialect: Mapped[str] = mapped_column(String(32), default="postgres")
+    source: Mapped[str] = mapped_column(String(32), default="feedback")
+    source_ref: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active")
+    result_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    uses: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PromptOptimizationRun(Base):
+    """One GEPA-style optimisation of a runtime prompt (reflective mutation + Pareto selection)."""
+
+    __tablename__ = "prompt_optimization_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="sql_generation")
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cases: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    log: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    baseline_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    iterations_done: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

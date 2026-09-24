@@ -277,6 +277,7 @@ def execute_parameterized_read_only(
     from .database import engine as app_engine, grant_read_only_access, read_only_engine
 
     target = read_only_engine if engine is app_engine and read_only_engine is not None else engine
+    started = time.perf_counter()
     try:
         rows, columns = _run_read_only(target, normalized, parameters, limit, timeout_seconds)
     except Exception as exc:
@@ -298,6 +299,8 @@ def execute_parameterized_read_only(
         "truncated": truncated,
         "limit": limit,
         "protected_columns": pii_columns,
+        # Measured wall time; the index advisor only suggests DDL for queries slower than a threshold.
+        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
     }
 
 

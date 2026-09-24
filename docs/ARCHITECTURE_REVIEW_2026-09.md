@@ -76,13 +76,41 @@ Findings cite `file:line` as of this review. "Done" items shipped in the same ch
 - Claude Sonnet 5 produced agent plans; a risky objective was held with a hashed, frozen plan.
 - Router evaluation on 10 labelled questions: LLM backend (Gemini 3.6 Flash) 100% accuracy at about 1.4 s; local scorer 80% at under 1 ms.
 
-**Remaining limits, stated plainly:**
-- The Docker Compose path with the reader role was not run here (Docker was stopped). Unit tests and the SQLite path cover the logic; run `docker compose up --build` once to confirm the grants.
-- `core.py` is still a large module. The circular import is gone, but finer service modules are follow-up work.
-- Migrations use a small versioned runner, not Alembic.
-- The web app uses query-string routing rather than App Router segments, and there is no TanStack Query (no new dependencies were added).
-- The Jev adapter is untested against the real TypeSafe API (no key). GEPA/DSPy optimisation has its scoring harness but has not been run.
-- LLM answer narratives stay off unless `CONVERSATION_MODEL_SUMMARY_ENABLED=true`.
+**Second closure pass (2026-09-24): the previously remaining limits**
+
+| Limit | Status | Evidence |
+|---|---|---|
+| Docker Compose path untested | **Closed** | Stack run under Docker. `datapilot_reader` was created by the API, and Postgres itself denies it `users` (`permission denied for table users`). Session cookie and SSE streaming work through the containerised web proxy; the agent run completed on the Temporal worker through `AgentRunWorkflow`. The user's port 3001 conflict was a leftover local dev server, since stopped. |
+| `core.py` too large | **Closed** | `core.py` is 269 lines: a facade over 15 `app/services/` modules. Routers are unchanged; every router imports in isolation (test). |
+| Custom migration runner | **Closed** | Alembic (`apps/api/alembic/`, revisions 0001–0005) with the advisory lock and adoption of databases from the old runner. The Docker database was adopted from `schema_versions` and upgraded to `0005_learning_indexes`, with the pg_trgm index created. Concurrency tested on PostgreSQL 17. |
+| Query-string routing, no TanStack Query | See web status below | App Router segments and TanStack Query (web pass). |
+| Jev untested; GEPA not run | **Closed** | Jev runs through the OpenRouter Decisions API (`typesafe/jev-1.13`) and was tested live: correct routes and a risk escalation the rule list missed. A GEPA run with live models raised the score from 0.75 to 0.90 (docs/LEARNING_LOOP.md). |
+| Model narratives off | **Closed** | `CONVERSATION_MODEL_SUMMARY_ENABLED=true` in `.env`. Tested live in Docker: the DeepSeek answer was grounded in the returned rows and flagged the small sample. |
+
+**Also added in this pass:** verified-query memory (exact reuse measured at 0.72 s vs 8.2 s, plus few-shot retrieval), a multi-model SQL vote with semantic result agreement (2/3 and 3/3 on live PostgreSQL), and an approval-gated index advisor. Several bugs were found only in live runs and fixed with tests: the SQLite cast rewrite for `COUNT(*) FILTER (…)::numeric`, a blank `TYPESAFE_MODEL` overriding the pinned model, fingerprint-based voting that never agreed across models, and `Cache-Control: no-transform` for SSE.
+
+**Honest trade-offs that remain by design:**
+- With every feature on (three-model vote, LLM router, model narrative) a turn takes about 6–13 s. Streaming shows each stage. For speed, remove the `sql_candidate_*` routes, set `DECISION_ROUTER_BACKEND=local`, or turn narratives off.
+- The multi-model vote only runs where candidates can be executed safely (local sources).
+- GEPA needs a few dozen cases to generalise.
+
+### Third pass (2026-09-24): Jev in agents and tools, analytics picker, DDL suggestions
+
+| Item | Status | Where |
+|---|---|---|
+| Jev picks **which agent** (up to 3 agent options), not just "an agent" | Done | `decision_router.local_scores` |
+| Jev picks **which tool** for each agent step, instead of firing every bound tool | Done; the choice is stored as `tool_choice` evidence | `temporal_activities._select_step_tools`, `jev_client.choose_tools` |
+| Router's chosen agent carried into the run (`agent_id`, lead agent owns a step) | Done | `routers/agents.py`, `ConversationsView.tsx` |
+| Planner output cut off at 800 tokens (silent fallback plan) | Fixed | `_plan_for_job` |
+| Tools skipped silently when parameters couldn't be grounded | Fixed (logged; step text used; a unique bare table name is accepted) | `_parameters_for_tool` |
+| Jev calls from `/router/decide` and `/router/evaluate` missing from usage | Fixed; `GET /model-usage` → `by_purpose` | `routers/decisions.py`, `routers/model_providers.py` |
+| DDL executed by DataPilot | Changed: suggestion-only, driven by slow queries (`SLOW_QUERY_MS`); runs only with `ALLOW_DDL_EXECUTION=true` plus approval | `index_advisor.py`, `routers/learning.py` |
+| Superset: one hidden dashboard per query, reachable only by hotlink | Done: a picker of project dashboard, published queries and datasets by source (project-scoped, PII columns excluded, restricted datasets admin-only) | `routers/analytics.py`, `SupersetView.tsx`, [ANALYTICS_EMBEDDING.md](ANALYTICS_EMBEDDING.md) |
+| Live proof of Jev decisions | `scripts/demo_jev_agents.py` → `docs/demo/` | [AGENTS_TOOLS_AND_JEV.md](AGENTS_TOOLS_AND_JEV.md) |
+
+Remaining agent and tool gaps (budget enforcement, built-in tool timeouts, self-approval, MCP
+token lifecycle, …) are listed with evidence in
+[AGENTS_TOOLS_AND_JEV.md §5](AGENTS_TOOLS_AND_JEV.md#5-recommended-improvements-not-yet-done).
 
 ### Original findings (for reference; see closure table above)
 
@@ -160,7 +188,8 @@ Findings cite `file:line` as of this review. "Done" items shipped in the same ch
   - Option ordering matters.
   - It is weak on numbers and dates.
   - Sending question text to a third party is a data-residency decision for a banking workspace.
-- **How it is wired here:**
+- **How it is wired here** (original design, superseded: Jev is now a declared provider
+  routed to four decision purposes; see [AGENTS_TOOLS_AND_JEV.md](AGENTS_TOOLS_AND_JEV.md)):
   - Behind `DECISION_ROUTER_BACKEND=jev`, and used only for the *route choice*.
   - **Risk and approval stay deterministic, and Jev can never lower them.**
   - State contains only the user's question and registry descriptions; never tool output, rows or
