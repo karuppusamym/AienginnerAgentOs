@@ -329,6 +329,17 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
     }
   }, [messagePages, messagesFetching]);
 
+  // Follow-ups default to the source the conversation was using (e.g. after a reload the picker
+  // would otherwise fall back to the local workspace and "that table" would resolve elsewhere).
+  const sourceAppliedRef = useRef("");
+  const latestSource = results[results.length - 1]?.structured.source;
+  useEffect(() => {
+    if (!selectedId || seededRef.current || sourceAppliedRef.current === selectedId || !latestSource) return;
+    sourceAppliedRef.current = selectedId;
+    const external = latestSource.connector_type && latestSource.connector_type !== "local_files" && latestSource.id;
+    setConnectorId(external && connectors.some((connector) => connector.id === latestSource.id) ? String(latestSource.id) : "");
+  }, [selectedId, latestSource, connectors]);
+
   useEffect(() => {
     if (!seed) return;
     seededRef.current = true;

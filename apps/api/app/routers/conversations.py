@@ -311,6 +311,12 @@ def _answer_question(
         .where(ConversationMessage.conversation_id == conversation.id)
         .order_by(ConversationMessage.created_at)
     ).all()
+    from ..catalog_answer import catalog_structure_answer
+
+    catalog = catalog_structure_answer(db, project.id, payload.content, list(prior_messages), payload.connector_id)
+    if catalog is not None:
+        progress("answering", "Reading the table's columns from the catalog")
+        return _persist_catalog_answer(db, user, project, conversation, payload, prior_messages, catalog, cancelled)
     progress("grounding", "Finding relevant tables, metrics and joins, then drafting governed SQL")
     analysis = generate_sql(
         SQLRequest(
@@ -386,6 +392,16 @@ def _answer_question(
         session_id=conversation.id,
         user_id=user.id,
     ) if provider else "I prepared a governed analysis."
+    if (analysis.get("provider") or {}).get("mode") == "deterministic_safety_fallback":
+        # The model's SQL was rejected; the fallback query is generic and may not answer the question.
+        validation = dict(analysis.get("validation") or {})
+        validation["status"] = "fallback"
+        validation["checks"] = ["Model SQL was rejected by the safety checks; showing a generic fallback query instead", *(validation.get("checks") or [])]
+        analysis["validation"] = validation
+        answer = (
+            "I couldn't produce a safe query that answers this exactly, so the result below is a generic fallback query "
+            "and may not answer your question. Try naming the table or measure you want. " + answer
+        )
     if route["route"] == "clarify" and not row_count:
         answer = (
             "I could not ground this question confidently in the catalog, so treat the draft query below as a guess. "
@@ -445,6 +461,61 @@ def _answer_question(
         "route_backend": route["backend"],
         "route_policy": route["policy_version"],
     })
+    db.commit()
+    return as_dict(assistant_message, ["id", "conversation_id", "role", "content", "structured", "created_by", "created_at"])
+
+
+def _persist_catalog_answer(
+    db: Session,
+    user: User,
+    project: Project,
+    conversation: Conversation,
+    payload: ConversationAsk,
+    prior_messages: list[ConversationMessage],
+    catalog: dict[str, Any],
+    cancelled: threading.Event | None,
+) -> dict[str, Any]:
+    """Save a catalog-metadata answer (no SQL, no model calls) as a normal chat turn."""
+    if cancelled is not None and cancelled.is_set():
+        db.rollback()
+        raise HTTPException(status_code=499, detail="Request cancelled by the client before the answer was saved")
+    route = {
+        "route": "catalog_lookup", "label": "Catalog metadata", "target": {"id": catalog["asset_id"], "name": catalog["relation"]},
+        "confidence": 1.0, "candidates": [], "suggested_actions": [], "backend": "deterministic",
+        "risk": {"level": "low", "requires_approval": False, "triggers": []}, "jev": None, "policy_version": "catalog-v1", "latency_ms": 0,
+    }
+    user_message = ConversationMessage(conversation_id=conversation.id, role="user", content=payload.content, created_by=user.id)
+    db.add(user_message)
+    db.flush()
+    structured = {
+        "question": payload.content,
+        "sql": "",
+        "dialect": catalog["source"]["dialect"],
+        "provider": {"name": "Catalog", "model": "metadata", "mode": "catalog_lookup", "latency_ms": 0},
+        "cache": None,
+        "grounding": {"catalog_matches": [{"asset_id": catalog["asset_id"], "relation": catalog["relation"], "match_type": "catalog", "score": 1.0, "columns": [row["column"] for row in catalog["execution"]["rows"]][:12]}]},
+        "validation": {"status": "passed", "read_only": True, "risk_level": "low", "checks": [f"Answered from catalog metadata ({catalog['resolved_by']})", "No data was queried"]},
+        "sources": [{"asset": catalog["relation"], "columns": [row["column"] for row in catalog["execution"]["rows"]], "source": catalog["source"]}],
+        "execution": catalog["execution"],
+        "chart": {"type": "table", "title": payload.content[:120], "data": [], "alternatives": ["table"], "reason": "column list"},
+        "source": catalog["source"],
+        "memory": {"prior_messages_used": len(prior_messages), "persisted": True},
+        "route": route,
+        "follow_ups": [f"How many rows are in {catalog['relation']}?", f"Show a sample of {catalog['relation']}"],
+    }
+    assistant_message = ConversationMessage(conversation_id=conversation.id, role="assistant", content=catalog["answer"], structured=structured)
+    db.add(assistant_message)
+    db.flush()
+    db.add(RouteDecision(
+        project_id=project.id, conversation_id=conversation.id, message_id=assistant_message.id, question=payload.content[:4_000],
+        route="catalog_lookup", confidence=1.0, backend="deterministic", policy_version="catalog-v1", candidates=[], risk=route["risk"],
+        outcome={"execution_error": False, "row_count": catalog["execution"]["row_count"]}, created_by=user.id,
+    ))
+    conversation.summary = refresh_conversation_summary(conversation, [*prior_messages, user_message, assistant_message])
+    if conversation.title == "New analysis":
+        conversation.title = payload.content[:200]
+    conversation.updated_at = datetime.now(timezone.utc)
+    audit(db, user, "conversation.answered", "conversation", conversation.id, {"route": "catalog_lookup", "relation": catalog["relation"]})
     db.commit()
     return as_dict(assistant_message, ["id", "conversation_id", "role", "content", "structured", "created_by", "created_at"])
 

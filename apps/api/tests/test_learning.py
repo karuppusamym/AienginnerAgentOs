@@ -177,6 +177,24 @@ class LearningApiTests(unittest.TestCase):
             self.assertEqual(max(scores, key=scores.get), expected, (step, scores))
         self.assertEqual(set(_local_tool_scores("zzz", {"a.b": "x", "c.d": "y"}).values()), {0.5})
 
+    def test_structure_questions_are_answered_from_the_catalog_and_follow_the_conversation(self) -> None:
+        from types import SimpleNamespace
+        from app.catalog_answer import is_structure_question, resolve_asset
+        self.assertTrue(is_structure_question("Show me the available columns for the closest table"))
+        self.assertFalse(is_structure_question("How many accounts by account type?"))
+        direct = self._ask("What columns does core.accounts have?")
+        self.assertEqual(direct["structured"]["provider"]["mode"], "catalog_lookup")
+        self.assertEqual(direct["structured"]["sql"], "")
+        self.assertIn("account_type", {row["column"] for row in direct["structured"]["execution"]["rows"]})
+        # "the closest table" follows what the user asked about earlier, even in another source.
+        with SessionLocal() as db:
+            project_id = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])["id"]
+            prior = [SimpleNamespace(role="user", content="Can you analyze the core.accounts dataset for me?", structured={}),
+                     SimpleNamespace(role="assistant", content="...", structured={"sources": []})]
+            asset, how = resolve_asset(db, project_id, "Show me the available columns for the closest table", prior, None)
+        self.assertEqual(f"{asset.schema_name}.{asset.table_name}", "core.accounts")
+        self.assertEqual(how, "from earlier in this conversation")
+
     def test_manual_verified_query_is_validated(self) -> None:
         bad = self.client.post("/verified-queries", headers=self.headers, json={"question": "leak", "sql": "select email from users"})
         self.assertEqual(bad.status_code, 422)

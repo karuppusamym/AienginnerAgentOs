@@ -10,7 +10,7 @@
 
 Fresh databases already have the column from the baseline, so the step is guarded.
 
-Revision ID: 0008_project_settings_scan_supersede
+Revision ID: 0008_project_settings
 Revises: 0007_invocation_history
 Create Date: 2026-09-24
 """
@@ -21,7 +21,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0008_project_settings_scan_supersede"
+revision: str = "0008_project_settings"
 down_revision: str | Sequence[str] | None = "0007_invocation_history"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

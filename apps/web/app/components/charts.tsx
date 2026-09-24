@@ -128,7 +128,9 @@ function niceDomain(minimum: number, maximum: number, count = 4) {
     else if (min > 0) min = 0;
     else max = 0;
   }
-  const step = niceStep(max - min, count);
+  let step = niceStep(max - min, count);
+  // Small integer ranges (counts like 0–2) would otherwise get 0.5 steps that round to duplicate labels.
+  if (step < 1 && Number.isInteger(min) && Number.isInteger(max)) step = 1;
   const lo = Math.floor(min / step) * step;
   const hi = Math.ceil(max / step) * step;
   const ticks: number[] = [];
