@@ -469,6 +469,10 @@ export type AnswerEnsemble = {
   strategy?: "result_majority" | "sql_majority" | "single" | string;
   /** No majority: a decision model picked among the candidates. */
   tie_break?: { by?: "jev" | string; model?: string; probabilities?: Record<string, number>; chosen?: string } | null;
+  /** SQL_VOTE_MODE used: cascade asks the third model only when the first two disagree. */
+  mode?: "cascade" | "always" | "off" | string;
+  escalated?: boolean;
+  not_needed?: string[];
 };
 
 export type VerifiedQuerySource = "feedback" | "evaluation" | "manual" | "optimization";

@@ -252,6 +252,10 @@ def generate_sql(
             for asset in project_assets
             if asset.connector_id == connector.id
         }
+    # Profiled-only files are catalogued without a table: never offer them to SQL generation.
+    from ..catalog_scope import queryable_asset_ids
+
+    allowed_asset_ids &= queryable_asset_ids(db, project.id, project_assets)
     catalog = [asset for asset in project_assets if asset.id in allowed_asset_ids]
     grounding = grounding_context(db, project.id, payload.question, limit=5, allowed_asset_ids=allowed_asset_ids)
     prioritized_ids = [item["asset_id"] for item in grounding["catalog_matches"] if item.get("asset_id")]
@@ -388,18 +392,34 @@ def generate_sql(
                     selected_routed(db, user, "sql_candidate_3"),
                 ) if candidate is not None and candidate.id != provider.id
             ]
+            vote_mode = learning.sql_vote_mode()
+            if vote_mode == "off":
+                extra_providers = []
             if extra_providers and dialect == "postgres" and executable_local_source:
                 primary_sql = sql
 
                 def drafter(candidate):
                     return lambda: _extract_sql(generate_text(candidate, system_prompt, user_prompt, 1200, governance_feature="sql_generation_candidate", governance_business_id=project.id, governance_user_id=user.id).content)
 
+                def validate_candidate(candidate_sql):
+                    return _safe_read_only_sql(candidate_sql, dialect) and not unknown_relations(candidate_sql, dialect, allowed_relations)
+
+                # Cascade (default): primary + the cheaper second candidate first; the third
+                # (usually the most expensive model) is asked only when those two disagree or one fails.
+                first_round = extra_providers[:1] if vote_mode == "cascade" else extra_providers
                 results = learning.run_candidates(
-                    [(f"{provider.name}", lambda: primary_sql), *[(f"{candidate.name}", drafter(candidate)) for candidate in extra_providers]],
-                    lambda candidate_sql: _safe_read_only_sql(candidate_sql, dialect) and not unknown_relations(candidate_sql, dialect, allowed_relations),
+                    [(f"{provider.name}", lambda: primary_sql), *[(f"{candidate.name}", drafter(candidate)) for candidate in first_round]],
+                    validate_candidate,
                     _local_execution_error,
                 )
+                escalated = False
+                not_needed = [candidate.name for candidate in extra_providers[len(first_round):]]
+                if not_needed and not learning.first_round_settled(results):
+                    results += learning.run_candidates([(candidate.name, drafter(candidate)) for candidate in extra_providers[len(first_round):]], validate_candidate, _local_execution_error)
+                    escalated, not_needed = True, []
                 chosen, agreement, strategy = learning.vote_candidates(results)
+                if vote_mode == "cascade" and not escalated and strategy == "result_majority":
+                    strategy = "cascade_agreed"
                 tie_break = None
                 executable = [index for index, item in enumerate(results) if item.get("ok")]
                 if strategy == "result_majority" and agreement.startswith("1/") and len(executable) >= 2:
@@ -418,6 +438,9 @@ def generate_sql(
                 ensemble = {
                     "strategy": strategy,
                     "agreement": agreement,
+                    "mode": vote_mode,
+                    "escalated": escalated,
+                    "not_needed": not_needed,
                     "tie_break": tie_break,
                     "candidates": [
                         {"model": item["model"], "ok": item["ok"], "row_count": item["row_count"], "fingerprint": (item["fingerprint"] or "")[:12] or None, "error": item["error"], "chosen": index == chosen, "sql": (item.get("sql") or "")[:4_000] or None}

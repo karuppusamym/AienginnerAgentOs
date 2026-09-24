@@ -182,7 +182,8 @@ def _grounding_strength(grounding: dict[str, Any] | None) -> tuple[float, list[s
         normalised = raw if match.get("match_type") in {"vector", "hybrid"} and raw <= 1.0 else min(1.0, raw / 3.0)
         best = max(best, normalised)
     if matches:
-        reasons.append(f"{len(matches)} catalog match(es); best {matches[0].get('relation', '?')}")
+        described = (matches[0].get("description") or "").strip()[:80]
+        reasons.append(f"{len(matches)} catalog match(es); best {matches[0].get('relation', '?')}" + (f" ({described})" if described else ""))
     if (grounding or {}).get("semantic_matches"):
         best = min(1.0, best + 0.15)
         reasons.append("semantic metric matched")
@@ -312,6 +313,10 @@ def _jev_choice(question: str, candidates: list[dict[str, Any]], policy: dict[st
             detail = f"{detail} Registered agents: {agent_names}."
         if target.get("description"):
             detail = f"{detail} {'Agent' if item['route'] == 'agent_run' else 'Tool'} {target.get('name', '')}: {target['description'][:200]}"
+        if item["route"] == "sql_analysis" and item.get("reasons"):
+            # Catalog evidence (registry metadata, e.g. "best staging.transactions (Ingested from transactions.csv)"),
+            # so a question about "the uploaded file" is recognised as answerable. The LLM path already gets this.
+            detail = f"{detail} Evidence: {'; '.join(item['reasons'])[:300]}"
         criteria[label] = detail
     result = jev_client.ask(provider, {"request": question[:4_000]}, {
         "route": {"type": "choice", "instructions": policy["instructions"] + " The request is in `request`.", "criteria": criteria},

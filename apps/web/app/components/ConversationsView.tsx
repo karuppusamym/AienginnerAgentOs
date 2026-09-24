@@ -951,8 +951,10 @@ function backendLabel(backend: string) {
 
 const ENSEMBLE_STRATEGY_LABELS: Record<string, string> = {
   result_majority: "Majority of identical results",
+  cascade_agreed: "Two models agreed (third not needed)",
   sql_majority: "Majority of equivalent SQL",
-  single: "Single model (no vote)",
+  jev_tie_break: "No majority: Jev picked",
+  single: "Only one candidate ran successfully",
 };
 
 /** Examples, reused verified query and prompt version the learning loop contributed to this answer. */
@@ -993,6 +995,8 @@ function EnsembleSection({ ensemble }: { ensemble?: AnswerEnsemble }) {
         <div><dt>Agreement</dt><dd>{ensemble.agreement || "-"}</dd></div>
         <div><dt>Strategy</dt><dd title={ensemble.strategy}>{ensemble.strategy ? ENSEMBLE_STRATEGY_LABELS[ensemble.strategy] || ensemble.strategy : "-"}</dd></div>
       </dl>
+      {ensemble.not_needed?.length ? <p className="inspector-muted">Not called (first two models agreed): {ensemble.not_needed.join(", ")}</p> : null}
+      {ensemble.escalated ? <p className="inspector-muted">The first two candidates disagreed or failed, so the third model was asked.</p> : null}
       {tieBreak && (
         <div className="tie-break">
           <p className="inspector-line"><Sparkles size={12} /> No majority — {tieBreak.by === "jev" || !tieBreak.by ? "Jev" : tieBreak.by} picked <strong>{tieBreak.chosen || "-"}</strong>{chosenProbability != null ? ` (${formatProbability(chosenProbability)})` : ""}{tieBreak.model && <small> · <code>{tieBreak.model}</code></small>}</p>

@@ -49,6 +49,16 @@ class VotingTests(unittest.TestCase):
         chosen, agreement, strategy = learning.vote_candidates([{"ok": True, "execution": percent}, {"ok": True, "execution": gemini}, {"ok": True, "execution": deepseek}])
         self.assertEqual((chosen, agreement, strategy), (1, "2/3", "result_majority"))
 
+    def test_cascade_asks_the_third_model_only_when_the_first_two_disagree(self) -> None:
+        same = {"rows": [{"n": 4}]}
+        self.assertTrue(learning.first_round_settled([{"ok": True, "execution": same}, {"ok": True, "execution": {"rows": [{"count": 4.0}]}}]))
+        self.assertFalse(learning.first_round_settled([{"ok": True, "execution": same}, {"ok": True, "execution": {"rows": [{"n": 5}]}}]))
+        self.assertFalse(learning.first_round_settled([{"ok": True, "execution": same}, {"ok": False, "execution": {"error": "relation does not exist"}}]))
+        with mock.patch.dict(os.environ, {"SQL_VOTE_MODE": ""}):
+            self.assertEqual(learning.sql_vote_mode(), "cascade")
+        with mock.patch.dict(os.environ, {"SQL_VOTE_MODE": "ALWAYS"}):
+            self.assertEqual(learning.sql_vote_mode(), "always")
+
     def test_fingerprint_is_order_insensitive(self) -> None:
         first = {"rows": [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]}
         second = {"rows": [{"a": 2, "b": "y"}, {"a": 1, "b": "x"}]}
@@ -102,6 +112,25 @@ class LearningApiTests(unittest.TestCase):
         self.assertIsInstance(usage.json()["by_purpose"], list)
         for item in usage.json()["by_purpose"]:
             self.assertTrue({"purpose", "model", "calls", "failed", "estimated_cost_usd", "average_latency_ms"} <= set(item))
+
+    def test_profiled_only_files_are_never_offered_to_sql_generation(self) -> None:
+        from app.catalog_scope import queryable_asset_ids
+        from app.models import DataAsset
+        with SessionLocal() as db:
+            project_id = db.scalar(select(DataAsset.project_id).where(DataAsset.project_id.is_not(None)).limit(1))
+            ghost = DataAsset(project_id=project_id, source_name="Local files", schema_name="file_profiles", table_name=f"ghost_{uuid4().hex[:6]}", asset_type="staged_file", columns=[{"name": "amount", "type": "numeric"}], tags=["local-file", "profiled"])
+            db.add(ghost)
+            db.commit()
+            try:
+                ids = queryable_asset_ids(db, project_id)
+                self.assertNotIn(ghost.id, ids)
+                self.assertTrue(ids, "real staged/demo tables stay queryable")
+                from app.grounding import grounding_context
+                grounding = grounding_context(db, project_id, f"total amount in {ghost.table_name}")
+                self.assertNotIn(ghost.id, {item["asset_id"] for item in grounding["catalog_matches"]})
+            finally:
+                db.delete(ghost)
+                db.commit()
 
     def test_manual_verified_query_is_validated(self) -> None:
         bad = self.client.post("/verified-queries", headers=self.headers, json={"question": "leak", "sql": "select email from users"})

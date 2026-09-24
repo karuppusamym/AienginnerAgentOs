@@ -111,7 +111,7 @@ def _coerce(value: Any, inferred_type: str) -> Any:
     return str(value)
 
 
-def stage_rows(
+def _stage_rows(
     engine: Engine,
     requested_name: str,
     file_id: str,
@@ -228,6 +228,15 @@ def stage_rows(
             for original, name, inferred_type, _ in column_specs
         ],
     }
+
+
+def stage_rows(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Stage rows into a physical table, then let catalog scoping see the new table immediately."""
+    result = _stage_rows(*args, **kwargs)
+    from .catalog_scope import reset_cache
+
+    reset_cache()
+    return result
 
 
 def _json_safe_value(value: Any) -> Any:

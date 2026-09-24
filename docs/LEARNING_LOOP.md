@@ -48,15 +48,28 @@ minimum. With 2–5 cases it will overfit.
 
 ## 2. Do we generate several candidates and pick the best?
 
-Yes. The SQL-generation model drafts the primary query. The models routed to `sql_candidate_2`
-(DeepSeek V4.1 Flash by default) and `sql_candidate_3` (Claude Sonnet 5) draft in parallel from
-the same prompt. Every candidate is validated (read-only parser, catalog tables only) and
-executed. The result that the most candidates agree on wins (self-consistency by result
-fingerprint), and ties go to the primary. The inspector's Decision tab shows every candidate,
-its row count and the agreement (e.g. `2/3`).
+Yes, as a **cascade** so the expensive model is only paid for when it is needed
+(`SQL_VOTE_MODE=cascade`, the default):
 
-- **Latency:** the three drafts run in parallel, so the answer waits for the slowest model.
-  Remove the `sql_candidate_*` routes in Admin → Model routing to turn voting off.
+1. The SQL-generation model (Gemini Flash) drafts the primary query, and the cheaper
+   `sql_candidate_2` (DeepSeek V4.1 Flash) drafts a second one in parallel.
+2. Both are validated (read-only parser, catalog tables only) and executed. **If they return the
+   same answer, that answer is used** and `sql_candidate_3` (Claude Sonnet 5) is never called.
+   The inspector shows "Two models agreed (third not needed)".
+3. Only when the two disagree, or one fails, is the third model asked. The result most
+   candidates agree on then wins, and ties go to the primary. If all three differ, Jev
+   (`sql_candidate_judge`) picks.
+
+- **Other modes:** `SQL_VOTE_MODE=always` asks all three models in parallel, as before (lowest
+  latency, highest cost). `off` disables voting.
+- **Turning off a single candidate:** remove its `sql_candidate_*` route in Admin → Model
+  routing.
+- **Observed live (2026-09-24):** on two chat questions Gemini and DeepSeek agreed (`2/2`), so
+  Sonnet 5 was not called.
+- **Profiled-only files are excluded:** files that are profiled but not staged are catalogued
+  under `file_profiles` with no table. They are no longer offered to SQL generation or grounding
+  (`catalog_scope.py`). Before this fix, two of three candidates failed with
+  `relation "file_profiles.transactions" does not exist`.
 - **Where it applies:** local sources. For external connectors the primary is used, because
   candidates cannot be executed safely there.
 - **Observed live:** when the primary's SQL failed, the vote chose the one candidate that ran
@@ -140,6 +153,7 @@ written onto it. `POST /router/evaluate` replays labelled and feedback cases thr
 | `DECISION_ROUTER_BACKEND` | `auto` | `auto` follows the model routed to `decision_routing` (Jev → jev, text model → llm, none → local); or force `local`, `llm` or `jev` |
 | `TYPESAFE_MODEL` | `typesafe/jev-1.13` | pinned Jev version |
 | Model routes `decision_routing`, `risk_check`, `tool_selection`, `sql_candidate_judge` | Jev when `OPENROUTER_API_KEY` exists | decision purposes (a generation model is rejected) |
+| `SQL_VOTE_MODE` | `cascade` | `cascade`: the third SQL model is asked only when the first two disagree; `always` or `off` |
 | `SLOW_QUERY_MS` | 500 | only queries slower than this feed index suggestions |
 | `ALLOW_DDL_EXECUTION` | `false` | `true` lets an approved suggestion run `CREATE INDEX` on local data |
 | Model routes `sql_candidate_2/3` | DeepSeek / Claude when keys exist | multi-model vote |

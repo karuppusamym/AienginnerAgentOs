@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -296,6 +297,17 @@ def vote_candidates(candidates: list[dict[str, Any]]) -> tuple[int, str, str]:
 def _fingerprint_only(candidate: dict[str, Any]) -> dict[str, Any] | None:
     # Unit-test / legacy path: compare by fingerprint when no execution payload is attached.
     return {"rows": [{"fingerprint": candidate.get("fingerprint")}]} if candidate.get("fingerprint") else None
+
+
+def sql_vote_mode() -> str:
+    """SQL_VOTE_MODE: ``cascade`` (default) asks the third model only on disagreement; ``always`` asks all; ``off`` disables voting."""
+    mode = os.getenv("SQL_VOTE_MODE", "cascade").strip().lower()
+    return mode if mode in {"cascade", "always", "off"} else "cascade"
+
+
+def first_round_settled(results: list[dict[str, Any]]) -> bool:
+    """Primary and second candidate both ran and returned the same answer: no third opinion needed."""
+    return len(results) >= 2 and all(item.get("ok") for item in results[:2]) and results_agree(results[0].get("execution"), results[1].get("execution"))
 
 
 def run_candidates(

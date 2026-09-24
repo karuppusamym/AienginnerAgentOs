@@ -348,6 +348,11 @@ def grounding_context(
     limit: int = 5,
     allowed_asset_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    if allowed_asset_ids is None:
+        # Never ground on catalog entries without a queryable table (profiled-only files).
+        from .catalog_scope import queryable_asset_ids
+
+        allowed_asset_ids = queryable_asset_ids(db, project_id)
     catalog_matches = project_asset_search(db, project_id, question, limit=limit, allowed_asset_ids=allowed_asset_ids)
     target_asset_ids = {m["asset_id"] for m in catalog_matches} if catalog_matches else set()
     semantic = semantic_matches(
