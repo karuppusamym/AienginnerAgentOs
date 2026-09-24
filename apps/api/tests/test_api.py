@@ -2204,7 +2204,7 @@ class DataPilotApiTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 201)
         published = self.client.post(
-            f"/agents/{planner['id']}/versions/{created.json()['version']}/publish",
+            f"/agents/{planner['id']}/versions/{created.json()['version']}/publish?force=true",  # unscored draft: admin override
             headers=self.headers,
         )
         self.assertEqual(published.json()["status"], "published")

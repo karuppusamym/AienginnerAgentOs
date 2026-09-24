@@ -7,9 +7,43 @@ from sqlalchemy import select
 from .connector_runtime import discover_metadata
 from .database import SessionLocal
 from .governance import record_audit_event, record_governance_event
-from .models import AuditEvent, Connector, DataAsset, Job, SchemaDriftEvent
+from .metadata_generation import is_unreviewed_description, suggest_dataset_metadata
+from .models import AuditEvent, Connector, DataAsset, Job, SchemaDriftEvent, User
 from .pii import annotate_columns
+from .provider_selection import selected_model_provider
+from .request_context import active_project_id
 from .vector_store import index_document
+
+
+def _apply_ai_suggested_metadata(db, project_id: str, actor_id: str, asset: DataAsset, schema_name: str, table_name: str) -> None:
+    """Fill in a description/column notes for a newly (re)discovered asset that nobody has reviewed yet.
+
+    Best-effort only: any failure (no provider routed for this purpose, model
+    error, malformed response) silently leaves the existing placeholder
+    description in place. A scan must never fail because this enrichment did.
+    """
+    if not is_unreviewed_description(asset.description):
+        return
+    if any(column.get("business_name") for column in asset.columns):
+        return
+    actor = db.get(User, actor_id)
+    if actor is None:
+        return
+    try:
+        provider = selected_model_provider(db, actor, "metadata_generation")
+    except Exception:
+        provider = None
+    if provider is None:
+        return
+    suggestion = suggest_dataset_metadata(
+        provider, schema_name, table_name, asset.columns,
+        governance_business_id=project_id, governance_user_id=actor.id,
+    )
+    if not suggestion:
+        return
+    asset.description = suggestion["description"]
+    asset.metadata_status = "ai_suggested"
+    asset.columns = [{**column, **suggestion["columns"].get(str(column.get("name", "")), {})} for column in asset.columns]
 
 
 def execute_metadata_scan(connector_id: str, job_id: str, actor_id: str) -> dict:
@@ -50,40 +84,52 @@ def execute_metadata_scan(connector_id: str, job_id: str, actor_id: str) -> dict
                 discovery = discover_metadata(connector)
                 summary = discovery.summary
                 discovered_assets = []
-                for item in discovery.assets:
-                    asset = db.scalar(
-                        select(DataAsset).where(
-                            DataAsset.project_id == connector.project_id,
-                            DataAsset.connector_id == connector.id,
-                            DataAsset.schema_name == item["schema_name"],
-                            DataAsset.table_name == item["table_name"],
+                # Pin the provider-selection context to the scanned connector's
+                # project: this runs off the request thread (worker/threadpool),
+                # so the ambient active_project_id contextvar is normally unset
+                # and selected_model_provider() would otherwise fall back to the
+                # actor's own "current project", which need not match the one
+                # being scanned.
+                context_token = active_project_id.set(connector.project_id)
+                try:
+                    for item in discovery.assets:
+                        asset = db.scalar(
+                            select(DataAsset).where(
+                                DataAsset.project_id == connector.project_id,
+                                DataAsset.connector_id == connector.id,
+                                DataAsset.schema_name == item["schema_name"],
+                                DataAsset.table_name == item["table_name"],
+                            )
                         )
-                    )
-                    if asset is None:
-                        asset = DataAsset(
-                            project_id=connector.project_id,
-                            connector_id=connector.id,
-                            source_name=connector.name,
-                            schema_name=item["schema_name"],
-                            table_name=item["table_name"],
-                        )
-                        db.add(asset)
-                        db.flush()
-                    else:
-                        previous = {str(column.get("name")): str(column.get("type")) for column in asset.columns}
-                        current = {str(column.get("name")): str(column.get("type")) for column in item["columns"]}
-                        changes = [
-                            *[{"kind": "column_added", "column": name, "type": current[name]} for name in sorted(current.keys() - previous.keys())],
-                            *[{"kind": "column_removed", "column": name, "type": previous[name]} for name in sorted(previous.keys() - current.keys())],
-                            *[{"kind": "type_changed", "column": name, "from": previous[name], "to": current[name]} for name in sorted(previous.keys() & current.keys()) if previous[name].lower() != current[name].lower()],
-                        ]
-                        if changes:
-                            db.add(SchemaDriftEvent(project_id=connector.project_id, connector_id=connector.id, asset_id=asset.id, relation=f"{item['schema_name']}.{item['table_name']}", changes=changes))
-                    asset.columns = annotate_columns(item["columns"])
-                    asset.tags = item.get("tags", [])
-                    asset.row_count = item.get("row_count")
-                    asset.description = item.get("description_hint") or f"Discovered from {connector.name} in read-only mode."
-                    discovered_assets.append(asset)
+                        if asset is None:
+                            asset = DataAsset(
+                                project_id=connector.project_id,
+                                connector_id=connector.id,
+                                source_name=connector.name,
+                                schema_name=item["schema_name"],
+                                table_name=item["table_name"],
+                            )
+                            db.add(asset)
+                            db.flush()
+                        else:
+                            previous = {str(column.get("name")): str(column.get("type")) for column in asset.columns}
+                            current = {str(column.get("name")): str(column.get("type")) for column in item["columns"]}
+                            changes = [
+                                *[{"kind": "column_added", "column": name, "type": current[name]} for name in sorted(current.keys() - previous.keys())],
+                                *[{"kind": "column_removed", "column": name, "type": previous[name]} for name in sorted(previous.keys() - current.keys())],
+                                *[{"kind": "type_changed", "column": name, "from": previous[name], "to": current[name]} for name in sorted(previous.keys() & current.keys()) if previous[name].lower() != current[name].lower()],
+                            ]
+                            if changes:
+                                db.add(SchemaDriftEvent(project_id=connector.project_id, connector_id=connector.id, asset_id=asset.id, relation=f"{item['schema_name']}.{item['table_name']}", changes=changes))
+                        asset.columns = annotate_columns(item["columns"])
+                        asset.tags = item.get("tags", [])
+                        asset.row_count = item.get("row_count")
+                        if is_unreviewed_description(asset.description):
+                            asset.description = item.get("description_hint") or f"Discovered from {connector.name} in read-only mode."
+                        _apply_ai_suggested_metadata(db, connector.project_id, actor_id, asset, item["schema_name"], item["table_name"])
+                        discovered_assets.append(asset)
+                finally:
+                    active_project_id.reset(context_token)
             connector.status = "healthy"
             connector.last_scanned_at = datetime.now(timezone.utc)
             connector.metadata_summary = summary

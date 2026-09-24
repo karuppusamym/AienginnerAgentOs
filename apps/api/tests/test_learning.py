@@ -132,6 +132,20 @@ class LearningApiTests(unittest.TestCase):
                 db.delete(ghost)
                 db.commit()
 
+    def test_tool_choice_evaluation_scores_local_and_jev(self) -> None:
+        cases = [
+            {"agent": "Metadata", "step": "Retrieve the lineage graph: upstream and downstream of the table", "expected_tool": "lineage.query"},
+            {"agent": "Metadata", "step": "Profile the dataset columns, null rates and distinct values", "expected_tool": "dataset.profile"},
+            {"agent": "Nobody", "step": "x", "expected_tool": "y"},
+        ]
+        verdict = {"by": "jev", "model": "typesafe/jev-1.13", "probabilities": {"lineage.query": 0.9, "dataset.profile": 0.1}, "latency_ms": 5, "cost_usd": 0.00002}
+        with mock.patch("app.provider_selection.routed_only_provider", return_value=object()), mock.patch("app.jev_client.choose_tools", return_value=verdict):
+            report = self.client.post("/router/evaluate-tools", headers=self.headers, json={"cases": cases}).json()
+        self.assertEqual(len(report["skipped"]), 1)
+        self.assertEqual(report["backends"]["jev"]["accuracy"], 0.5)  # the fake verdict always says lineage.query
+        self.assertEqual(report["backends"]["local"]["effective_backend"], "local")
+        self.assertIsNotNone(report["backends"]["local"]["accuracy"])
+
     def test_manual_verified_query_is_validated(self) -> None:
         bad = self.client.post("/verified-queries", headers=self.headers, json={"question": "leak", "sql": "select email from users"})
         self.assertEqual(bad.status_code, 422)
@@ -168,6 +182,16 @@ class LearningApiTests(unittest.TestCase):
             after = next(item for item in self.client.get("/sql/index-recommendations?min_ms=0", headers=self.headers).json() if item["columns"] == ["account_type"])
         self.assertTrue(after["exists"])
 
+    def test_separation_of_duties_blocks_self_approval_but_allows_withdrawal(self) -> None:
+        self.client.post("/sql/generate", headers=self.headers, json={"question": f"How many accounts by status? {uuid4().hex[:4]}", "dialect": "postgres"})
+        with mock.patch.dict(os.environ, {"ALLOW_DDL_EXECUTION": "true", "APPROVAL_SEPARATION_OF_DUTIES": "true"}):
+            item = next(item for item in self.client.get("/sql/index-recommendations?min_ms=0", headers=self.headers).json() if not item["exists"])
+            requested = self.client.post("/sql/index-recommendations/apply", headers=self.headers, json={"relation": item["relation"], "columns": item["columns"]}).json()
+            blocked = self.client.post(f"/approvals/{requested['approval_id']}/decision", headers=self.headers, json={"decision": "approved", "note": "self"})
+            self.assertEqual(blocked.status_code, 403, blocked.text)
+            withdrawn = self.client.post(f"/approvals/{requested['approval_id']}/decision", headers=self.headers, json={"decision": "rejected", "note": "withdraw"})
+            self.assertEqual(withdrawn.status_code, 200, withdrawn.text)
+
     def test_gepa_run_optimises_and_activation_requires_approval(self) -> None:
         provider = self.client.post("/model-providers", headers=self.headers, json={
             "name": f"Fake gen {uuid4().hex[:4]}", "provider_type": "openai_compatible", "base_url": "http://model.invalid/v1", "default_model": "fake", "secret_reference": "env:FAKE_MODEL_KEY",
@@ -202,9 +226,10 @@ class LearningApiTests(unittest.TestCase):
             self.assertTrue(any(candidate["on_pareto_front"] and candidate["origin"] == "reflection" for candidate in detail["candidates"]))
             applied = self.client.post(f"/prompt-optimizations/{run_id}/apply", headers=self.headers, json={}).json()
             with SessionLocal() as db:
-                project_id = db.scalar(select(VerifiedQuery.project_id).limit(1))
+                project_id = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])["id"]
                 self.assertEqual(learning.active_runtime_prompt(db, project_id)[0], None)  # not active before approval
-            self.client.post(f"/approvals/{applied['approval_id']}/decision", headers=self.headers, json={"decision": "approved", "note": "ship it"})
+            decided = self.client.post(f"/approvals/{applied['approval_id']}/decision", headers=self.headers, json={"decision": "approved", "note": "ship it"})
+            self.assertEqual(decided.status_code, 200, decided.text)
             with SessionLocal() as db:
                 guidance, version = learning.active_runtime_prompt(db, project_id)
             self.assertIn("filter on account_type", guidance)

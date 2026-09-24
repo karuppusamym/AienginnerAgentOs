@@ -13,15 +13,20 @@ Design choices, deliberately conservative:
 - Fixed-window counter (INCR + EXPIRE) — simpler and cheaper than a sliding
   window or token bucket, and the small burst error at window boundaries is
   an acceptable trade for an abuse governor rather than a hard billing gate.
-- Fails OPEN, not closed. If `REDIS_URL` is unset (local/dev without Redis)
-  or Redis is unreachable, requests are allowed through and nothing breaks.
-  A rate limiter should never become a new single point of failure for a
-  read-only, already-governed gateway that has its own SQL-level guardrails.
+- No Redis does not mean no limit. If `REDIS_URL` is unset (local/dev
+  without Redis) or Redis is unreachable, an in-process sliding-window log
+  takes over, so a missing Redis never turns the external gateway into an
+  unthrottled surface (it used to fail open). The in-process limit is per
+  replica, so with N replicas the effective ceiling is N x limit -- still a
+  real bound, and Redis restores the exact shared limit.
 """
 from __future__ import annotations
 
+import math
 import os
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,25 +80,52 @@ class RateLimitResult:
     retry_after_seconds: int
 
 
-_local_windows: dict[str, int] = {}
+_LOCAL_MAX_KEYS = 10_000
+_local_windows: dict[str, deque[float]] = {}
+_local_lock = threading.Lock()
+
+
+def reset_local_windows() -> None:
+    """Test/ops hook: forget every in-process sliding window."""
+    with _local_lock:
+        _local_windows.clear()
+
+
+def _prune_local(now: float, window_seconds: int) -> None:
+    for name in [name for name, hits in _local_windows.items() if not hits or hits[-1] <= now - window_seconds]:
+        _local_windows.pop(name, None)
+    if len(_local_windows) > _LOCAL_MAX_KEYS:  # still too many live keys: drop the least recently used
+        for name in sorted(_local_windows, key=lambda item: _local_windows[item][-1])[: len(_local_windows) - _LOCAL_MAX_KEYS]:
+            _local_windows.pop(name, None)
 
 
 def _local_check(key: str, limit: int, window_seconds: int) -> RateLimitResult:
-    """Per-process fallback for surfaces that must not fail open (sign-in)."""
-    now = int(time.time())
-    bucket = f"{key}:{now // window_seconds}"
-    if len(_local_windows) > 10_000:
-        _local_windows.clear()
-    _local_windows[bucket] = _local_windows.get(bucket, 0) + 1
-    count = _local_windows[bucket]
-    return RateLimitResult(allowed=count <= limit, limit=limit, remaining=max(0, limit - count), retry_after_seconds=window_seconds - now % window_seconds)
+    """In-process sliding-window log, used whenever Redis is unavailable.
+
+    Only allowed requests are recorded, so a client that keeps retrying while
+    limited regains capacity as its oldest accepted requests age out.
+    """
+    now = time.monotonic()
+    with _local_lock:
+        hits = _local_windows.get(key)
+        if hits is None:
+            if len(_local_windows) >= _LOCAL_MAX_KEYS:
+                _prune_local(now, window_seconds)
+            hits = _local_windows[key] = deque()
+        while hits and hits[0] <= now - window_seconds:
+            hits.popleft()
+        if len(hits) >= limit:
+            retry_after = max(1, math.ceil(hits[0] + window_seconds - now)) if hits else window_seconds
+            return RateLimitResult(allowed=False, limit=limit, remaining=0, retry_after_seconds=retry_after)
+        hits.append(now)
+        return RateLimitResult(allowed=True, limit=limit, remaining=max(0, limit - len(hits)), retry_after_seconds=0)
 
 
-def check_rate_limit(key: str, limit: int, window_seconds: int, local_fallback: bool = False) -> RateLimitResult:
-    """Fixed-window rate limit. See module docstring for the fail-open rationale.
+def check_rate_limit(key: str, limit: int, window_seconds: int, local_fallback: bool = True) -> RateLimitResult:
+    """Fixed-window limit in Redis; in-process sliding window when Redis is unavailable.
 
-    ``local_fallback`` keeps an in-process counter when Redis is unavailable,
-    for endpoints like sign-in where failing open enables password guessing.
+    ``local_fallback=False`` restores the old fail-open behaviour for a caller
+    that explicitly prefers availability over throttling.
     """
     client = _get_client()
     if client is None:
@@ -108,6 +140,8 @@ def check_rate_limit(key: str, limit: int, window_seconds: int, local_fallback: 
             client.expire(redis_key, window_seconds + 1)
         ttl = client.ttl(redis_key)
     except Exception:
+        if local_fallback:
+            return _local_check(key, limit, window_seconds)
         return RateLimitResult(allowed=True, limit=limit, remaining=limit, retry_after_seconds=0)
     remaining = max(0, limit - count)
     retry_after = ttl if isinstance(ttl, int) and ttl > 0 else window_seconds

@@ -723,6 +723,9 @@ class ExternalClient(Base):
     default_project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Token lifecycle (Alembic 0006): NULL expires_at means the token never expires.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QueryTool(Base):
@@ -765,6 +768,8 @@ class QueryToolGrant(Base):
     query_tool_id: Mapped[str] = mapped_column(ForeignKey("query_tools.id"), index=True)
     external_client_id: Mapped[str] = mapped_column(ForeignKey("external_clients.id"), index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Max invocations of this tool by this client per UTC day; NULL = unlimited (Alembic 0006).
+    daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

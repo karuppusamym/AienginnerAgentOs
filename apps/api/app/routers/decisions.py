@@ -9,6 +9,7 @@ only deployed via ``DECISION_POLICY_PATH`` after human review.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from typing import Literal
@@ -151,4 +152,81 @@ def evaluate_router(payload: RouterEvaluationRequest, user: User = Depends(get_c
             "results": results,
         }
     db.commit()  # keep the evaluated backends' call logs in Model usage
+    return report
+
+
+class ToolChoiceCase(BaseModel):
+    agent: str = Field(min_length=1, max_length=120)
+    step: str = Field(min_length=1, max_length=1_000)
+    expected_tool: str = Field(min_length=1, max_length=120)
+    objective: str = Field(default="", max_length=1_000)
+
+
+class ToolChoiceEvaluationRequest(BaseModel):
+    backends: list[Literal["local", "jev"]] = Field(default_factory=lambda: ["local", "jev"])
+    cases: list[ToolChoiceCase] = Field(min_length=1, max_length=50)
+
+
+@router.post("/router/evaluate-tools")
+def evaluate_tool_choice(payload: ToolChoiceEvaluationRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Labelled "agent step -> expected tool" cases replayed through the tool choosers.
+
+    ``local`` is the word-overlap fallback; ``jev`` is the decision model routed to
+    ``tool_selection``. Options are the agent's bound tools and their registry descriptions,
+    the same menu an agent run offers.
+    """
+    from .. import jev_client
+    from ..models import AgentDefinition, AgentVersion, QueryTool, ToolDefinition
+    from ..provider_selection import routed_only_provider
+    from ..temporal_activities import _local_tool_scores
+
+    project = require_current_project(db, user)
+    chooser = routed_only_provider(db, user, "tool_selection")
+    report: dict[str, Any] = {"cases": len(payload.cases), "backends": {}, "skipped": []}
+    menus: dict[str, dict[str, str]] = {}
+    for case in payload.cases:
+        if case.agent in menus:
+            continue
+        agent = db.scalar(select(AgentDefinition).where(AgentDefinition.name == case.agent))
+        if agent is None:
+            continue
+        version = db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent.id, AgentVersion.status == "published").order_by(AgentVersion.version.desc()).limit(1))
+        menu: dict[str, str] = {}
+        for name in (version.tool_names if version else agent.tool_names) or []:
+            tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == name))
+            if tool is not None:
+                menu[name] = tool.description or name
+        for name in (version.query_tool_names if version else agent.query_tool_names) or []:
+            query_tool = db.scalar(select(QueryTool).where(QueryTool.project_id == project.id, QueryTool.name == name))
+            if query_tool is not None:
+                menu[name] = f"{query_tool.description} {query_tool.purpose}".strip() or name
+        menus[case.agent] = menu
+    usable = []
+    for case in payload.cases:
+        menu = menus.get(case.agent) or {}
+        if case.expected_tool not in menu or len(menu) < 2:
+            report["skipped"].append({"agent": case.agent, "step": case.step[:200], "reason": "unknown agent, expected tool not bound to it, or nothing to choose between"})
+        else:
+            usable.append((case, menu))
+    for backend in payload.backends:
+        results, latencies = [], []
+        for case, menu in usable:
+            started = time.perf_counter()
+            if backend == "jev":
+                verdict = jev_client.choose_tools(db, chooser, case.step, case.objective or case.step, menu, project.id, user.id) if chooser is not None else None
+                probabilities = (verdict or {}).get("probabilities") or {}
+                effective = f"jev:{verdict['model']}" if verdict else ("jev (not routed)" if chooser is None else "jev (unavailable)")
+            else:
+                probabilities = _local_tool_scores(f"{case.step} {case.objective}", menu)
+                effective = "local"
+            latencies.append((time.perf_counter() - started) * 1000)
+            got = max(probabilities, key=probabilities.get) if probabilities else None
+            results.append({"agent": case.agent, "step": case.step[:200], "expected": case.expected_tool, "got": got, "probability": round(probabilities.get(got, 0.0), 4) if got else None, "backend": effective, "correct": got == case.expected_tool})
+        report["backends"][backend] = {
+            "accuracy": round(sum(item["correct"] for item in results) / len(results), 4) if results else None,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
+            "effective_backend": results[0]["backend"] if results else None,
+            "results": results,
+        }
+    db.commit()  # keep Jev call logs in Model usage
     return report

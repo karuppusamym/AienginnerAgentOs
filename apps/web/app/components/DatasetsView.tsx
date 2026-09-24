@@ -2,10 +2,12 @@ import {
   ChevronRight,
   Code2,
   Database,
+  Download,
   FileSpreadsheet,
   FileUp,
   MessageSquare,
   Search,
+  Sparkles,
 } from "lucide-react";
 import { ChangeEvent, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
@@ -92,6 +94,64 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
       setSaving(false);
     }
   };
+  const [generating, setGenerating] = useState(false);
+  const generateWithAI = async () => {
+    if (!selected) return;
+    setGenerating(true);
+    try {
+      const suggestion = await api<{ description: string; columns: Record<string, { business_name?: string; description?: string }> }>(`/datasets/${selected.id}/generate-metadata`, { method: "POST" });
+      setEditDescription(suggestion.description);
+      setEditColumnNotes((current) => {
+        const next = { ...current };
+        for (const [name, notes] of Object.entries(suggestion.columns || {})) {
+          next[name] = { business_name: notes.business_name ?? next[name]?.business_name ?? "", description: notes.description ?? next[name]?.description ?? "" };
+        }
+        return next;
+      });
+      notify?.("AI suggestion applied — review and save", "ok");
+    } catch (error) {
+      notify?.(error instanceof ApiError ? error.message : "Could not generate a metadata suggestion", "error");
+    } finally {
+      setGenerating(false);
+    }
+  };
+  const downloadBlob = (filename: string, content: string, type: string) => {
+    const blob = new Blob([content], { type });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+  const exportCatalogCsv = () => {
+    const header = ["schema", "table", "column", "type", "business_name", "description", "tags", "owner", "sensitivity", "metadata_status"];
+    const rows = datasets.flatMap((dataset) =>
+      (dataset.columns.length ? dataset.columns : [{ name: "", type: "", business_name: "", description: "" }]).map((column) => [
+        dataset.schema_name,
+        dataset.table_name,
+        column.name || "",
+        column.type || "",
+        column.business_name || "",
+        column.description || "",
+        (dataset.tags || []).join("; "),
+        dataset.owner || "",
+        dataset.sensitivity || "",
+        dataset.metadata_status || "",
+      ])
+    );
+    const escape = (value: string) => (/[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value);
+    const csv = [header, ...rows].map((row) => row.map((cell) => escape(String(cell))).join(",")).join("\n");
+    downloadBlob("dataset-catalog.csv", csv, "text/csv;charset=utf-8");
+  };
+  const exportDataPackage = async () => {
+    try {
+      const descriptor = await api<object>("/datapackage");
+      downloadBlob("dataset-catalog-datapackage.json", JSON.stringify(descriptor, null, 2), "application/json");
+    } catch (error) {
+      notify?.(error instanceof ApiError ? error.message : "Could not export the data package", "error");
+    }
+  };
   const [importing, setImporting] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const handleImportFile = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -131,6 +191,8 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
           <div className="toolbar-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter datasets" /></div>
           <input ref={importInputRef} type="file" accept=".csv" hidden onChange={handleImportFile} />
           <button className="secondary-button" title="Import a schema_name,table_name,column_name catalog CSV without a live connection" disabled={importing} onClick={() => importInputRef.current?.click()}><FileUp size={16} />{importing ? "Importing…" : "Import catalog CSV"}</button>
+          <button className="secondary-button" title="Export the full catalog as CSV, one row per column" onClick={exportCatalogCsv} disabled={!datasets.length}><Download size={16} />Export CSV</button>
+          <button className="secondary-button" title="Export the full catalog as a Frictionless Data Package (JSON)" onClick={exportDataPackage} disabled={!datasets.length}><Download size={16} />Export data package</button>
         </div>
       </div>
       <div className="dataset-layout">
@@ -138,7 +200,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
           <div className="table-header dataset-grid"><span>Dataset</span><span>Rows</span><span>Category</span><span /></div>
           {filtered.map((dataset) => (
             <button className={`data-row dataset-grid ${selected?.id === dataset.id ? "selected" : ""}`} key={dataset.id} onClick={() => setSelectedId(dataset.id)}>
-              <span className="dataset-name"><Database size={17} /><span><strong>{dataset.schema_name}.{dataset.table_name}</strong><small>{dataset.source?.name || dataset.source_name} / {connectorLabels[dataset.source?.connector_type || ""] || dataset.source?.connector_type || "registered source"}</small></span></span>
+              <span className="dataset-name"><Database size={17} /><span><strong>{dataset.schema_name}.{dataset.table_name}{dataset.queryable === false && <span className="tag profile-only" title="Profiled only: stage this file (Files) before SQL can query it">profile only</span>}</strong><small>{dataset.source?.name || dataset.source_name} / {connectorLabels[dataset.source?.connector_type || ""] || dataset.source?.connector_type || "registered source"}</small></span></span>
               <span className="mono">{dataset.row_count?.toLocaleString() || "-"}</span>
               <span className="tag-list"><span className="tag">{dataset.category}</span>{dataset.tags.slice(0, 2).map((tag) => <span className="tag" key={tag}>{tag}</span>)}</span>
               <ChevronRight size={16} />
@@ -150,6 +212,8 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
             <>
               <div className="detail-title"><span className="dataset-icon"><Database size={21} /></span><div><span>{selected.schema_name}</span><h3>{selected.table_name}</h3></div></div>
               <p className="detail-description">{selected.description}</p>
+              {selected.metadata_status === "ai_suggested" && <p className="inline-note">AI-suggested description — review and save to mark it reviewed.</p>}
+              {selected.queryable === false && <p className="inline-note warning">Profiled only: this file was catalogued but not staged, so there is no table to query. Stage it from Files to use it in SQL, chat and dashboards.</p>}
               <div className="tag-list">{(selected.tags || []).map((tag) => <span className="tag" key={tag}>{tag}</span>)}</div>
               <div className="detail-stats"><div><span>Rows</span><strong>{selected.row_count?.toLocaleString()}</strong></div><div><span>Category</span><strong>{selected.category}</strong></div><div><span>System</span><strong>{connectorLabels[selected.source?.connector_type || ""] || selected.source?.connector_type || selected.asset_type}</strong></div></div>
               <div className="subheading"><h4>Columns</h4><span>{selected.columns.length}</span></div>
@@ -169,6 +233,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
         <Modal title={`Review metadata — ${selected.schema_name}.${selected.table_name}`} onClose={() => setEditing(false)}>
           <form className="modal-form" onSubmit={(event) => { event.preventDefault(); saveEdit(); }}>
             <label>Description<textarea rows={4} value={editDescription} onChange={(event) => setEditDescription(event.target.value)} placeholder="Business description for this dataset" /></label>
+            <button type="button" className="secondary-button" onClick={generateWithAI} disabled={generating}><Sparkles size={16} />{generating ? "Generating…" : "Generate with AI"}</button>
             <label>Tags (comma separated)<input value={editTags} onChange={(event) => setEditTags(event.target.value)} placeholder="pii, finance, verified" /></label>
             <div className="form-grid">
               <label>Owner<input value={editOwner} onChange={(event) => setEditOwner(event.target.value)} placeholder="team or person" /></label>
@@ -181,6 +246,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
               <label>Freshness SLA (hours)<input type="number" min={1} max={8760} value={editFreshnessHours} onChange={(event) => setEditFreshnessHours(event.target.value)} placeholder="24" /></label>
               <label>Metadata status<select value={editMetadataStatus} onChange={(event) => setEditMetadataStatus(event.target.value)}>
                 <option value="scanned">Scanned</option>
+                <option value="ai_suggested">AI-suggested</option>
                 <option value="reviewed">Reviewed</option>
                 <option value="certified">Certified</option>
                 <option value="deprecated">Deprecated</option>

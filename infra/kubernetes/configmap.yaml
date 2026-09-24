@@ -19,6 +19,14 @@ data:
   QDRANT_URL: http://qdrant.example.internal:6333
   TEMPORAL_ADDRESS: temporal.example.internal:7233
   TOOL_HTTP_ALLOWLIST: integrations.example.internal
+  # HTTP tools refuse private/loopback IPs; set "true" only when the allowlisted hosts are internal services.
+  TOOL_HTTP_ALLOW_PRIVATE: "false"
+  TOOL_HTTP_MAX_BYTES: "1000000"
+  # Two-person rule for agent runs, index DDL, prompt activation, publication, deploy and retention approvals.
+  APPROVAL_SEPARATION_OF_DUTIES: "true"
+  SQL_VOTE_MODE: cascade
+  AGENT_RUN_MAX_SECONDS: "300"
+  AGENT_PUBLISH_MIN_SCORE: "0.8"
   OTEL_ENABLED: "true"
   OTEL_SERVICE_NAME: datapilot-api
   OTEL_EXPORTER_OTLP_ENDPOINT: https://otel-collector.example.internal/v1/traces

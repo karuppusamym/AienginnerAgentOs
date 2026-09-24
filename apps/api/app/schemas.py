@@ -121,7 +121,7 @@ class DataAssetUpdate(BaseModel):
     owner: str | None = Field(default=None, max_length=160)
     sensitivity: Literal["unclassified", "internal", "confidential", "restricted"] | None = None
     freshness_sla_hours: int | None = Field(default=None, ge=1, le=8760)
-    metadata_status: Literal["scanned", "reviewed", "certified", "deprecated"] | None = None
+    metadata_status: Literal["scanned", "reviewed", "certified", "deprecated", "ai_suggested"] | None = None
     # Keyed by physical column name -> {"business_name": ..., "description": ...}.
     # DataAsset.columns entries otherwise only ever have name/type/nullable —
     # there was no way to record what a column *means* in business terms, only
@@ -175,6 +175,12 @@ class SQLExecutionRequest(BaseModel):
     dialect: Literal["postgres", "sqlserver", "oracle", "teradata", "bigquery"] = "postgres"
     connector_id: str | None = None
     limit: int = Field(default=500, ge=1, le=1000)
+
+
+class SQLExplainRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=100_000)
+    dialect: Literal["postgres", "sqlserver", "oracle", "teradata", "bigquery"] = "postgres"
+    connector_id: str | None = None
 
 
 class SupersetPublishRequest(BaseModel):
@@ -393,6 +399,13 @@ class ExternalClientCreate(BaseModel):
     scopes: list[Literal["tools:list", "tools:invoke"]] = Field(
         default_factory=lambda: ["tools:list", "tools:invoke"]
     )
+    # Token lifetime; omitted = the token does not expire.
+    expires_in_days: int | None = Field(default=None, ge=1, le=365)
+
+
+class ExternalClientRotate(BaseModel):
+    # New lifetime for the rotated token; omitted = keep the client's current expiry.
+    expires_in_days: int | None = Field(default=None, ge=1, le=365)
 
 
 class ExternalClientUpdate(BaseModel):
@@ -428,6 +441,8 @@ class QueryToolInvoke(BaseModel):
 class QueryToolGrantCreate(BaseModel):
     external_client_id: str
     enabled: bool = True
+    # Invocations of this tool by this client per UTC day; omitted/null = unlimited.
+    daily_quota: int | None = Field(default=None, ge=1, le=1_000_000)
 
 
 class MCPRequest(BaseModel):

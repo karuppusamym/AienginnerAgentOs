@@ -233,6 +233,10 @@ def list_approvals(
         for approval in approvals
     ]
 
+# High-impact actions that need a second person when APPROVAL_SEPARATION_OF_DUTIES=true.
+SEPARATE_APPROVER_ACTIONS = {"agent_execution", "create_index", "prompt_activation", "publish_superset_query", "tool_execution", "deploy_pipeline", "apply_retention"}
+
+
 @router.post("/approvals/{approval_id}/decision")
 async def decide_approval(
     approval_id: str,
@@ -245,6 +249,14 @@ async def decide_approval(
     approval = require_project_resource(db.get(Approval, approval_id), project, "Approval")
     if approval.status != "pending":
         raise HTTPException(status_code=409, detail="Approval has already been decided")
+    if (
+        payload.decision == "approved"
+        and approval.requested_by == user.id
+        and approval.action_type in SEPARATE_APPROVER_ACTIONS
+        and os.getenv("APPROVAL_SEPARATION_OF_DUTIES", "false").strip().lower() in {"1", "true", "yes", "on"}
+    ):
+        # Two-person rule: the requester may withdraw (reject) but not approve their own high-impact request.
+        raise HTTPException(status_code=403, detail="A different person must approve this request (separation of duties is enabled)")
     approval.status = payload.decision
     approval.decision_note = payload.note
     approval.decided_by = user.id

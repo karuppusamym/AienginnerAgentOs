@@ -111,7 +111,7 @@ from ..schema_migrations import backfill_project_columns, ensure_project_columns
 from ..seed import seed_database
 from ..staging import execute_parameterized_read_only, execute_read_only, safe_identifier, stage_rows
 from ..superset_client import create_editor_url, create_guest_token
-from ..temporal_activities import agent_runtime_evidence, hold_agent_run_for_approval, run_agent_plan_locally
+from ..temporal_activities import agent_run_limit_label, agent_runtime_evidence, hold_agent_run_for_approval, run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
@@ -250,7 +250,7 @@ async def start_agent_run(
             agent_runtime_evidence(autonomy_level, payload.objective, lead_agent),
             *([{"type": "agent_choice", "label": f"Lead agent: {lead_agent}", "agent": lead_agent}] if lead_agent else []),
             {"type": "catalog", "label": f"{catalog_size} assets in project catalog (tools run only after approval)" if requires_approval else f"{catalog_size} assets in project catalog"},
-            {"type": "limit", "label": "5 agents / 12 tool calls / 5 minute budget"},
+            {"type": "limit", "label": agent_run_limit_label()},
             *([{"type": "policy", "label": "Plan only: approval not required because nothing executes"}] if autonomy_level == 0 and risk["requires_approval"] else []),
         ],
         outputs=[],
@@ -517,16 +517,56 @@ def create_agent_version(agent_id: str, payload: AgentVersionCreate, user: User 
     db.commit()
     return as_dict(version, ["id", "version", "instructions", "model_provider_id", "tool_names", "query_tool_names", "input_schema", "config", "status", "created_at"])
 
+def agent_publish_min_score() -> float:
+    """Minimum evaluation score to publish, as a percentage (0-100).
+
+    AGENT_PUBLISH_MIN_SCORE is a fraction (default 0.8 = 80%) to match the
+    scorecard's 80% promotion bar; values above 1 are read as a percentage.
+    AgentVersion.evaluation_score is the scorecard's average case score (0-100)."""
+    try:
+        value = float(os.getenv("AGENT_PUBLISH_MIN_SCORE", "0.8"))
+    except ValueError:
+        value = 0.8
+    return value if value > 1 else value * 100
+
+
 @router.post("/agents/{agent_id}/versions/{version_number}/publish")
-def publish_agent_version(agent_id: str, version_number: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def publish_agent_version(
+    agent_id: str,
+    version_number: int,
+    force: bool = Query(False, description="Admin-only override of the evaluation-score gate; recorded in the audit event"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     require_permission(user, db, "registry:write", "Registry write permission required")
     version = db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent_id, AgentVersion.version == version_number))
     if version is None:
         raise HTTPException(status_code=404, detail="Agent version not found")
+    # Publishing gate: a version goes live only with a passing scorecard.
+    # evaluation_score is written by GET /agents/{agent_id}/scorecard (average
+    # case score of evaluation runs that exercised this agent). Only an admin
+    # can override with ?force=true, and the override is audited.
+    min_score = agent_publish_min_score()
+    score = version.evaluation_score
+    passing = score is not None and score >= min_score
+    forced = False
+    if not passing:
+        if not (force and user.role == "admin"):
+            reason = "has no evaluation score" if score is None else f"scored {score:g}/100, below the required {min_score:g}"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Agent version {version_number} {reason} (AGENT_PUBLISH_MIN_SCORE). "
+                "Run an evaluation set that exercises this agent and refresh its scorecard before publishing; "
+                "an admin can override with ?force=true (audited).",
+            )
+        forced = True
     for candidate in db.scalars(select(AgentVersion).where(AgentVersion.agent_id == agent_id)).all():
         if candidate.status == "published":
             candidate.status = "retired"
     version.status = "published"
-    audit(db, user, "agent.version_published", "agent", agent_id, {"version": version_number})
+    audit(
+        db, user, "agent.version_published", "agent", agent_id,
+        {"version": version_number, "evaluation_score": score, "min_score": min_score, "force": forced},
+    )
     db.commit()
     return {"agent_id": agent_id, "version": version_number, "status": version.status}

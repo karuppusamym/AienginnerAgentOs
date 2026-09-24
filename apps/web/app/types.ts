@@ -82,6 +82,8 @@ export type Dataset = {
   metadata_status?: string;
   connector_id?: string | null;
   source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string; connection_mode?: "direct" | "mcp" };
+  /** False for a profiled-only file: catalogued, but there is no table to query until it is staged. */
+  queryable?: boolean;
 };
 
 export type Connector = {
@@ -425,7 +427,8 @@ export type RouteDecision = {
   latency_ms: number;
   jev?: JevDecision | null;
 };
-export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; token?: string };
+export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; expires_at?: string | null; last_used_at?: string | null; expired?: boolean; token?: string };
+export type QueryToolGrant = { id: string; project_id: string; query_tool_id: string; external_client_id: string; enabled: boolean; daily_quota: number | null; created_at: string };
 export type QueryTool = { id: string; name: string; description: string; purpose: string; data_source: string; line_of_business: string; owner: string; tags: string[]; connector_id?: string; upstream_tool_name?: string | null; sql_template: string; parameter_schema: Record<string, unknown>; result_schema: Record<string, unknown>; allowed_relations: string[]; row_limit: number; timeout_seconds: number; requires_approval: boolean; status: string; version: number; updated_at: string };
 export type QueryToolDraft = Omit<QueryTool, "id" | "status" | "version" | "updated_at">;
 export type RelationOption = { asset_id: string; relation: string; source_name: string; connector_id?: string | null; connector_name: string; columns: Dataset["columns"]; tags: string[] };

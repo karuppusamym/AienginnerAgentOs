@@ -2421,8 +2421,14 @@ a {
 
 .semantic-graph-svg {
   width: 100%;
-  height: 460px;
+  height: auto;
   display: block;
+  transform-origin: 0 0;
+}
+
+.graph-scroll {
+  overflow: auto;
+  max-width: 100%;
 }
 
 .graph-legend {
@@ -2503,6 +2509,12 @@ a {
 
 .graph-node.active text {
   font-weight: 600;
+}
+
+.graph-node.dimmed,
+.graph-edge.dimmed {
+  opacity: 0.15;
+  transition: opacity 0.15s ease;
 }
 
 .dataset-toolbar,
@@ -3038,7 +3050,7 @@ a {
 
 .sql-question {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-columns: 24px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   padding: 12px 14px;
@@ -3049,6 +3061,33 @@ a {
   min-width: 0;
   border: 0;
   box-shadow: none;
+}
+
+.sql-question.paste-sql-form {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+}
+
+.sql-question.paste-sql-form textarea {
+  width: 100%;
+}
+
+.sql-hints {
+  padding: 14px;
+}
+
+.sql-hints label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sql-hints textarea {
+  width: 100%;
+  font-weight: 400;
 }
 
 .sql-layout {
@@ -5499,4 +5538,24 @@ th {
   .analytics-picker {
     max-height: 320px;
   }
+}
+
+/* Datasets: profiled-only files (catalogued, no table until staged). */
+.tag.profile-only {
+  margin-left: 6px;
+  border-color: var(--gold-line);
+  background: var(--gold-soft);
+  color: var(--gold-ink);
+  font-size: 10px;
+  vertical-align: 1px;
+}
+
+.inline-note.warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--gold-line);
+  border-radius: 6px;
+  background: var(--gold-soft);
+  color: var(--gold-ink);
+  font-size: 12px;
 }

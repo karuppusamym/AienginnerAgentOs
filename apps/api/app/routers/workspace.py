@@ -94,6 +94,7 @@ from ..models import (
     UserFeedback,
 )
 from ..provider_selection import selected_model_provider
+from ..metadata_generation import suggest_dataset_metadata
 from ..quality import execute_quality_rule
 from ..notebook_runtime import execute_notebook
 from ..observability import elapsed_ms, emit, initialize_observability, request_id, span, status as observability_status
@@ -206,6 +207,9 @@ def list_datasets(
     assets = db.scalars(
         select(DataAsset).where(DataAsset.project_id == project.id).order_by(DataAsset.schema_name, DataAsset.table_name)
     ).all()
+    from ..catalog_scope import queryable_asset_ids
+
+    queryable = queryable_asset_ids(db, project.id, assets)
     output = []
     for asset in assets:
         connector = db.get(Connector, asset.connector_id) if asset.connector_id else None
@@ -227,6 +231,8 @@ def list_datasets(
                 ),
                 "category": dataset_category(asset, connector),
                 "source": source,
+                # False for profiled-only files: catalogued, but no table to query until staged.
+                "queryable": asset.id in queryable,
             }
         )
     return output
@@ -250,6 +256,7 @@ def update_dataset_metadata(
     project = require_current_project(db, user)
     asset = db.get(DataAsset, asset_id)
     require_project_resource(asset, project, "Dataset")
+    was_ai_suggested = asset.metadata_status == "ai_suggested"
     changes: dict[str, Any] = {}
     if payload.description is not None and payload.description != asset.description:
         changes["description"] = {"from": asset.description, "to": payload.description}
@@ -282,6 +289,12 @@ def update_dataset_metadata(
         if column_changes:
             changes["columns"] = column_changes
             asset.columns = updated_columns
+    # A human just reviewed this — an AI suggestion the reviewer didn't
+    # explicitly re-flag with a different status shouldn't keep showing as
+    # unreviewed after they hit Save.
+    if was_ai_suggested and payload.metadata_status is None and asset.metadata_status == "ai_suggested" and changes:
+        changes["metadata_status"] = {"from": "ai_suggested", "to": "reviewed"}
+        asset.metadata_status = "reviewed"
     if changes:
         audit(db, user, "dataset.metadata_updated", "data_asset", asset.id, changes)
         db.commit()
@@ -290,6 +303,33 @@ def update_dataset_metadata(
         asset,
         ["id", "source_name", "schema_name", "table_name", "asset_type", "row_count", "columns", "tags", "description", "connector_id", "owner", "sensitivity", "freshness_sla_hours", "metadata_status"],
     )
+
+
+@router.post("/datasets/{asset_id}/generate-metadata")
+def generate_dataset_metadata(
+    asset_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Suggest a description and column business names/definitions for review.
+
+    Deliberately does not write to the dataset: the caller still has to
+    review the suggestion and hit "Save metadata" through the normal editor,
+    same as if a human had typed it.
+    """
+    require_data_editor(user, db)
+    project = require_current_project(db, user)
+    asset = require_project_resource(db.get(DataAsset, asset_id), project, "Dataset")
+    provider = selected_model_provider(db, user, "metadata_generation")
+    if provider is None:
+        raise HTTPException(status_code=409, detail="No model provider is available for metadata generation. Configure one in Admin > Model providers.")
+    suggestion = suggest_dataset_metadata(
+        provider, asset.schema_name, asset.table_name, asset.columns,
+        governance_business_id=project.id, governance_user_id=user.id,
+    )
+    if suggestion is None:
+        raise HTTPException(status_code=422, detail="The model provider did not return a usable suggestion")
+    return suggestion
 
 
 @router.post("/datasets/import", status_code=201)

@@ -6,10 +6,11 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..connection_guard import ConnectionLimitExceeded
@@ -150,24 +151,65 @@ def _granted_query_tools(db: Session, client: ExternalClient) -> list[QueryTool]
 EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE = int(os.getenv("EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", "60"))
 
 
+def enforce_external_rate_limit(db: Session, client: ExternalClient, action: str, tool_name: str | None = None) -> None:
+    """Per-client limit shared by discovery (list) and invocation.
+
+    Without Redis the limiter uses an in-process sliding window (see
+    app/rate_limit.py), so this never fails open.
+    """
+    rate = check_rate_limit(f"external_client:{client.id}", EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE, 60)
+    if rate.allowed:
+        return
+    details: dict[str, Any] = {"limit_per_minute": rate.limit, "action": action, "project_id": client.default_project_id}
+    if tool_name:
+        details["query_tool"] = tool_name
+    audit(db, None, "external_query_tool.rate_limited", "external_client", client.id, details)
+    db.commit()
+    raise HTTPException(
+        status_code=429,
+        detail=f"Rate limit exceeded: {rate.limit} requests/minute for this client",
+        headers={"Retry-After": str(rate.retry_after_seconds)},
+    )
+
+
+def _utc_day_start(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _enforce_daily_quota(db: Session, client: ExternalClient, tool: QueryTool, grant: QueryToolGrant) -> None:
+    if grant.daily_quota is None:
+        return
+    day_start = _utc_day_start()
+    used = db.scalar(
+        select(func.count(ExternalInvocation.id)).where(
+            ExternalInvocation.external_client_id == client.id,
+            ExternalInvocation.query_tool_id == tool.id,
+            ExternalInvocation.created_at >= day_start,
+        )
+    ) or 0
+    if used < grant.daily_quota:
+        return
+    audit(
+        db, None, "external_query_tool.quota_exceeded", "external_client", client.id,
+        {"daily_quota": grant.daily_quota, "used": used, "query_tool": tool.name, "project_id": tool.project_id},
+    )
+    db.commit()
+    seconds_to_midnight = max(1, int(86_400 - (datetime.now(timezone.utc) - day_start).total_seconds()))
+    raise HTTPException(
+        status_code=429,
+        detail=f"Daily quota exceeded: {grant.daily_quota} invocations/day of {tool.name} for this client",
+        headers={"Retry-After": str(seconds_to_midnight)},
+    )
+
+
 def _invoke_external_query_tool(
     db: Session,
     client: ExternalClient,
     tool: QueryTool,
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
-    rate = check_rate_limit(f"external_client:{client.id}", EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE, 60)
-    if not rate.allowed:
-        audit(
-            db, None, "external_query_tool.rate_limited", "external_client", client.id,
-            {"limit_per_minute": rate.limit, "query_tool": tool.name, "project_id": tool.project_id},
-        )
-        db.commit()
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {rate.limit} requests/minute for this client",
-            headers={"Retry-After": str(rate.retry_after_seconds)},
-        )
+    enforce_external_rate_limit(db, client, "invoke", tool.name)
     grant = db.scalar(
         select(QueryToolGrant).where(
             QueryToolGrant.query_tool_id == tool.id,
@@ -180,6 +222,7 @@ def _invoke_external_query_tool(
     if tool.requires_approval:
         raise HTTPException(status_code=409, detail="This tool requires an interactive portal approval")
     _validate_tool_parameters(tool.parameter_schema, parameters)
+    _enforce_daily_quota(db, client, tool, grant)
     invocation = ExternalInvocation(
         project_id=tool.project_id,
         external_client_id=client.id,

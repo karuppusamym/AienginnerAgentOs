@@ -108,6 +108,16 @@ def _ensure_project_columns(connection: Connection) -> None:
             connection.execute(text("ALTER TABLE learning_suggestions ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1"))
         if "severity" not in suggestion_columns:
             connection.execute(text("ALTER TABLE learning_suggestions ADD COLUMN severity VARCHAR(16) NOT NULL DEFAULT 'normal'"))
+    timestamp_type = "TIMESTAMP WITH TIME ZONE" if dialect_name == "postgresql" else "DATETIME"
+    if "external_clients" in existing_tables:
+        client_columns = {column["name"] for column in inspector.get_columns("external_clients")}
+        for column_name in ("expires_at", "last_used_at"):
+            if column_name not in client_columns:
+                connection.execute(text(f"ALTER TABLE external_clients ADD COLUMN {column_name} {timestamp_type}"))
+    if "query_tool_grants" in existing_tables:
+        grant_columns = {column["name"] for column in inspector.get_columns("query_tool_grants")}
+        if "daily_quota" not in grant_columns:
+            connection.execute(text("ALTER TABLE query_tool_grants ADD COLUMN daily_quota INTEGER"))
     if "agent_definitions" in existing_tables:
         agent_columns = {column["name"] for column in inspector.get_columns("agent_definitions")}
         if "query_tool_names" not in agent_columns:

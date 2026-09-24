@@ -51,6 +51,7 @@ MODEL_PURPOSES: dict[str, str] = {
     "risk_check": "Consequential-action check (escalates approvals only)",
     "sql_candidate_judge": "SQL candidate tie-breaker",
     "tool_selection": "Tool choice for each agent step",
+    "metadata_generation": "Catalog metadata auto-description",
 }
 # generation: needs a text model; decision: needs a decision model (Jev); either: both work.
 PURPOSE_KIND: dict[str, str] = {purpose: "generation" for purpose in MODEL_PURPOSES}
@@ -59,12 +60,17 @@ DECISION_PROVIDER_TYPES = {"jev"}
 
 
 def provider_capability(provider: ModelProvider) -> str:
+    # "local": the deterministic on-prem model. Routing a decision purpose to it keeps that
+    # project's decisions local (no request text leaves the deployment).
+    if provider.provider_type == "local_mock":
+        return "local"
     return "decision" if provider.provider_type in DECISION_PROVIDER_TYPES else "generation"
 
 
 def purpose_accepts(purpose: str, provider: ModelProvider) -> bool:
     kind = PURPOSE_KIND.get(purpose, "generation")
-    return kind == "either" or kind == provider_capability(provider)
+    capability = provider_capability(provider)
+    return kind == "either" or capability == "local" or kind == capability
 _FAILED_STATUSES = {"failed", "error", "unhealthy", "configuration_required"}
 
 
@@ -84,6 +90,8 @@ def routed_only_provider(db: Session, user: User, purpose: str) -> ModelProvider
     route = db.scalar(select(ModelRoute).where(ModelRoute.purpose == purpose, ModelRoute.project_id == project_id)) if project_id else None
     route = route or db.scalar(select(ModelRoute).where(ModelRoute.purpose == purpose, ModelRoute.project_id.is_(None)))
     provider = db.get(ModelProvider, route.provider_id) if route is not None else None
+    if provider is not None and provider_capability(provider) == "local" and PURPOSE_KIND.get(purpose) == "decision":
+        return None  # routed to local: no external decision model for this project (local scorer / rules decide)
     return provider if _usable(provider) and purpose_accepts(purpose, provider) else None
 
 

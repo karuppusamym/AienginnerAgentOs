@@ -523,10 +523,16 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
         void invalidate(scopes.approvals, scopes.jobs);
         notify(run.approval_id ? (run.plan_bound && run.plan_hash ? `Plan ${run.plan_hash.slice(0, 12)} is waiting in Approvals` : "Agent run is waiting in Approvals") : `Agent run ${run.status.toLowerCase()}`);
       } else if (action.route === "query_tool" && action.target) {
-        const result = await api<SQLExecutionResult>(`/query-tools/${action.target.id}/test`, { method: "POST", body: JSON.stringify({ parameters: {} }) });
-        setToolResults((current) => ({ ...current, [message.id]: { tool: action.target!.name, result } }));
-        setInspectId(message.id); setTab("result");
-        notify(`${action.target.name} returned ${result.row_count} rows`);
+        try {
+          const result = await api<SQLExecutionResult>(`/query-tools/${action.target.id}/test`, { method: "POST", body: JSON.stringify({ parameters: {} }) });
+          setToolResults((current) => ({ ...current, [message.id]: { tool: action.target!.name, result } }));
+          setInspectId(message.id); setTab("result");
+          notify(`${action.target.name} returned ${result.row_count} rows`);
+        } catch (reason) {
+          // Running a query tool needs the query-runner permission (viewers are read-only).
+          if (reason instanceof ApiError && reason.status === 403) { notify(`You do not have permission to run ${action.target.name}. Ask a project maintainer for query access.`, "error"); return; }
+          throw reason;
+        }
       }
     } catch (reason) { notify(reason instanceof Error ? reason.message : "Action failed", "error"); }
   }

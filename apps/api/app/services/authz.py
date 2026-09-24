@@ -4,6 +4,7 @@ Also authenticates external (machine) clients from their bearer token.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -97,6 +98,23 @@ def _external_client_from_header(
     client = db.scalar(select(ExternalClient).where(ExternalClient.client_id == client_id))
     if client is None or not client.active or not verify_password(secret, client.secret_hash):
         raise HTTPException(status_code=401, detail="Invalid external client token")
+    now = datetime.now(timezone.utc)
+    expires_at = client.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:  # SQLite returns naive datetimes; values are stored in UTC
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now:
+            raise HTTPException(status_code=401, detail="External client token has expired; rotate it to issue a new one")
     if required_scope not in client.scopes:
         raise HTTPException(status_code=403, detail=f"Missing scope: {required_scope}")
+    # Cheap usage stamp: written at most once a minute and committed with the
+    # caller's own transaction (invocation / audit), not by a separate write here.
+    last_used = client.last_used_at
+    if last_used is not None and last_used.tzinfo is None:
+        last_used = last_used.replace(tzinfo=timezone.utc)
+    if last_used is None or now - last_used >= timedelta(seconds=EXTERNAL_CLIENT_LAST_USED_RESOLUTION_SECONDS):
+        client.last_used_at = now
     return client
+
+
+EXTERNAL_CLIENT_LAST_USED_RESOLUTION_SECONDS = 60

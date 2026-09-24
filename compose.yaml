@@ -85,6 +85,10 @@ services:
       SUPERSET_EDITOR_SSO_SECRET: ${SUPERSET_EDITOR_SSO_SECRET:-datapilot-local-editor-sso-secret-change-me}
       ENABLE_DEMO_DATA: ${ENABLE_DEMO_DATA:-false}
       TOOL_HTTP_ALLOWLIST: ${TOOL_HTTP_ALLOWLIST:-localhost,127.0.0.1,superset,mcp-toolbox}
+      # Compose services resolve to private IPs; the allowlist above still limits which hosts HTTP tools may call.
+      TOOL_HTTP_ALLOW_PRIVATE: ${TOOL_HTTP_ALLOW_PRIVATE:-true}
+      SQL_VOTE_MODE: ${SQL_VOTE_MODE:-cascade}
+      APPROVAL_SEPARATION_OF_DUTIES: ${APPROVAL_SEPARATION_OF_DUTIES:-false}
       SQLSERVER_DEMO_CREDENTIALS: ${SQLSERVER_DEMO_CREDENTIALS:-{"server":"sqlserver-demo,1433","database":"DemoDB","username":"sa","password":"DataPilot#2026!"}}
       POSTGRES_DEMO_CREDENTIALS: ${POSTGRES_DEMO_CREDENTIALS:-{"host":"postgres-demo","port":5432,"database":"demodb","username":"demouser","password":"DemoPass#2026!"}}
       OTEL_ENABLED: ${OTEL_ENABLED:-false}

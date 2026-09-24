@@ -30,7 +30,8 @@ from app import temporal_activities as runtime
 from app import temporal_runtime
 from app.database import SessionLocal
 from app.main import app
-from app.models import Approval, Job, ProjectMembership, User
+from app.models import AgentDefinition, AgentVersion, Approval, AuditEvent, Job, ModelProvider, ProjectMembership, ToolExecution, User
+from app.tool_runtime import ToolRuntimeError
 
 SAFE_PLAN = [
     {"agent": "Planner", "action": "Decompose objective and set limits"},
@@ -87,6 +88,8 @@ class AgentRuntimeTests(unittest.TestCase):
             for job_id in cls.created_jobs:
                 for approval in db.scalars(select(Approval).where(Approval.job_id == job_id)).all():
                     db.delete(approval)
+                for execution in db.scalars(select(ToolExecution).where(ToolExecution.job_id == job_id)).all():
+                    db.delete(execution)
             db.flush()
             for job_id in cls.created_jobs:
                 job = db.get(Job, job_id)
@@ -484,6 +487,295 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIs(a, b)
         self.assertIsNot(a, c)
         self.assertEqual(connect.await_count, 2)
+
+    # -- agent configuration read at run time (section 5 items 1/2/4/5/8) ------
+    def _agent(self, tool_names: list[str], autonomy: int = 2, instructions: str = "Test agent.", provider_id: str | None = None) -> str:
+        """A throwaway enabled agent with one published version; removed after the test."""
+        name = f"Runtime Test Agent {uuid4().hex[:8]}"
+        with SessionLocal() as db:
+            agent = AgentDefinition(name=name, purpose="Runtime test agent", autonomy_level=autonomy, tool_names=tool_names, policy={})
+            db.add(agent)
+            db.flush()
+            db.add(AgentVersion(agent_id=agent.id, version=1, instructions=instructions, model_provider_id=provider_id, tool_names=tool_names, status="published", created_by=self.admin_id))
+            db.commit()
+            agent_id = agent.id
+
+        def cleanup() -> None:
+            with SessionLocal() as db:
+                for version in db.scalars(select(AgentVersion).where(AgentVersion.agent_id == agent_id)).all():
+                    db.delete(version)
+                db.flush()
+                agent_row = db.get(AgentDefinition, agent_id)
+                if agent_row is not None:
+                    db.delete(agent_row)
+                db.commit()
+
+        self.addCleanup(cleanup)
+        return name
+
+    def test_step_autonomy_is_narrowed_by_the_agents_registry_level(self) -> None:
+        self.assertEqual(runtime._effective_autonomy(1, SimpleNamespace(autonomy_level=3)), 1)  # never widens
+        self.assertEqual(runtime._effective_autonomy(2, SimpleNamespace(autonomy_level=1)), 1)
+        self.assertEqual(runtime._effective_autonomy(2, SimpleNamespace(autonomy_level=None)), 2)
+        name = self._agent(["catalog.search"], autonomy=0)
+        job_id = self._job("Search the catalog for accounts")
+        with SessionLocal() as db, mock.patch.object(runtime, "execute_tool") as execute_tool:
+            job = db.get(Job, job_id)
+            evidence, logs, _ = runtime._execute_bound_tools(db, job, [{"agent": name, "action": "Search the catalog"}], job.title, autonomy_level=2)
+        execute_tool.assert_not_called()
+        self.assertEqual(evidence, [])
+        self.assertTrue(any("runs at autonomy level 0" in entry["message"] for entry in logs))
+
+    def test_agent_version_provider_and_instructions_drive_parameter_fill(self) -> None:
+        with SessionLocal() as db:
+            provider = ModelProvider(name=f"Agent pinned {uuid4().hex[:6]}", provider_type="openai", default_model="gpt-test", enabled=True, status="healthy")
+            db.add(provider)
+            db.commit()
+            provider_id = provider.id
+        self.addCleanup(lambda: self._delete(ModelProvider, provider_id))  # runs after the agent cleanup (LIFO)
+        instructions = "You profile governed datasets for the risk team. " + "x" * 900
+        name = self._agent(["dataset.profile"], instructions=instructions, provider_id=provider_id)
+        routed = SimpleNamespace(id="routed", provider_type="openai", name="Routed", default_model="routed")
+        job_id = self._job("Profile something unnamed")
+        with SessionLocal() as db:
+            job = db.get(Job, job_id)
+            version = db.scalar(select(AgentVersion).join(AgentDefinition, AgentDefinition.id == AgentVersion.agent_id).where(AgentDefinition.name == name))
+            self.assertEqual(runtime._agent_provider(db, job, version, routed).id, provider_id)
+            self.assertIs(runtime._agent_provider(db, job, SimpleNamespace(model_provider_id=None), routed), routed)
+            # No asset is named, so the heuristic fails and the model fill gets the agent's provider + clipped instructions.
+            fill = mock.Mock(return_value=None)
+            with mock.patch.object(runtime, "_llm_parameters_for_tool", fill), mock.patch.object(runtime, "execute_tool") as execute_tool:
+                runtime._execute_bound_tools(db, job, [{"agent": name, "action": "Profile it"}], job.title, routed)
+            execute_tool.assert_not_called()
+            self.assertEqual(fill.call_args.args[1].id, provider_id)
+            passed_instructions = fill.call_args.args[7]
+            self.assertTrue(passed_instructions.startswith("You profile governed datasets"))
+            self.assertLessEqual(len(passed_instructions), runtime.AGENT_INSTRUCTIONS_PROMPT_CHARS)
+            # An unusable pinned provider falls back to the routed one.
+            db.get(ModelProvider, provider_id).enabled = False
+            db.flush()
+            self.assertIs(runtime._agent_provider(db, job, version, routed), routed)
+            db.rollback()
+            # So does a local_mock pin (it cannot fill parameters or reflect).
+            db.get(ModelProvider, provider_id).provider_type = "local_mock"
+            db.flush()
+            self.assertIs(runtime._agent_provider(db, job, version, routed), routed)
+            db.rollback()
+            # The instructions reach the parameter-fill system prompt as context.
+            generated = mock.Mock(return_value=SimpleNamespace(content="{}", latency_ms=1))
+            with mock.patch.object(runtime, "generate_text", generated):
+                self.assertIsNone(runtime._llm_parameters_for_tool(db, routed, {"required": ["asset_id"], "properties": {"asset_id": {"type": "string"}}}, "x", self.project_id, "dataset.profile", job, "Only profile finance tables."))
+            self.assertIn("Only profile finance tables.", generated.call_args.args[1])
+            self.assertIn("cannot relax", generated.call_args.args[1])
+            db.rollback()
+
+    def _delete(self, model, row_id: str) -> None:
+        with SessionLocal() as db:
+            row = db.get(model, row_id)
+            if row is not None:
+                db.delete(row)
+                db.commit()
+
+    def test_planner_prompt_carries_agent_registry_instructions(self) -> None:
+        marker = f"Marker-{uuid4().hex[:8]} owns reconciliation of ledger balances."
+        name = self._agent(["catalog.search"], instructions=marker)
+        job_id = self._job("Reconcile the ledger")
+        plan_json = '[{"agent": "Planner", "action": "Scope"}, {"agent": "Metadata", "action": "Ground"}, {"agent": "%s", "action": "Reconcile"}]' % name
+        generated = mock.Mock(return_value=SimpleNamespace(content=plan_json, latency_ms=3))
+        fake = SimpleNamespace(id="p1", provider_type="openai", name="Fake", default_model="fake")
+        with SessionLocal() as db:
+            job = db.get(Job, job_id)
+            with mock.patch.object(runtime, "_job_provider", return_value=fake), mock.patch.object(runtime, "generate_text", generated):
+                planned = runtime._plan_for_job(db, job, "Reconcile the ledger")
+            db.rollback()
+        self.assertEqual(planned["source"], "model")
+        system_prompt = generated.call_args.args[1]
+        self.assertIn(f"- {name}: {marker}", system_prompt)
+        self.assertIn("never override", system_prompt)
+
+    def test_reflection_retries_draw_from_the_tool_call_budget_and_are_audited(self) -> None:
+        name = self._agent(["catalog.search"])
+        job_id = self._job("Search the catalog for accounts")
+        budget = {"remaining": 2}
+        with SessionLocal() as db, \
+                mock.patch.object(runtime, "execute_tool", side_effect=ToolRuntimeError("boom")) as execute_tool, \
+                mock.patch.object(runtime, "_reflect_on_tool_error", return_value={"query": "accounts"}):
+            job = db.get(Job, job_id)
+            _, logs, outputs = runtime._execute_bound_tools(db, job, [{"agent": name, "action": "Search the catalog"}], job.title, budget=budget)
+            db.flush()  # SessionLocal does not autoflush
+            executions = [
+                SimpleNamespace(status=row.status, error=row.error, created_by=row.created_by)
+                for row in db.scalars(select(ToolExecution).where(ToolExecution.job_id == job_id)).all()
+            ]
+            db.rollback()
+        # First call + one reflection retry; the second repair is refused because the budget is spent.
+        self.assertEqual(execute_tool.call_count, 2)
+        self.assertEqual(budget["remaining"], 0)
+        self.assertTrue(any("tool-call budget exhausted" in entry["message"] for entry in logs))
+        self.assertEqual(sum(1 for item in outputs if item["type"] == "tool_error"), 1)
+        self.assertEqual([item.status for item in executions], ["FAILED", "FAILED"])
+        self.assertTrue(all(item.error == "boom" and item.created_by == self.admin_id for item in executions))
+
+    def test_agent_tool_calls_write_tool_execution_rows(self) -> None:
+        name = self._agent(["catalog.search"])
+        job_id = self._job("Search the catalog for accounts")
+        result = ({"count": 3, "results": [{"name": "accounts"}]}, 1, 12)
+        with mock.patch.object(runtime, "execute_tool", return_value=result):
+            with SessionLocal() as db:
+                job = db.get(Job, job_id)
+                evidence, _, _ = runtime._execute_bound_tools(db, job, [{"agent": name, "action": "Search the catalog"}], job.title)
+                db.commit()
+        with SessionLocal() as db:
+            executions = db.scalars(select(ToolExecution).where(ToolExecution.job_id == job_id)).all()
+        self.assertEqual(len(executions), 1)
+        execution = executions[0]
+        self.assertEqual(execution.status, "SUCCEEDED")
+        self.assertEqual(execution.created_by, self.admin_id)
+        self.assertEqual(execution.duration_ms, 12)
+        self.assertEqual(execution.result.get("count"), 3)
+        self.assertIn("query", execution.parameters)
+        self.assertIsNotNone(execution.completed_at)
+        self.assertEqual(evidence[0]["tool"], "catalog.search")
+        # The registry's usage view now sees the agent's call.
+        history = self.client.get("/tools/executions", headers=self.headers).json()
+        self.assertTrue(any(item["id"] == execution.id and item["job_id"] == job_id for item in history))
+
+    def test_run_time_budget_skips_remaining_steps_and_partially_succeeds(self) -> None:
+        job_id = self._job()
+        with mock.patch.object(runtime, "_plan_for_job", return_value=_planned()):
+            runtime._prepare_agent_run(job_id, "Summarize available customer data")
+        self.assertIn("started_at", runtime._runtime(self._load(job_id)))
+        with SessionLocal() as db:
+            job = db.get(Job, job_id)
+            runtime._set_runtime(job, started_at=(runtime.datetime.now(runtime.timezone.utc) - runtime.timedelta(seconds=301)).isoformat())
+            db.commit()
+        with mock.patch.dict(os.environ, {"AGENT_RUN_MAX_SECONDS": "300"}), \
+                mock.patch.object(runtime, "_execute_bound_tools") as tools:
+            first = runtime._execute_agent_step(job_id, 0)
+            later = runtime._execute_agent_step(job_id, 2)
+            self.assertEqual(runtime._review_agent_plan(job_id)["pending_steps"], [])
+            final = runtime._finalize_agent_run(job_id)
+        tools.assert_not_called()
+        self.assertEqual(first["status"], "SKIPPED")
+        self.assertEqual(later["status"], "ALREADY_COMPLETED")
+        self.assertEqual(final["status"], "PARTIALLY_SUCCEEDED")
+        job = self._load(job_id)
+        self.assertEqual(job.status, "PARTIALLY_SUCCEEDED")
+        self.assertTrue(all(step["status"] == "skipped" and step["skip_reason"] == "run time budget exceeded" for step in job.plan))
+        self.assertTrue(any("Run time budget exceeded" in entry["message"] for entry in job.logs))
+        self.assertTrue(any(item.get("type") == "limit" and "run time budget exceeded" in item["label"] for item in job.evidence))
+        # Inside a step the loop also stops at the deadline.
+        self.assertTrue(runtime._past_deadline({"deadline": runtime.datetime.now(runtime.timezone.utc) - runtime.timedelta(seconds=1)}))
+        self.assertFalse(runtime._past_deadline({"remaining": 3}))
+
+    def test_limit_label_reflects_enforced_budget(self) -> None:
+        with mock.patch.dict(os.environ, {"AGENT_RUN_MAX_SECONDS": "90"}):
+            self.assertEqual(runtime.agent_run_limit_label(), f"{runtime.MAX_PLAN_STEPS} plan steps / {runtime.AGENT_TOOL_CALL_BUDGET} tool calls / 90 second budget")
+        with mock.patch.dict(os.environ, {"AGENT_RUN_MAX_SECONDS": "300"}):
+            self.assertIn("/ 5 minute budget", runtime.agent_run_limit_label())
+            run = self._start_risky_run("Delete stale staging rows for the limit label check")
+            job = self.client.get(f"/jobs/{run['job_id']}", headers=self.headers).json()
+            self.assertIn({"type": "limit", "label": runtime.agent_run_limit_label()}, job["evidence"])
+
+    def test_medium_risk_tools_run_only_inside_a_human_approved_run(self) -> None:
+        name = self._agent(["sql.preview", "pipeline.stage"])
+        objective = "Preview SELECT 1 AS n"
+        job_id = self._job(objective)
+        step = {"agent": name, "action": "Preview the query"}
+        preview_result = ({"row_count": 1, "rows": [{"n": 1}]}, 1, 5)
+        with SessionLocal() as db:
+            job = db.get(Job, job_id)
+            # Not approved: sql.preview (medium) is not eligible and never runs.
+            self.assertEqual(runtime._eligible_step_tools(db, job, ["sql.preview", "pipeline.stage"], [], 2), {})
+            with mock.patch.object(runtime, "execute_tool", return_value=preview_result) as execute_tool:
+                runtime._execute_bound_tools(db, job, [step], objective)
+            execute_tool.assert_not_called()
+            approval = Approval(project_id=self.project_id, job_id=job_id, title="Approve", action_type="agent_execution", status="pending", requested_by=self.admin_id, evidence={})
+            db.add(approval)
+            db.flush()
+            runtime._set_runtime(job, approval_id=approval.id)
+            db.commit()
+            # A pending approval is not an approval.
+            self.assertIsNone(runtime._human_approval_id(db, job))
+            approval.status = "approved"
+            db.commit()
+            approval_id = runtime._human_approval_id(db, job)
+            self.assertEqual(approval_id, approval.id)
+            # Same eligible set Jev tool selection sees; high-risk/approval-gated pipeline.stage stays out.
+            self.assertEqual(set(runtime._eligible_step_tools(db, job, ["sql.preview", "pipeline.stage"], [], 2, approval_id)), {"sql.preview"})
+            self.assertEqual(runtime._eligible_step_tools(db, job, ["sql.preview"], [], 1, approval_id), {})  # level 1 stays read-only
+            with mock.patch.object(runtime, "execute_tool", return_value=preview_result) as execute_tool:
+                runtime._execute_bound_tools(db, job, [{**step, "origin": "reviewer"}], objective)
+                execute_tool.assert_not_called()  # reviewer steps were not seen by the approver
+                runtime._execute_bound_tools(db, job, [step], objective, autonomy_level=1)
+                execute_tool.assert_not_called()
+                evidence, _, _ = runtime._execute_bound_tools(db, job, [step], objective)
+            self.assertEqual(execute_tool.call_count, 1)
+            self.assertEqual(execute_tool.call_args.args[2], "sql.preview")
+            self.assertTrue(evidence[0]["under_approval"])
+            self.assertEqual(evidence[0]["approval_id"], approval_id)
+            self.assertIn("ran under approval", evidence[0]["label"])
+            db.rollback()
+
+    def test_publishing_an_agent_version_requires_a_passing_evaluation_score(self) -> None:
+        created = self.client.post("/agents", headers=self.headers, json={"name": f"Publish Gate {uuid4().hex[:8]}", "purpose": "Gate test", "instructions": "v1", "tool_names": ["catalog.search"]})
+        self.assertEqual(created.status_code, 201, created.text)
+        agent_id = created.json()["id"]
+
+        def cleanup() -> None:
+            with SessionLocal() as db:
+                for version in db.scalars(select(AgentVersion).where(AgentVersion.agent_id == agent_id)).all():
+                    db.delete(version)
+                db.flush()
+                db.delete(db.get(AgentDefinition, agent_id))
+                db.commit()
+
+        self.addCleanup(cleanup)
+
+        def set_score(version: int, score: float | None) -> None:
+            with SessionLocal() as db:
+                db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent_id, AgentVersion.version == version)).evaluation_score = score
+                db.commit()
+
+        publish = lambda version, query="": self.client.post(f"/agents/{agent_id}/versions/{version}/publish{query}", headers=self.headers)
+        unscored = publish(1)
+        self.assertEqual(unscored.status_code, 409)
+        self.assertIn("no evaluation score", unscored.json()["detail"])
+        set_score(1, 50.0)  # scorecard scores are 0-100
+        self.assertEqual(publish(1).status_code, 409)
+        set_score(1, 90.0)
+        with mock.patch.dict(os.environ, {"AGENT_PUBLISH_MIN_SCORE": "0.95"}):
+            self.assertEqual(publish(1).status_code, 409)
+        passed = publish(1)
+        self.assertEqual(passed.status_code, 200, passed.text)
+        self.assertEqual(passed.json()["status"], "published")
+        second = self.client.post(f"/agents/{agent_id}/versions", headers=self.headers, json={"instructions": "v2", "tool_names": ["catalog.search"]})
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(publish(2).status_code, 409)
+        # A non-admin registry writer cannot force past the gate.
+        from fastapi import Depends
+        from app.auth import get_current_user
+        from app.database import get_db
+
+        def as_engineer(db=Depends(get_db)):
+            user = db.get(User, self.admin_id)
+            db.expunge(user)
+            user.role = "engineer"
+            return user
+
+        app.dependency_overrides[get_current_user] = as_engineer
+        try:
+            refused = publish(2, "?force=true")
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+        self.assertEqual(refused.status_code, 409, refused.text)
+        forced = publish(2, "?force=true")  # the test user is an admin
+        self.assertEqual(forced.status_code, 200, forced.text)
+        with SessionLocal() as db:
+            statuses = {version.version: version.status for version in db.scalars(select(AgentVersion).where(AgentVersion.agent_id == agent_id)).all()}
+            events = db.scalars(select(AuditEvent).where(AuditEvent.entity_id == agent_id, AuditEvent.event_type == "agent.version_published").order_by(AuditEvent.created_at)).all()
+        self.assertEqual(statuses, {1: "retired", 2: "published"})
+        self.assertEqual([(event.details["version"], event.details["force"]) for event in events], [(1, False), (2, True)])
 
 
 if __name__ == "__main__":

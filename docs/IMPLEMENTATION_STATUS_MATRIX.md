@@ -1,14 +1,111 @@
 # DataPilot Agent OS — Implementation Status Matrix
 
 **Purpose:** a single completed / partial / not-completed checklist, reconciled directly against the code (not just prior documentation), for presentation and tracking use.
-**Method:** cross-checked against `apps/api/app/routers/*.py` (177 endpoints across 26 domain routers), `apps/api/app/models.py`, and `apps/web/app/components/*.tsx`. Backend test suite independently re-run from a clean install (venv at `apps/api/.venv`): **98/98 passing**, all four test files (`test_api.py`, `test_connection_guard.py`, `test_new_endpoints.py`, `test_vector_store.py`) genuinely isolated. Frontend `npx tsc --noEmit` and `next build`: both clean. `pyflakes app/` run across the whole backend package: zero undefined-name findings — the specific bug class ("symbol used but never imported") that broke 8 routers in an earlier pass does not currently exist anywhere in the codebase.
-**Last reconciled:** August 16, 2026 (seventeenth reconciliation pass, this revision — see change log). **Note: this masthead itself was stale between the eleventh and the fourteenth pass** — two full reconciliation passes (twelfth: RBAC/gateway-search fixes, 93/93 passing; thirteenth: a Docker 404 fix) had already landed and were reflected in the change log below, but this masthead and several §2 rows still described the eleventh pass's state as current. Corrected in the fourteenth pass, and flagged as a process gap there: **update the masthead in the same edit as any change-log entry that changes test counts or closes a gap**, not as a separate follow-up pass. This revision follows that rule.
+**Method:** cross-checked against `apps/api/app/routers/*.py`, `apps/api/app/models.py`, Alembic revisions `0001`–`0006` and `apps/web/app/components/*.tsx`, and driven live on the Docker Compose stack (`docker compose --profile analytics up -d --build`). Backend suite: **211 passed, 1 skipped** (`cd apps/api && python -m pytest tests -q`). Web: `tsc --noEmit` clean, `tests/app-source.test.mjs` 7/7.
+**Last reconciled:** September 24, 2026 (eighteenth pass: the September architecture review and its closure; see [§0](#0-september-2026-review--closure-tracker-current) and the change log). Rows in §1–§8 are the August state unless §0 says otherwise.
 
 > **Read this before trusting any status row below that predates this revision:** the previous revision of this document (the one ending in the "Superset dashboard-collision fix" change-log entry) was reconciled against code that, as of this pass, **did not actually run** — 8 routers referenced `require_permission`/`project_permissions`/`current_membership` without importing them, and every write path through those routers raised a live `NameError`. That prior revision's "70/70 passing" masthead claim was written either just before this regression landed or without re-running the suite after it. This revision fixes the regression and re-verifies from an actual green test run, not from reading the previous revision's prose.
 
 Status legend: ✅ Done · 🟡 Partial · 🔴 Not started/Not certified
 
 > **Note on how to read this document:** multiple independent rounds of work have landed in this codebase between revisions of this doc — not all of them mine, and at least one landed *while this exact revision was being written* (confirmed by a file-changed-on-disk warning mid-edit). This pass found real, working code for three things an earlier revision of this document had called out as open gaps: bounded multi-hop lineage traversal (`/lineage/graph`), permission-map-backed write authorization (`require_permission`), and PII detection/masking on governed query results (`app/pii.py`). Each was verified by reading the actual implementation and, where practical, exercising it — not by trusting a changelog line. The methodology stays constant: cross-check against the code as it stands right now, not against any round's — including this document's own previous version's — self-description.
+
+## 0. September 2026 review — closure tracker (current)
+
+This section covers the devil's-advocate review of the whole app (UI and API), the Jev decision
+model, the learning loop, embedded analytics and the agent/tool hardening. Detail lives in
+[ARCHITECTURE_REVIEW_2026-09.md](ARCHITECTURE_REVIEW_2026-09.md),
+[LEARNING_LOOP.md](LEARNING_LOOP.md), [AGENTS_TOOLS_AND_JEV.md](AGENTS_TOOLS_AND_JEV.md) and
+[ANALYTICS_EMBEDDING.md](ANALYTICS_EMBEDDING.md).
+
+### 0.1 Review findings (security, reliability, structure)
+
+| Item | Status | Evidence |
+|---|---|---|
+| C1 app DB reachable from user/model SQL | ✅ | `STAGING_DATABASE_URL` → SELECT-only `datapilot_reader`; Postgres denies it `users` (verified live) |
+| C2 membership used instead of permission | ✅ | `roles.py` project role authoritative; viewer blocked from SQL/agents/tools |
+| C3 synchronous ask / lock across LLM calls | ✅ | SSE streaming `POST /conversations/{id}/messages/stream`; user turn written after generation |
+| C4 blocking calls in async endpoints | ✅ | `run_in_threadpool` on local agent paths |
+| H1 regex SQL guard | ✅ | `sql_guard.py` (sqlglot, per dialect) on every execution path |
+| H2 prompt injection | ✅ | Untrusted context fenced; catalogued relations only; repair then deterministic fallback |
+| H3 cache | ✅ | SQL only, never rows; TTL; failures never cached |
+| H4 silent provider fallback | ✅ | Per-purpose `model_routes`; unavailable routed provider → 409 |
+| H5 approval not bound to plan | ✅ | Frozen plan + `plan_hash`, verified before every step |
+| H6 Temporal durability | ✅ | One activity per step, idempotency keys, deterministic workflow IDs |
+| M1–M6 (structure, migrations, hot paths, project pinning, auth/secrets, notebook freeze) | ✅ | `core.py` facade + `services/`; Alembic 0001–0006; indexes; `X-Project-Id`; httpOnly cookie + CSRF header; killable notebook cells |
+| Web review items (URLs, 401, cookie auth, a11y, dark mode, TanStack Query, App Router) | ✅ | `app/(workspace)/…` routes, `lib/queries.tsx` |
+| Frictionless (Open Knowledge Foundation) Data Package interchange | ✅ | `GET /datapackage`, `/datasets/{id}/datapackage`, validate, descriptive-only import |
+
+### 0.2 Chat, decisions and Jev
+
+| Item | Status | Evidence |
+|---|---|---|
+| 3-panel Analysis chat rebuilt (threads · answer · inspector) | ✅ | `ConversationsView.tsx`; route, Jev decision, ensemble, learning sections in the inspector |
+| Data-driven charts (KPI, line, bar, grouped/stacked bar, pie, scatter, table) with a switcher | ✅ | `app/charts.py` `infer_chart`; `components/charts.tsx` |
+| Jev as a declared decision-model provider (`typesafe/jev-1.13` via OpenRouter) | ✅ | Seeded when `OPENROUTER_API_KEY` is set; decision models can't serve generation purposes |
+| Jev decides route **and which agent / query tool** | ✅ | Up to 3 agent options (`decision_router.local_scores`); catalog evidence in Jev's option text |
+| Jev consequential-action check (escalate only) | ✅ | "Copy all customer records…" escalated at p ≈ 0.9 while rules missed it (live) |
+| Jev picks the tool for each agent step | ✅ | `_select_step_tools`, `jev_client.choose_tools`; `tool_choice` evidence in the run trace |
+| Jev SQL tie-break | ✅ | `sql_candidate_judge` on split votes |
+| Router's chosen agent carried into the run | ✅ | `agent_id` on `POST /agents/runs`; lead agent owns a plan step |
+| Measured accuracy | ✅ | 11 labelled routes: Jev 100% (~370 ms), keyword scorer 73%; earlier run Gemini 100% at 1075 ms |
+| Tool-choice evaluation | ✅ | `POST /router/evaluate-tools`; Learning → Router panel |
+| Usage per decision type | ✅ | `GET /model-usage` → `by_purpose` |
+| Live proof report | ✅ | `scripts/demo_jev_agents.py` → `docs/demo/`; published proof page |
+| Data residency (keep a project's decisions on-prem) | ✅ | Route decision purposes to the local deterministic model ("on-prem, no external call") |
+
+### 0.3 Learning loop and SQL
+
+| Item | Status | Evidence |
+|---|---|---|
+| Verified-query memory (exact reuse, few-shot, 👍 capture, 👎 review) | ✅ | `learning.py`, `routers/learning.py` |
+| GEPA prompt optimisation (offline, approval to activate) | ✅ | `gepa.py`; safety clause always appended |
+| Multi-model SQL vote with semantic agreement | ✅ | `learning.vote_candidates`, `results_agree` |
+| Cascade vote (the expensive third model only on disagreement) | ✅ | `SQL_VOTE_MODE=cascade` default; live: 2/2 agreement, Sonnet 5 not called |
+| DDL is suggestion-only, driven by slow queries | ✅ | `SLOW_QUERY_MS` (500); `ddl_suggestion` artifacts; runs only with `ALLOW_DDL_EXECUTION=true` + approval |
+| Profiled-only files broke SQL generation | ✅ Fixed | `catalog_scope.py`; Datasets "profile only" tag |
+
+### 0.4 Embedded analytics (Superset)
+
+| Item | Status | Evidence |
+|---|---|---|
+| "No address associated with hostname" | ✅ | Availability check + guidance; analytics profile documented |
+| Blank dashboards (charts taken by other dashboards, text-typed columns, dropped layout rows) | ✅ | Per-dashboard chart names, inferred column types, row wrapping; verified in Superset |
+| Dashboard picker: project dashboard, published queries, datasets by source | ✅ | `GET /analytics/dashboards`, `POST /analytics/datasets/{id}/guest-token`, `SupersetView.tsx` |
+| Scope and governance | ✅ | Project-scoped; restricted datasets admin-only; PII columns excluded; audited |
+
+### 0.5 Agents, tools and external gateway (16 items)
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Agent configuration read at run time (autonomy cap, provider pin, instructions) | ✅ |
+| 2 | Budget enforced (reflection counts; `AGENT_RUN_MAX_SECONDS`; `PARTIALLY_SUCCEEDED`) | ✅ |
+| 3 | Built-in tool timeouts; project-scoped `sql.preview` | ✅ |
+| 4 | Agent tool calls write `ToolExecution` rows | ✅ (verified live: 7 rows for one run) |
+| 5 | Medium-risk tools only after human approval | ✅ |
+| 6 | HTTP egress: private-IP block, IP pinning, response cap | ✅ |
+| 7 | Separation of duties on approvals (`APPROVAL_SEPARATION_OF_DUTIES`) | ✅ (on in Kubernetes) |
+| 8 | Agent publish gate (`AGENT_PUBLISH_MIN_SCORE`, audited admin force) | ✅ |
+| 9 | External client token expiry + last used (Alembic 0006) | ✅ |
+| 10 | Rate limiting no longer fails open; list + invoke limited | ✅ |
+| 11 | MCP ping, batch, notifications, JSON-RPC errors | ✅ (streamable HTTP GET/SSE not done) |
+| 12 | Per-grant daily quota | ✅ |
+| 13 | Permission check on `/query-tools/{id}/test` | ✅ |
+| 14 | Jev judges split votes | ✅ |
+| 15 | Tool-choice evaluation | ✅ |
+| 16 | Data residency option | ✅ |
+
+### 0.6 Still open
+
+| Item | Status | Note |
+|---|---|---|
+| Rotate the Gemini and OpenRouter API keys shared in chat | 🔴 User action | Keys are only in the gitignored `.env` |
+| Change the seeded admin's temporary password | 🔴 User action | The forced "change temporary password" dialog still appears |
+| Commit this work | 🔴 User action | Nothing has been committed |
+| MCP streamable HTTP (GET/SSE) | 🟡 By choice | POST JSON-RPC covers current clients |
+| `AgentVersion.input_schema` / `config` at run time | 🟡 | Stored, not yet used |
+| Timed-out built-in tool threads | 🟡 By design | Interrupted at the database; the thread can't be killed |
+| Items carried from August (§2): PingFederate SSO, pen test, demo video, connector certification beyond SQL Server | 🔴 Unchanged | Outside this review's scope |
 
 ## 1. Core product workflows
 
@@ -181,6 +278,15 @@ Read `temporal_activities.py`'s `_execute_agent_plan()`/`_execute_bound_tools()`
 The remaining harness gaps are reflection/replan after a failed call, per-tool cost/token accounting (beyond the per-attempt `ModelCallLog` rows the parameter-fill tier now writes), provider failover, and automated live-run quality judging.
 
 ## 9. Change log
+
+- **September 24, 2026 (eighteenth pass — September architecture review closure, this revision):** Full devil's-advocate review of UI and API, then closure. Summary per area in [§0](#0-september-2026-review--closure-tracker-current).
+  - **Security/reliability:** read-only staging role, sqlglot guard, project-role permissions, SSE streaming, plan-hash approvals, per-step Temporal activities, Alembic 0001–0006, cookie auth + CSRF header.
+  - **Decisions:** Jev (TypeSafe, via OpenRouter) is a declared decision-model provider for routing (incl. which agent), consequential-action escalation, per-step tool choice and SQL tie-break; on-prem option per project; live proof report.
+  - **Learning:** verified queries, GEPA with approval-gated activation, cascade multi-model vote, slow-query DDL suggestions (never executed by default).
+  - **Analytics:** Superset availability checks, blank-dashboard fixes, data-driven charts, dashboard picker (project / published queries / datasets by source).
+  - **Agents/tools/gateway:** all 16 hardening items (budgets, timeouts, egress, audit, separation of duties, publish gate, token expiry, quotas, MCP ping/batch/notifications).
+  - **Bugs found live and fixed:** profiled-only `file_profiles.*` tables offered to SQL; planner output truncated at 800 tokens; tools skipped silently; routing preview/evaluation calls not logged; Jev lacking catalog evidence ("uploaded file" → clarify).
+  - **Tests:** 211 passed, 1 skipped; web tsc clean, 7/7 source tests.
 
 - **August 16, 2026 (seventeenth pass — MCP tools aren't connector-level groups, this revision):** Direct follow-up from the user, pointing at the sixteenth pass's own clustered-graph screenshot: `mcp.sqlserver.*` tools and `mcp.postgres.*` tools were still shown connected/grouped together even though they should never be treated as one queryable unit. The fifteenth pass's `group_key()` fix (one bucket per `connector_id`) is correct for a **direct-driver** connector — its assets really do share one physical DB connection — but wrong for an **MCP-backed** connector, where each cataloged asset is a separately-discovered *tool* (`discover_mcp_metadata()` hardcodes `schema_name="mcp"` for every one, regardless of backend), and a single MCP toolbox can front more than one physically distinct backend with no structured signal in `tools/list` saying which tools share one — confirmed directly in this repo's own demo config, `infra/mcp-toolbox/toolbox.yaml`, which defines two separate `kind: source` blocks (a SQL Server source and a Postgres source) behind one connector. Traced every MCP execution path (`execute_connector_query`/`execute_mcp_tool` in `connector_runtime.py`, and both call sites in `temporal_activities.py`) to confirm there is no cross-tool join capability anywhere in the runtime — an MCP-backed call always invokes exactly one named tool. That makes the correct fix stronger than "assume different backends conservatively": **no two distinct MCP tools are ever joinable, even when they happen to share a backend**, so each one must be its own atomic group regardless of connector_id.
   - **Fixed, backend:** `group_key()` in `routers/semantic.py` now checks the asset's connector's `connection_mode`: direct connectors keep the existing one-bucket-per-`connector_id` behavior; MCP connectors instead key each asset by `f"{connector_id}:{asset_id}"`, so two tools on the same MCP connector never share a group. Inferred edges (already scoped to `group_key()` equality from the fifteenth pass) automatically inherit the fix. `validate_semantic_join_policy()` (`app/main.py`) had the identical gap on the governed-policy path — it only ever compared `connector_id`, which would have let a maintainer approve a policy between two different MCP tools on the same connector; now it separately checks `connection_mode == "mcp"` for a same-connector pair and rejects with a message naming the real reason (two different MCP tools, not "two different connectors"). Added `connection_mode` to `analysis_source_output()`'s response (the `source` object returned by `GET /datasets` and `/sql/generate`) so clients can tell direct and MCP sources apart without a second lookup.

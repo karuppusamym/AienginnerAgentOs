@@ -117,7 +117,7 @@ export const providerTypeOptions: ProviderTypeOption[] = [
 
 /** A provider's capability; older APIs omit it, so it is derived from the provider type. */
 export const providerCapability = (provider: { capability?: string | null; provider_type?: string }) =>
-  provider.capability === "decision" || provider.capability === "generation"
+  provider.capability === "decision" || provider.capability === "generation" || provider.capability === "local"
     ? provider.capability
     : providerTypeOptions.find((option) => option.value === provider.provider_type)?.capability || "generation";
 

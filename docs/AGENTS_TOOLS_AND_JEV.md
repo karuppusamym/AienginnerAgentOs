@@ -1,8 +1,8 @@
 # Agents, tools and Jev: how decisions are made
 
 This page covers how DataPilot's agents and tools work, both internal and external, and where
-the Jev decision model makes each choice. It also shows how to demo that live and what to
-improve next. Code references are relative to `apps/api/app/`.
+the Jev decision model makes each choice. It also shows how to demo that live and the status of
+every improvement. Code references are relative to `apps/api/app/`.
 
 - **Live proof:** [`demo/`](demo/) holds the latest report from `scripts/demo_jev_agents.py`.
 - **Related:** [Learning loop](LEARNING_LOOP.md), [Analytics embedding](ANALYTICS_EMBEDDING.md),
@@ -13,7 +13,7 @@ improve next. Code references are relative to `apps/api/app/`.
 | Registry | What it holds | Scope | Who can call it |
 |---|---|---|---|
 | **Agents** (`AgentDefinition`, `AgentVersion`) | Name, purpose, bound tools, bound query tools, instructions (versioned, publishable) | Platform-wide | Internal only: chat suggestions, `POST /agents/runs`, pipelines |
-| **Internal tools** (`ToolDefinition`, `ToolVersion`, `ToolExecution`) | 10 built-in handlers (`catalog.search`, `dataset.profile`, `lineage.query`, `sql.generate`, `sql.preview`, `quality.run`, …) plus allow-listed HTTP tools | Platform-wide | Agents (low-risk built-ins only); users with `jobs:write` or `registry:write` |
+| **Internal tools** (`ToolDefinition`, `ToolVersion`, `ToolExecution`) | 10 built-in handlers (`catalog.search`, `dataset.profile`, `lineage.query`, `sql.generate`, `sql.preview`, `quality.run`, …) plus allow-listed HTTP tools | Platform-wide | Agents (low-risk built-ins; medium-risk only after a human approved the run); users with `jobs:write` or `registry:write` |
 | **Query tools** (`QueryTool`, `QueryToolGrant`) | Parameterised, read-only SQL with a business description, allowed relations, row limit and timeout | Per project | Agents; the chat router; **external clients** through `/external/v1` and MCP |
 
 **External access** is intentionally narrow:
@@ -22,7 +22,8 @@ improve next. Code references are relative to `apps/api/app/`.
 - It can only list and invoke query tools it was explicitly granted.
 - Endpoints: `GET/POST /external/v1/query-tools…`, `/.well-known/mcp.json`, and `POST /mcp`
   (`initialize`, `tools/list`, `tools/call`).
-- Every invocation is rate-limited (60/min per client) and audited as an `ExternalInvocation`.
+- Every call (list, detail, invoke, MCP `tools/list`) is rate-limited per client (60/min; an in-process window takes over without Redis), invocations can have a daily quota per grant, and each is audited as an `ExternalInvocation`.
+- Client tokens can expire (`expires_in_days`) and record `last_used_at`.
 - External clients cannot reach agents or internal tools.
 
 **Seeded agents** (`seed.py`):
@@ -59,7 +60,7 @@ chat message ──► decision_routing ──► route + WHICH agent / WHICH qu
 |---|---|---|---|---|
 | Which route, which agent, which query tool | `decision_routing` | **Jev** (LLM or local scorer as fallback) | A probability for each option, e.g. `agent_run:Troubleshooter 93%` | Options come from the registry only; Jev sees only the question text |
 | Does this objective change, move, publish or send data? | `risk_check` | **Jev** | P(consequential) | Can **add** an approval (p ≥ 0.7), never remove one the rules require |
-| Which bound tool fits this plan step | `tool_selection` | **Jev** (local word overlap as fallback) | A probability for each eligible tool; top-1 plus any ≥ 25%, at most 2 | Only low-risk, published, non-approval tools are eligible |
+| Which bound tool fits this plan step | `tool_selection` | **Jev** (local word overlap as fallback) | A probability for each eligible tool; top-1 plus any ≥ 25%, at most 2 | Only published, non-approval built-ins: low-risk, or medium-risk when a human approved the run |
 | Which SQL candidate wins a split vote | `sql_candidate_judge` | **Jev** | A probability for each candidate | Used only when the multi-model vote has no majority |
 | Plan steps | `agent_planning` | LLM (Claude Sonnet 5) | JSON steps | Enabled agent names only; deterministic fallback plan |
 | Tool parameters | `tool_parameters` | Deterministic grounder, then LLM | JSON | Schema-validated; IDs must resolve in this project |
@@ -132,52 +133,52 @@ Latest live result (2026-09-24, `typesafe/jev-1.13-20260917`):
 - **Admin → Model usage:** Jev calls with their cost.
 - **Learning → Router evaluation:** run local, llm and jev side by side on your own cases.
 
-## 5. Recommended improvements (not yet done)
+## 5. Improvement list: status (2026-09-24 closure)
 
-Ordered by value. File references come from a code walk-through on 2026-09-24.
+All 16 items from the earlier code walk-through have been implemented and tested. The
+full backend suite passes (211 passed, 1 skipped).
 
 ### Internal agents and tools
-1. **Read the agent configuration at run time.** `AgentVersion.instructions`,
-   `model_provider_id`, `input_schema` and `AgentDefinition.autonomy_level` are stored but not
-   used. The provider comes from project routing and autonomy from the request.
-2. **Enforce the advertised budget.** "5 agents / 12 tool calls / 5 minute budget" is only
-   partly enforced:
-   - Reflection retries don't count against the budget.
-   - There is no wall-clock or cost limit.
-   - The no-Temporal fallback runs inside the HTTP request.
-   - Add a per-run deadline and a cost cap.
-3. **Built-in tool timeouts and scoping.** `timeout_seconds` applies only to HTTP tools, and
-   `sql.preview` doesn't scope reads to the run's project. Wrap built-ins in the same timeout, and
-   pass `project_id` into the read-only guard.
-4. **One audit trail.** Agent tool calls write job evidence and governance events but no
-   `ToolExecution` rows, so the tool registry's usage view under-counts. Write both.
-5. **Let agents use medium-risk tools after approval.** `sql.preview`, `quality.run` and
-   `pipeline.stage` are bound to agents but can never run inside a loop (low-risk only). Allow
-   them when the run was approved *and* the tool was in the approved plan.
-6. **HTTP tool egress.** The allowlist checks only the hostname. Add private-IP and
-   DNS-rebinding checks and a response-size cap.
-7. **Two-person rule.** An approver can approve their own request. Block self-approval for
-   `agent_execution`, `create_index` and `prompt_activation`.
-8. **Publishing gates.** Agent versions can be published without an evaluation score, and query
-   tools without the "tested" status. Require a passing scorecard.
+
+| # | Item | Status | What changed |
+|---|---|---|---|
+| 1 | Agent configuration unused at run time | **Done** | Each step runs at the lower of the run's autonomy and the agent's `autonomy_level`. A published version's `model_provider_id` is used for parameter filling and reflection when it can generate text (a pin to the local deterministic model is ignored). Version `instructions` go to the planner and the parameter filler as context that cannot relax any rule. `input_schema` and `config` are still unused. |
+| 2 | Advertised budget not enforced | **Done** | Reflection retries count against the 12-call budget. `AGENT_RUN_MAX_SECONDS` (default 300) is checked before each step and inside the tool loop. Unfinished steps are skipped as "run time budget exceeded" and the run ends `PARTIALLY_SUCCEEDED`. The limit label reads from the real constants. |
+| 3 | Built-in tools had no timeout; `sql.preview` not project-scoped | **Done** | Built-ins run in a worker thread with the version's `timeout_seconds`, which is also the database statement timeout. Timeouts are not retried. `sql.preview` refuses tables that aren't queryable catalogued assets of the run's project. |
+| 4 | Agent tool calls missing from the tool audit | **Done** | Every internal tool attempt inside an agent run writes a `ToolExecution` row (job id, status, duration, parameters, result or error). Query tools keep their governance events. |
+| 5 | Medium-risk tools could never run inside agents | **Done** | They run only when a human approved the run (`agent_execution` approval). Steps added by the reviewer are excluded. The same rule applies to Jev's eligible tool set, and evidence records "ran under approval". |
+| 6 | HTTP egress checked the hostname only | **Done** | Private, loopback, link-local, multicast and reserved IPs are refused unless `TOOL_HTTP_ALLOW_PRIVATE=true` (Compose: true, Kubernetes: false). The request connects to the checked IP, with SNI and Host kept, which blocks DNS rebinding. Responses are capped at `TOOL_HTTP_MAX_BYTES`, and credentials in URLs are refused. |
+| 7 | Self-approval allowed | **Done** | With `APPROVAL_SEPARATION_OF_DUTIES=true` (on in Kubernetes, off for the single-admin local demo), the requester cannot approve their own agent run, index DDL, prompt activation, publication, tool execution, deploy or retention request. They can still reject it. |
+| 8 | Publishing without evaluation | **Done** | Publishing an agent version returns 409 without an evaluation score of at least `AGENT_PUBLISH_MIN_SCORE` (default 0.8, i.e. the scorecard's 80%). An admin can override with `?force=true`, which is audited. |
 
 ### External (MCP / gateway)
-9. **Client token lifecycle.** Add expiry, last-used time and scoped rotation. Tokens currently
-   never expire.
-10. **Rate limiting without Redis.** It fails open when Redis is down, and `tools/list` isn't
-    limited. Fail closed for `tools/call`.
-11. **MCP completeness.** Add `ping`, batching and correct notification handling (no body). Add
-    streamable HTTP (GET/SSE) for clients that need it.
-12. **Per-tool quotas and scopes** beyond `tools:list` and `tools:invoke`.
-13. **Permission check on `/query-tools/{id}/test`.** Any project member can run it, and chat
-    "Run tool" uses it. Route chat through the governed invoke path, and require `jobs:write` for
-    `/test`.
+
+| # | Item | Status | What changed |
+|---|---|---|---|
+| 9 | Client tokens never expired | **Done** | `expires_at` and `last_used_at` (Alembic `0006_gateway_token_lifecycle`). `expires_in_days` (1–365) is accepted on create and rotate. Expired tokens get 401. Admin → Gateway shows expiry and last use. |
+| 10 | Rate limiting failed open without Redis | **Done** | An in-process sliding window takes over when Redis is missing or erroring. One per-client limit covers invoke, REST list and detail, and MCP `tools/list`. |
+| 11 | MCP gaps | **Done** (except streamable HTTP) | `ping`, JSON-RPC batches, notifications (202, no body), and errors -32601, -32600 and -32700. GET/SSE streamable HTTP is not implemented. |
+| 12 | No per-tool quotas | **Done** | `QueryToolGrant.daily_quota`. Past the quota a call gets 429 with Retry-After, and the event is audited. Set per grant in Admin → Gateway. |
+| 13 | `/query-tools/{id}/test` had no permission check | **Done** | Requires the query-runner permission; viewers get 403, which is audited. The chat "Run tool" button shows a clear permission message. |
 
 ### Jev
-14. **Judge SQL candidates by default.** Use Jev for SQL candidates on every split vote (not
-    only 1/3), and log the judged-vs-voted winner for evaluation.
-15. **Evaluate tool choice.** Add labelled "step → expected tool" cases to Learning → Router
-    evaluation so `tool_selection` accuracy is measured like routing.
-16. **Data residency.** Question text goes to OpenRouter/TypeSafe. For regulated projects, route
-    decision purposes to an on-prem decision model behind the same provider type, or to the local
-    scorer.
+
+| # | Item | Status | What changed |
+|---|---|---|---|
+| 14 | Judge every split vote | **Done** | With the cascade vote, a split between the first two models asks the third. Any remaining split with two or more runnable candidates goes to Jev, and the tie-break is stored in the answer's ensemble. |
+| 15 | Evaluate tool choice | **Done** | `POST /router/evaluate-tools` and the Learning → Router → *Tool choice evaluation* panel score the local chooser against Jev on labelled "agent step → expected tool" cases. |
+| 16 | Data residency | **Done** | Route a project's decision purposes to the local deterministic model (Admin → Model routing, "on-prem, no external call"). That project's routing, risk check, tool choice and tie-break then run locally, and no request text goes to OpenRouter. |
+
+### Also fixed in this closure
+
+| Item | What changed |
+|---|---|
+| Profiled-only files broke SQL (`relation "file_profiles.transactions" does not exist`) | `catalog_scope.py` keeps catalog entries without a table out of SQL generation and grounding. Datasets shows a "profile only" tag. |
+| Sonnet 5 called on every question | Cascade vote (`SQL_VOTE_MODE=cascade`): the third model is asked only when the first two disagree. |
+| Jev didn't know which table matched | Catalog evidence (for example "best staging.transactions (Ingested from transactions.csv)") is now in Jev's option text. "…in the uploaded file?" went from clarify 57% to SQL 82%. Jev scored 100% on 11 labelled routes. |
+| Run budget and lead-agent evidence dropped mid-run | Kept through prepare and finalize. |
+
+### Still open by design
+- MCP streamable HTTP (GET/SSE).
+- A timed-out built-in tool's thread is stopped only at the database level, then left to finish on its own.
+- `AgentVersion.input_schema` and `config` are not used at run time.

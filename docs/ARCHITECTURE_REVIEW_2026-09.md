@@ -108,9 +108,9 @@ Findings cite `file:line` as of this review. "Done" items shipped in the same ch
 | Superset: one hidden dashboard per query, reachable only by hotlink | Done: a picker of project dashboard, published queries and datasets by source (project-scoped, PII columns excluded, restricted datasets admin-only) | `routers/analytics.py`, `SupersetView.tsx`, [ANALYTICS_EMBEDDING.md](ANALYTICS_EMBEDDING.md) |
 | Live proof of Jev decisions | `scripts/demo_jev_agents.py` → `docs/demo/` | [AGENTS_TOOLS_AND_JEV.md](AGENTS_TOOLS_AND_JEV.md) |
 
-Remaining agent and tool gaps (budget enforcement, built-in tool timeouts, self-approval, MCP
-token lifecycle, …) are listed with evidence in
-[AGENTS_TOOLS_AND_JEV.md §5](AGENTS_TOOLS_AND_JEV.md#5-recommended-improvements-not-yet-done).
+All 16 agent and tool gaps (budget enforcement, built-in tool timeouts, self-approval, MCP token
+lifecycle, quotas, egress, data residency, …) were closed on 2026-09-24; see
+[AGENTS_TOOLS_AND_JEV.md §5](AGENTS_TOOLS_AND_JEV.md#5-improvement-list-status-2026-09-24-closure).
 
 ### Original findings (for reference; see closure table above)
 

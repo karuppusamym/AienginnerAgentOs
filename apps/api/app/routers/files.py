@@ -44,6 +44,7 @@ from ..file_profiles import profile_file, read_structured_rows
 from ..grounding import context_signature, grounding_context, grounding_prompt_text, normalize_query, project_grounding_signature
 from ..model_runtime import generate_text, test_provider as invoke_provider_test
 from ..metadata_scan_runtime import execute_metadata_scan
+from ..metadata_generation import is_unreviewed_description, suggest_dataset_metadata
 from ..models import (
     AgentDefinition,
     AgentVersion,
@@ -262,35 +263,47 @@ def ingest_file(
             item.status = "profiled"
         table_name = staged["table_name"] if staged else safe_identifier(Path(item.filename).stem, f"file_{item.id[:8]}")
         schema_name = staged["schema_name"] if staged else "file_profiles"
-        db.add(
-            DataAsset(
-                project_id=project.id,
-                source_name="Local files",
-                schema_name=schema_name,
-                table_name=table_name,
-                asset_type="staged_file",
-                row_count=profile.get("row_count"),
-                columns=annotate_columns(
-                    (
-                    [
-                        {"name": column["name"], "type": column["type"], "nullable": True}
-                        for column in staged["columns"]
-                    ]
-                    if staged
-                    else [
-                        {
-                            "name": column["name"],
-                            "type": column["inferred_type"],
-                            "nullable": column["null_count"] > 0,
-                        }
-                        for column in profile.get("columns", [])
-                    ]
-                    )
-                ),
-                tags=["local-file", item.status],
-                description=f"Ingested from {item.filename}",
+        annotated_columns = annotate_columns(
+            (
+            [
+                {"name": column["name"], "type": column["type"], "nullable": True}
+                for column in staged["columns"]
+            ]
+            if staged
+            else [
+                {
+                    "name": column["name"],
+                    "type": column["inferred_type"],
+                    "nullable": column["null_count"] > 0,
+                }
+                for column in profile.get("columns", [])
+            ]
             )
         )
+        new_asset = DataAsset(
+            project_id=project.id,
+            source_name="Local files",
+            schema_name=schema_name,
+            table_name=table_name,
+            asset_type="staged_file",
+            row_count=profile.get("row_count"),
+            columns=annotated_columns,
+            tags=["local-file", item.status],
+            description=f"Ingested from {item.filename}",
+        )
+        try:
+            metadata_provider = selected_model_provider(db, user, "metadata_generation")
+        except Exception:
+            metadata_provider = None
+        suggestion = suggest_dataset_metadata(
+            metadata_provider, schema_name, table_name, annotated_columns,
+            governance_business_id=project.id, governance_user_id=user.id,
+        ) if metadata_provider is not None else None
+        if suggestion:
+            new_asset.description = suggestion["description"]
+            new_asset.metadata_status = "ai_suggested"
+            new_asset.columns = [{**column, **suggestion["columns"].get(str(column.get("name", "")), {})} for column in annotated_columns]
+        db.add(new_asset)
     else:
         item.status = "indexed"
     db.add(item)
@@ -762,7 +775,24 @@ def stage_file_mapping(
             for column in staged["columns"]
         ]
     asset.tags = ["local-file", "mapped", "staged", payload.load_mode]
-    asset.description = f"Mapped {payload.load_mode} ingestion from {item.filename}"
+    if is_unreviewed_description(asset.description):
+        asset.description = f"Mapped {payload.load_mode} ingestion from {item.filename}"
+    missing_business_names = not any(column.get("business_name") for column in asset.columns)
+    if is_unreviewed_description(asset.description) or missing_business_names:
+        try:
+            metadata_provider = selected_model_provider(db, user, "metadata_generation")
+        except Exception:
+            metadata_provider = None
+        suggestion = suggest_dataset_metadata(
+            metadata_provider, asset.schema_name, asset.table_name, asset.columns,
+            governance_business_id=project.id, governance_user_id=user.id,
+        ) if metadata_provider is not None else None
+        if suggestion:
+            if is_unreviewed_description(asset.description):
+                asset.description = suggestion["description"]
+                asset.metadata_status = "ai_suggested"
+            if missing_business_names:
+                asset.columns = [{**column, **suggestion["columns"].get(str(column.get("name", "")), {})} for column in asset.columns]
     db.flush()
     job = Job(
         project_id=project.id,

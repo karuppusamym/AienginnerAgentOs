@@ -2,13 +2,17 @@ import {
   AlertCircle,
   Braces,
   Check,
+  Download,
+  FileCode2,
   Network,
   Plus,
   Search,
   ShieldCheck,
   XCircle,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type {
   Dataset,
@@ -56,11 +60,20 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
   const [graph, setGraph] = useState<SemanticGraphData | null>(null);
   const [includeInferred, setIncludeInferred] = useState(true);
   const [hovered, setHovered] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+  const [zoom, setZoom] = useState(1);
+  const svgRef = useRef<SVGSVGElement>(null);
   const load = useCallback(() => api<SemanticGraphData>(`/semantic/graph?include_inferred=${includeInferred}`).then(setGraph), [includeInferred]);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Relationship graph unavailable", "error")); }, [load, notify]);
 
-  const width = 900, height = 460, cx = width / 2, cy = height / 2, radius = Math.min(width, height) / 2 - 90;
   const nodes = graph?.nodes || [];
+  // Fixed 900x460 overlapped every label once there were more than a
+  // handful of nodes: angular spacing per node shrank but the canvas and
+  // label offset never grew to compensate. Scale both with node count.
+  const radius = Math.max(160, Math.min(420, 90 + nodes.length * 9));
+  const height = radius * 2 + 180;
+  const width = height + 320;
+  const cx = width / 2, cy = height / 2;
 
   // Cluster nodes by source group instead of scattering every asset from
   // every connector around one flat ring: each group gets its own
@@ -101,24 +114,77 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
   const gap = groupOrder.length > 1 ? 0.16 : 0;
   const totalGap = gap * groupOrder.length;
   const positions = new Map<string, { x: number; y: number }>();
+  // Labels sit at a fixed offset from their node, so two nodes placed close
+  // together on the ring (dense arcs, many groups) get labels that collide.
+  // Nodes are visited here in increasing angle order already (each group's
+  // arc starts where the previous one ended) -- track the last label placed
+  // per side and, once a new one would land within one line-height of it,
+  // push it out to the next offset step instead of always using 14px.
+  const OFFSET_STEPS = [14, 30, 46];
+  const labelOffsets = new Map<string, number>();
+  const lastBySide: Record<"left" | "right", { y: number; step: number } | null> = { left: null, right: null };
   let cursor = -Math.PI / 2;
   groupOrder.forEach((group) => {
     const members = groupMembers.get(group)!;
     const span = nodes.length <= 1 ? 0 : (2 * Math.PI - totalGap) * (members.length / nodes.length);
     members.forEach((node, index) => {
       const angle = members.length <= 1 ? cursor + span / 2 : cursor + (span * index) / (members.length - 1 || 1);
-      positions.set(node.id, { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) });
+      const x = cx + radius * Math.cos(angle);
+      const y = cy + radius * Math.sin(angle);
+      positions.set(node.id, { x, y });
+      const side: "left" | "right" = x >= cx ? "right" : "left";
+      const previous = lastBySide[side];
+      const step = previous && Math.abs(y - previous.y) < 13 ? (previous.step + 1) % OFFSET_STEPS.length : 0;
+      lastBySide[side] = { y, step };
+      labelOffsets.set(node.id, OFFSET_STEPS[step]);
     });
     cursor += span + gap;
   });
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const needle = filter.trim().toLowerCase();
+  const nodeMatches = (node: SemanticGraphNode) =>
+    !needle || node.relation.toLowerCase().includes(needle) || node.source_label.toLowerCase().includes(needle) || node.columns.some((column) => column.toLowerCase().includes(needle));
+  const exportGraphJson = () => {
+    if (!graph) return;
+    const blob = new Blob([JSON.stringify(graph, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "semantic-graph.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+  const exportGraphSvg = () => {
+    if (!svgRef.current) return;
+    // The exported file loses the app's stylesheet (.graph-node-dot,
+    // .graph-edge, etc. live in globals.css, not inlined here), so nodes/edges
+    // render unstyled outside the app -- a quick visual snapshot, not a
+    // portable diagram. Use "Export graph data (JSON)" to get the real data.
+    const clone = svgRef.current.cloneNode(true) as SVGSVGElement;
+    clone.removeAttribute("style");
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    const serialized = `<?xml version="1.0" encoding="UTF-8"?>\n${new XMLSerializer().serializeToString(clone)}`;
+    const blob = new Blob([serialized], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "semantic-graph.svg";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <section className="surface graph-panel">
       <div className="section-heading compact">
         <div><span className="eyebrow">CATALOG RELATIONSHIPS</span><h3>Table &amp; join graph</h3><p>Nodes are catalog datasets, clustered and colored by source; solid edges are approved join policies, dashed edges are column-name-inferred suggestions within the same queryable group, never used automatically. Datasets that can&apos;t actually be queried together in one call are never linked here — that includes assets from two different connectors, and (for MCP-backed connectors) two different MCP tools, since each MCP call can only invoke one tool.</p></div>
         <div className="row-actions">
+          <div className="toolbar-search"><Search size={14} /><input placeholder="Filter nodes..." value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter graph nodes" /></div>
           <label className="toggle-inline"><input type="checkbox" checked={includeInferred} onChange={(event) => setIncludeInferred(event.target.checked)} />Show inferred</label>
           {graph && <StatusPill value={`${graph.governed_edge_count} governed / ${graph.inferred_edge_count} inferred`} />}
+          <button className="icon-button" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.6, Math.round((value - 0.2) * 10) / 10))}><ZoomOut size={16} /></button>
+          <button className="icon-button" title="Zoom in" onClick={() => setZoom((value) => Math.min(2, Math.round((value + 0.2) * 10) / 10))}><ZoomIn size={16} /></button>
+          <button className="icon-button" title="Export graph data as JSON" onClick={exportGraphJson} disabled={!graph}><Download size={16} /></button>
+          <button className="icon-button" title="Export graph as an SVG image" onClick={exportGraphSvg} disabled={!graph}><FileCode2 size={16} /></button>
         </div>
       </div>
       {!graph ? <LoadingBlock label="Loading relationship graph" /> : nodes.length === 0 ? <EmptyState icon={<Network size={24} />} title="No datasets yet" body="Catalog a dataset to see the relationship graph populate." /> : (
@@ -137,34 +203,39 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
               })}
             </div>
           )}
-          <svg viewBox={`0 0 ${width} ${height}`} className="semantic-graph-svg" role="img" aria-label="Catalog table and join relationship graph, clustered by source">
-            {graph!.edges.map((edge) => {
-              const source = positions.get(edge.source);
-              const target = positions.get(edge.target);
-              if (!source || !target) return null;
-              const active = hovered === edge.source || hovered === edge.target;
-              return (
-                <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${edge.governed ? "governed" : "inferred"} ${edge.cross_connector ? "cross-connector" : ""} ${active ? "active" : ""}`}>
-                  <title>{edge.cross_connector
-                    ? `⚠ ${edge.left_column} = ${edge.right_column} — approved policy references two datasets that can't actually be queried together in a single call (different connectors, or different MCP tools) and cannot be executed as written. Edit or remove this policy.`
-                    : `${edge.left_column} = ${edge.right_column} — ${edge.governed ? `${edge.status} join policy` : "inferred suggestion, not governed"}`}</title>
-                </line>
-              );
-            })}
-            {nodes.map((node) => {
-              const pos = positions.get(node.id)!;
-              const rightSide = pos.x >= cx;
-              const label = node.relation.length > 24 ? `${node.relation.slice(0, 22)}…` : node.relation;
-              const color = groupColor.get(node.group);
-              return (
-                <g key={node.id} transform={`translate(${pos.x}, ${pos.y})`} className={`graph-node ${hovered === node.id ? "active" : ""}`} onMouseEnter={() => setHovered(node.id)} onMouseLeave={() => setHovered(null)}>
-                  <circle r={9} className="graph-node-dot" style={color ? { stroke: color } : undefined} />
-                  <title>{`${node.relation}\nSource: ${node.source_label}\n${node.columns.join(", ")}`}</title>
-                  <text x={rightSide ? 14 : -14} y={4} textAnchor={rightSide ? "start" : "end"}>{label}</text>
-                </g>
-              );
-            })}
-          </svg>
+          <div className="graph-scroll">
+            <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} className="semantic-graph-svg" style={{ transform: `scale(${zoom})` }} role="img" aria-label="Catalog table and join relationship graph, clustered by source">
+              {graph!.edges.map((edge) => {
+                const source = positions.get(edge.source);
+                const target = positions.get(edge.target);
+                if (!source || !target) return null;
+                const active = hovered === edge.source || hovered === edge.target;
+                const dimmed = Boolean(needle) && !(nodeMatches(nodeById.get(edge.source)!) && nodeMatches(nodeById.get(edge.target)!));
+                return (
+                  <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${edge.governed ? "governed" : "inferred"} ${edge.cross_connector ? "cross-connector" : ""} ${active ? "active" : ""} ${dimmed ? "dimmed" : ""}`}>
+                    <title>{edge.cross_connector
+                      ? `⚠ ${edge.left_column} = ${edge.right_column} — approved policy references two datasets that can't actually be queried together in a single call (different connectors, or different MCP tools) and cannot be executed as written. Edit or remove this policy.`
+                      : `${edge.left_column} = ${edge.right_column} — ${edge.governed ? `${edge.status} join policy` : "inferred suggestion, not governed"}`}</title>
+                  </line>
+                );
+              })}
+              {nodes.map((node) => {
+                const pos = positions.get(node.id)!;
+                const rightSide = pos.x >= cx;
+                const label = node.relation.length > 24 ? `${node.relation.slice(0, 22)}…` : node.relation;
+                const color = groupColor.get(node.group);
+                const offset = labelOffsets.get(node.id) ?? 14;
+                const dimmed = Boolean(needle) && !nodeMatches(node);
+                return (
+                  <g key={node.id} transform={`translate(${pos.x}, ${pos.y})`} className={`graph-node ${hovered === node.id ? "active" : ""} ${dimmed ? "dimmed" : ""}`} onMouseEnter={() => setHovered(node.id)} onMouseLeave={() => setHovered(null)}>
+                    <circle r={9} className="graph-node-dot" style={color ? { stroke: color } : undefined} />
+                    <title>{`${node.relation}\nSource: ${node.source_label}\n${node.columns.join(", ")}`}</title>
+                    <text x={rightSide ? offset : -offset} y={4} textAnchor={rightSide ? "start" : "end"}>{label}</text>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
         </>
       )}
     </section>

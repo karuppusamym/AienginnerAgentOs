@@ -39,6 +39,15 @@ const PublishedQueryAnalyticsModal = dynamic(() => import("./PublishedQueryAnaly
 
 export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify: (message: string, tone?: "ok" | "error") => void; seed?: { question: string; dialect: string } | null; currentUser: SessionUser; onSeedConsumed?: () => void }) {
   const [question, setQuestion] = useState("Show monthly deposit-account growth and explain unusual changes");
+  const [mode, setMode] = useState<"ask" | "paste">("ask");
+  const [showHints, setShowHints] = useState(false);
+  const [hints, setHints] = useState("");
+  const [pastedSql, setPastedSql] = useState("");
+  const [explaining, setExplaining] = useState(false);
+  const [canSaveVerified, setCanSaveVerified] = useState(false);
+  const [verifiedModalOpen, setVerifiedModalOpen] = useState(false);
+  const [verifiedQuestion, setVerifiedQuestion] = useState("");
+  const [savingVerified, setSavingVerified] = useState(false);
   const superset = useSupersetStatus();
   const supersetDown = superset.data !== undefined && !superset.data.available;
   const [dialect, setDialect] = useState("postgres");
@@ -94,15 +103,53 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
     event.preventDefault();
     setLoading(true);
     try {
+      const effectiveQuestion = hints.trim() ? `${question}\n\nAdditional context: ${hints.trim()}` : question;
       setResult(await api<SQLResult>("/sql/generate", {
         method: "POST",
-        body: JSON.stringify({ question, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null }),
+        body: JSON.stringify({ question: effectiveQuestion, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null }),
       }));
+      setCanSaveVerified(false);
       notify("SQL draft generated and validated");
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "SQL generation failed", "error");
     } finally {
       setLoading(false);
+    }
+  }
+  async function explainSql(event: FormEvent) {
+    event.preventDefault();
+    if (!pastedSql.trim()) return;
+    setExplaining(true);
+    try {
+      setResult(await api<SQLResult>("/sql/explain", {
+        method: "POST",
+        body: JSON.stringify({ sql: pastedSql, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null }),
+      }));
+      setArtifactId(null);
+      setCanSaveVerified(true);
+      notify("SQL validated and explained");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "SQL could not be explained", "error");
+    } finally {
+      setExplaining(false);
+    }
+  }
+  async function saveVerifiedQuery(event: FormEvent) {
+    event.preventDefault();
+    if (!result) return;
+    setSavingVerified(true);
+    try {
+      await api("/verified-queries", {
+        method: "POST",
+        body: JSON.stringify({ question: verifiedQuestion, sql: result.sql, dialect: effectiveDialect, connector_id: resolvedConnector?.id || null }),
+      });
+      setVerifiedModalOpen(false);
+      setVerifiedQuestion("");
+      notify("Saved as a verified query — future matching questions can reuse it");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Could not save as a verified query", "error");
+    } finally {
+      setSavingVerified(false);
     }
   }
   async function runPreview() {
@@ -211,6 +258,7 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
         execution: null,
         provider: { id: "artifact", name: "Saved artifact", model: "history", mode: "saved", latency_ms: 0 },
       });
+      setCanSaveVerified(false);
       notify(`Loaded SQL history item v${latest.version}`);
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "SQL history could not be opened", "error");
@@ -225,11 +273,28 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
           <span className="analysis-dialect">{selectedConnector ? `${connectorLabels[selectedConnector.connector_type] || selectedConnector.connector_type} source` : "PostgreSQL local source"}</span>
         </div>
       </div>
-      <form className="sql-question surface" onSubmit={generate}>
-        <Sparkles size={19} />
-        <input value={question} onChange={(event) => setQuestion(event.target.value)} aria-label="Business question" />
-        <button className="primary-button" disabled={loading}>{loading ? <RefreshCw size={17} className="spin" /> : <Play size={17} />}Generate</button>
-      </form>
+      <div className="segmented" role="tablist" aria-label="SQL input mode">
+        <button role="tab" aria-selected={mode === "ask"} className={mode === "ask" ? "active" : ""} onClick={() => setMode("ask")}>Ask a question</button>
+        <button role="tab" aria-selected={mode === "paste"} className={mode === "paste" ? "active" : ""} onClick={() => setMode("paste")}>Paste SQL</button>
+      </div>
+      {mode === "ask" ? (
+        <form className="sql-question surface" onSubmit={generate}>
+          <Sparkles size={19} />
+          <input value={question} onChange={(event) => setQuestion(event.target.value)} aria-label="Business question" />
+          <button type="button" className="icon-button" title={showHints ? "Hide extra context" : "Add extra context"} onClick={() => setShowHints((value) => !value)}><Layers3 size={16} /></button>
+          <button className="primary-button" disabled={loading}>{loading ? <RefreshCw size={17} className="spin" /> : <Play size={17} />}Generate</button>
+        </form>
+      ) : (
+        <form className="sql-question surface paste-sql-form" onSubmit={explainSql}>
+          <textarea className="mono-input" rows={6} value={pastedSql} onChange={(event) => setPastedSql(event.target.value)} placeholder="Paste a read-only SELECT statement against a catalogued table..." spellCheck={false} aria-label="Pasted SQL" />
+          <button className="primary-button" disabled={explaining || !pastedSql.trim()}>{explaining ? <RefreshCw size={17} className="spin" /> : <Play size={17} />}Explain &amp; validate</button>
+        </form>
+      )}
+      {mode === "ask" && showHints && (
+        <div className="surface sql-hints">
+          <label>Additional context<textarea rows={2} value={hints} onChange={(event) => setHints(event.target.value)} placeholder="Extra detail for the model: tables to prefer, filters, time range, definitions..." /></label>
+        </div>
+      )}
       {!result ? (
         <EmptyState icon={<Code2 size={26} />} title="Ready for a business question" body="The agent will show its SQL, evidence, validation checks, and a limited preview before anything can be saved." />
       ) : (
@@ -237,7 +302,7 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
           <section className="surface code-panel">
             <div className="panel-toolbar"><span><Code2 size={16} />{result.dialect} | {selectedConnector?.name || result.provider.name}</span><StatusPill value={result.validation.status} /></div>
             <pre><code>{result.sql}</code></pre>
-            <div className="code-actions"><button className="icon-button" onClick={() => sendFeedback("helpful")} title="Helpful result"><Check size={16} /></button><button className="icon-button" onClick={() => sendFeedback("not_helpful")} title="Result needs improvement"><XCircle size={16} /></button><button className="secondary-button" onClick={() => setExplainOpen(true)}><Layers3 size={16} />Why this result?</button><button className="secondary-button" onClick={saveArtifact} disabled={saving || !canSaveSql}>{saving ? <RefreshCw size={16} className="spin" /> : <Archive size={16} />}Save artifact</button><button className="secondary-button" onClick={() => { setToolModalOpen(true); setReportName(question.slice(0, 50)); }}><Network size={16} />Publish API</button><button className="secondary-button" onClick={() => { setNotebookModalOpen(true); setReportName(question.slice(0, 50)); }}><FileSpreadsheet size={16} />Eject</button>{analyticsStatus?.published ? <button className="secondary-button" onClick={() => setAnalyticsOpen(true)}><LayoutDashboard size={16} />Open in Superset</button> : <button className="secondary-button" onClick={requestSupersetPublication} disabled={!artifactId || publishing || supersetDown} title={supersetDown ? `Superset unavailable: ${superset.data?.reason}` : !artifactId ? "Save this SQL as an artifact first" : "Requests admin approval before this query becomes a Superset dashboard"}>{publishing ? <RefreshCw size={16} className="spin" /> : <LayoutDashboard size={16} />}Publish to Superset</button>}<button className="primary-button" onClick={runPreview} disabled={executing} title="Execute a bounded read-only preview; no source data is changed">{executing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run read-only preview</button></div>
+            <div className="code-actions"><button className="icon-button" onClick={() => sendFeedback("helpful")} title="Helpful result"><Check size={16} /></button><button className="icon-button" onClick={() => sendFeedback("not_helpful")} title="Result needs improvement"><XCircle size={16} /></button><button className="secondary-button" onClick={() => setExplainOpen(true)}><Layers3 size={16} />Why this result?</button><button className="secondary-button" onClick={saveArtifact} disabled={saving || !canSaveSql}>{saving ? <RefreshCw size={16} className="spin" /> : <Archive size={16} />}Save artifact</button>{canSaveVerified && canSaveSql && <button className="secondary-button" onClick={() => { setVerifiedQuestion(mode === "ask" ? question : ""); setVerifiedModalOpen(true); }}><Sparkles size={16} />Save as verified query</button>}<button className="secondary-button" onClick={() => { setToolModalOpen(true); setReportName(question.slice(0, 50)); }}><Network size={16} />Publish API</button><button className="secondary-button" onClick={() => { setNotebookModalOpen(true); setReportName(question.slice(0, 50)); }}><FileSpreadsheet size={16} />Eject</button>{analyticsStatus?.published ? <button className="secondary-button" onClick={() => setAnalyticsOpen(true)}><LayoutDashboard size={16} />Open in Superset</button> : <button className="secondary-button" onClick={requestSupersetPublication} disabled={!artifactId || publishing || supersetDown} title={supersetDown ? `Superset unavailable: ${superset.data?.reason}` : !artifactId ? "Save this SQL as an artifact first" : "Requests admin approval before this query becomes a Superset dashboard"}>{publishing ? <RefreshCw size={16} className="spin" /> : <LayoutDashboard size={16} />}Publish to Superset</button>}<button className="primary-button" onClick={runPreview} disabled={executing} title="Execute a bounded read-only preview; no source data is changed">{executing ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run read-only preview</button></div>
           </section>
           <aside className="surface validation-panel">
             <div className="section-heading compact"><div><span className="eyebrow">EVIDENCE</span><h3>Validation</h3></div><StatusPill value={result.validation.risk_level} /></div>
@@ -266,6 +331,7 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
       {analyticsOpen && artifactId && <PublishedQueryAnalyticsModal artifactId={artifactId} title={analyticsStatus?.dashboard_title || "Query analytics"} onClose={() => setAnalyticsOpen(false)} />}
       {toolModalOpen && <Modal title="Publish as API Tool" onClose={() => setToolModalOpen(false)}><form className="modal-form" onSubmit={publishTool}><label>Tool name<input value={reportName} onChange={(event) => setReportName(event.target.value)} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setToolModalOpen(false)}>Cancel</button><button className="primary-button"><Network size={16} />Request Approval</button></div></form></Modal>}
       {notebookModalOpen && <Modal title="Eject to Notebook" onClose={() => setNotebookModalOpen(false)}><form className="modal-form" onSubmit={ejectNotebook}><label>Notebook title<input value={reportName} onChange={(event) => setReportName(event.target.value)} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setNotebookModalOpen(false)}>Cancel</button><button className="primary-button"><FileSpreadsheet size={16} />Create Notebook</button></div></form></Modal>}
+      {verifiedModalOpen && <Modal title="Save as verified query" onClose={() => setVerifiedModalOpen(false)}><form className="modal-form" onSubmit={saveVerifiedQuery}><label>Business question this SQL answers<input value={verifiedQuestion} onChange={(event) => setVerifiedQuestion(event.target.value)} placeholder="e.g. Show monthly active accounts by region" required minLength={3} /></label><p className="caption">Future questions that match this one closely will reuse this exact SQL instead of generating fresh.</p><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setVerifiedModalOpen(false)} disabled={savingVerified}>Cancel</button><button className="primary-button" disabled={savingVerified}>{savingVerified ? "Saving…" : "Save"}</button></div></form></Modal>}
       {explainOpen && result && <Modal title="Why this result?" onClose={() => setExplainOpen(false)}><div className="modal-form"><p>{result.explanation}</p><div className="subheading"><h4>Source and model</h4></div><div className="check-list"><div><Database size={15} />{result.source?.name || selectedConnector?.name || "DataPilot local workspace"} / {result.dialect}</div><div><Bot size={15} />{result.provider.name} / {result.provider.model} ({result.provider.mode})</div><div><CircleGauge size={15} />Validation: {result.validation.status}; risk: {result.validation.risk_level}; row limit: {result.validation.row_limit}</div></div><div className="subheading"><h4>Grounding evidence</h4></div>{result.grounding?.catalog_matches?.slice(0, 5).map((item) => <div className="source-row" key={`${item.relation}-${item.match_type}`}><Layers3 size={15} /><span><strong>{item.relation}</strong><small>{item.match_type} catalog match / score {item.score}</small></span></div>)}{result.grounding?.semantic_matches?.slice(0, 5).map((item) => <div className="source-row" key={item.name}><Braces size={15} /><span><strong>{item.name}</strong><small>{item.formula} at {item.grain}</small></span></div>)}{result.grounding?.join_matches?.slice(0, 5).map((item) => <div className="source-row" key={`${item.left_relation}-${item.right_relation}`}><Network size={15} /><span><strong>{item.left_relation} {item.join_type} {item.right_relation}</strong><small>{item.left_column} = {item.right_column}</small></span></div>)}<div className="subheading"><h4>Safety checks</h4></div><div className="check-list">{result.validation.checks.map((check) => <div key={check}><Check size={15} />{check}</div>)}</div></div></Modal>}
     </div>
   );

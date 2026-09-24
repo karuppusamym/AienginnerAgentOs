@@ -90,6 +90,7 @@ export function LearningView({ notify, tab, onTab, runId, onRun }: {
         <>
           <RouterDecisionsPanel notify={notify} />
           <RouterEvaluationPanel notify={notify} />
+          <ToolChoiceEvaluationPanel notify={notify} />
         </>
       )}
     </div>
@@ -701,6 +702,77 @@ function RouterDecisionsPanel({ notify }: { notify: Notify }) {
           ))}
         </>
       ) : <div className="inline-empty">{items.length ? "No decisions match these filters." : "No routing decisions recorded for this project yet."}</div>}
+    </section>
+  );
+}
+
+// ------------------------------------------------------------------ tool choice evaluation
+
+type ToolChoiceResult = { agent: string; step: string; expected: string; got: string | null; probability: number | null; backend: string; correct: boolean };
+type ToolChoiceReport = { cases: number; skipped: { agent: string; step: string; reason: string }[]; backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; results: ToolChoiceResult[] }> };
+
+const SAMPLE_TOOL_CASES = [
+  "Metadata | Retrieve the lineage graph for staging.transactions, upstream and downstream | lineage.query",
+  "Metadata | Profile the dataset columns: types, null rates and distinct values | dataset.profile",
+  "Metadata | Find catalogued tables about customer accounts | catalog.search",
+  "SQL Analyst | Draft a read-only query for total amount by transaction type | sql.generate",
+  "Troubleshooter | Inspect the failed job's logs and error | job.inspect",
+  "Troubleshooter | Trace which downstream tables are affected by the failed load | lineage.query",
+].join("\n");
+
+/** Labelled "agent step -> expected tool" cases replayed through the local chooser and Jev (tool_selection). */
+function ToolChoiceEvaluationPanel({ notify }: { notify: Notify }) {
+  const [text, setText] = useState(SAMPLE_TOOL_CASES);
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<ToolChoiceReport | null>(null);
+  const cases = text.split("\n").map((line) => line.split("|").map((part) => part.trim())).filter((parts) => parts.length >= 3 && parts.every(Boolean)).map(([agent, step, expected_tool]) => ({ agent, step, expected_tool }));
+
+  async function run() {
+    if (!cases.length) { notify("Add at least one line: agent | step | expected tool", "error"); return; }
+    setRunning(true);
+    try {
+      setReport(await api<ToolChoiceReport>("/router/evaluate-tools", { method: "POST", body: JSON.stringify({ cases, backends: ["local", "jev"] }) }));
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Tool choice evaluation failed", "error");
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <section className="surface admin-surface">
+      <div className="section-heading">
+        <div><span className="eyebrow">TOOL SELECTION</span><h3>Tool choice evaluation</h3><p>One case per line: <code>agent | plan step | expected tool</code>. Each step is offered the agent&apos;s bound tools, exactly as in an agent run, and scored with the local word-overlap chooser and the decision model routed to tool selection (Jev).</p></div>
+        <div className="row-actions"><button className="primary-button" onClick={() => void run()} disabled={running}>{running ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}{running ? "Evaluating" : `Evaluate ${cases.length} case${cases.length === 1 ? "" : "s"}`}</button></div>
+      </div>
+      <div className="learning-pad">
+        <label className="field-label" htmlFor="tool-choice-cases">Cases</label>
+        <textarea id="tool-choice-cases" className="code-input" rows={6} value={text} onChange={(event) => setText(event.target.value)} spellCheck={false} />
+      </div>
+      {report && (
+        <div className="learning-pad">
+          <div className="three-column compact-cards">
+            {Object.entries(report.backends).map(([name, item]) => (
+              <div className="control-item" key={name}><span><strong>{name === "jev" ? "Jev" : "Local chooser"}</strong><small>{item.effective_backend || "-"}</small></span><span><strong>{item.accuracy != null ? `${Math.round(item.accuracy * 100)}%` : "-"}</strong><small>{item.avg_latency_ms != null ? `${Math.round(item.avg_latency_ms)} ms avg` : ""}</small></span></div>
+            ))}
+          </div>
+          {report.skipped.length ? <p className="admin-hint">{report.skipped.length} case{report.skipped.length === 1 ? "" : "s"} skipped: {report.skipped.map((item) => `${item.agent} (${item.reason})`).join("; ")}</p> : null}
+          <div className="table-header decision-grid"><span>Step</span><span>Expected</span><span>Local</span><span>Jev</span><span></span></div>
+          {(report.backends.local?.results || report.backends.jev?.results || []).map((row, index) => {
+            const jev = report.backends.jev?.results[index];
+            const local = report.backends.local?.results[index];
+            return (
+              <div className="data-row decision-grid" key={`${row.agent}-${index}`}>
+                <span><strong title={row.step}>{row.step}</strong><small>{row.agent}</small></span>
+                <span className="mono">{row.expected}</span>
+                <span className="mono">{local ? `${local.correct ? "✓" : "✗"} ${local.got || "-"}` : "-"}</span>
+                <span className="mono">{jev ? `${jev.correct ? "✓" : "✗"} ${jev.got || "-"}${jev.probability != null ? ` ${Math.round(jev.probability * 100)}%` : ""}` : "-"}</span>
+                <span></span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }
