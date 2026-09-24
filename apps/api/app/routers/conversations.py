@@ -116,38 +116,46 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+import contextvars
+import queue
+import threading
+from collections.abc import Callable, Iterator
 
-from .. import main
-from ..main import (
+from ..models import RouteDecision
+
+from ..decision_router import decide, follow_up_questions
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
     ArtifactCreate, ArtifactReviewRequest, ArtifactVersion, AuditEvent, AuthProvider,
     AuthProviderUpdate, Base, BaseModel, CORSMiddleware, ConfigDict, Connector,
     ConnectorCreate, ConnectorRuntimeError, ConnectorUpdate, Conversation,
-    ConversationAsk, ConversationCreate, ConversationMessage, ConversationRename, ConversationReportCreate,
-    DEFAULT_ARTIFACT_TARGETS, DataAsset, Depends, EvaluationBaselineRequest,
-    EvaluationCaseInput, EvaluationRun, EvaluationRunRequest, EvaluationSet,
-    EvaluationSetCreate, ExternalClient, ExternalClientCreate, ExternalClientUpdate,
-    ExternalExtraction, ExternalExtractionCreate, ExternalInvocation, FastAPI,
-    FeedbackCreate, Field, File, FileStageRequest, Form, HTTPException, Header,
-    Incident, IncidentResolveRequest, IngestedFile, IngestionMapping,
-    IngestionSchedule, Job, LearningSuggestion, LearningSuggestionReview, LineageEdge,
-    Literal, LoginRequest, MCPRequest, MappingColumn, ModelCallLog, ModelProvider,
-    NotebookCell, NotebookSave, ORMModel, PasswordChange, Path, PipelineDefinition,
-    PipelineGenerateRequest, PipelineGenerationError,
-    PipelinePackageDeliveryConfigSave, PipelinePackageSummary, PipelineUpdateRequest,
-    PipelineVersion, Project, ProjectCreate, ProjectMemberUpdate, ProjectMembership,
-    ProjectModelUpdate, PromptRollback, PromptSave, ProviderCreate, ProviderUpdate,
-    QualityRemediationRequest, QualityRule, QualityRuleCreate, QualityRun, Query,
-    QueryTool, QueryToolCreate, QueryToolGrant, QueryToolGrantCreate, QueryToolInvoke,
-    QueryToolWizardPreview, RedTeamSuiteCreate, Request, RetentionPolicy,
-    RetentionPolicySave, SECURITY_CATEGORIES, SECURITY_CATEGORY_LABELS,
-    SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache, SQLRequest,
-    ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate, SemanticJoinPolicy,
-    SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate, Session,
-    SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
+    ConversationAsk, ConversationCreate, ConversationMessage, ConversationRename,
+    ConversationReportCreate, DEFAULT_ARTIFACT_TARGETS, DataAsset, Depends,
+    EvaluationBaselineRequest, EvaluationCaseInput, EvaluationRun,
+    EvaluationRunRequest, EvaluationSet, EvaluationSetCreate, ExternalClient,
+    ExternalClientCreate, ExternalClientUpdate, ExternalExtraction,
+    ExternalExtractionCreate, ExternalInvocation, FastAPI, FeedbackCreate, Field, File,
+    FileStageRequest, Form, HTTPException, Header, Incident, IncidentResolveRequest,
+    IngestedFile, IngestionMapping, IngestionSchedule, Job, LearningSuggestion,
+    LearningSuggestionReview, LineageEdge, Literal, LoginRequest, MCPRequest,
+    MappingColumn, ModelCallLog, ModelProvider, NotebookCell, NotebookSave, ORMModel,
+    PasswordChange, Path, PipelineDefinition, PipelineGenerateRequest,
+    PipelineGenerationError, PipelinePackageDeliveryConfigSave, PipelinePackageSummary,
+    PipelineUpdateRequest, PipelineVersion, Project, ProjectCreate,
+    ProjectMemberUpdate, ProjectMembership, ProjectModelUpdate, PromptRollback,
+    PromptSave, ProviderCreate, ProviderUpdate, QualityRemediationRequest, QualityRule,
+    QualityRuleCreate, QualityRun, Query, QueryTool, QueryToolCreate, QueryToolGrant,
+    QueryToolGrantCreate, QueryToolInvoke, QueryToolWizardPreview, RedTeamSuiteCreate,
+    Request, RetentionPolicy, RetentionPolicySave, SECURITY_CATEGORIES,
+    SECURITY_CATEGORY_LABELS, SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache,
+    SQLRequest, ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate,
+    SemanticJoinPolicy, SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate,
+    Session, SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
     ToolDefinitionCreate, ToolDefinitionUpdate, ToolExecuteRequest, ToolExecution,
     ToolRuntimeError, ToolVersion, ToolVersionCreate, UPLOAD_DIR, UploadFile, User,
     UserCreate, UserFeedback, UserUpdate, _asset_relation_sql, _build_delivery_plan,
@@ -161,37 +169,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -201,7 +209,40 @@ router = APIRouter()
 def list_conversations(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
     conversations = db.scalars(select(Conversation).where(Conversation.project_id == project.id).order_by(Conversation.updated_at.desc())).all()
-    return [conversation_output(item, db) for item in conversations]
+    # One grouped count instead of loading every message of every conversation.
+    counts = dict(
+        db.execute(
+            select(ConversationMessage.conversation_id, func.count())
+            .join(Conversation, Conversation.id == ConversationMessage.conversation_id)
+            .where(Conversation.project_id == project.id)
+            .group_by(ConversationMessage.conversation_id)
+        ).all()
+    )
+    latest = (
+        select(ConversationMessage.conversation_id, func.max(ConversationMessage.created_at).label("latest_at"))
+        .join(Conversation, Conversation.id == ConversationMessage.conversation_id)
+        .where(Conversation.project_id == project.id)
+        .group_by(ConversationMessage.conversation_id)
+        .subquery()
+    )
+    last_messages = {
+        conversation_id: content
+        for conversation_id, content in db.execute(
+            select(ConversationMessage.conversation_id, ConversationMessage.content).join(
+                latest,
+                (latest.c.conversation_id == ConversationMessage.conversation_id)
+                & (latest.c.latest_at == ConversationMessage.created_at),
+            )
+        ).all()
+    }
+    return [
+        {
+            **as_dict(item, ["id", "project_id", "title", "summary", "created_by", "created_at", "updated_at"]),
+            "message_count": counts.get(item.id, 0),
+            "last_message": (last_messages.get(item.id) or "")[:240] or None,
+        }
+        for item in conversations
+    ]
 
 @router.post("/conversations", status_code=201)
 def create_conversation(payload: ConversationCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -215,29 +256,62 @@ def create_conversation(payload: ConversationCreate, user: User = Depends(get_cu
     return conversation_output(conversation, db)
 
 @router.get("/conversations/{conversation_id}/messages")
-def list_conversation_messages(conversation_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_conversation_messages(
+    conversation_id: str,
+    response: Response,
+    limit: int = Query(default=200, ge=1, le=500),
+    before: str | None = Query(default=None, max_length=36),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Most recent ``limit`` messages (ascending), optionally older than message ``before``."""
     project = require_current_project(db, user)
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    messages = db.scalars(select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id).order_by(ConversationMessage.created_at)).all()
+    query = select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id)
+    if before:
+        anchor = db.get(ConversationMessage, before)
+        if anchor is None or anchor.conversation_id != conversation.id:
+            raise HTTPException(status_code=404, detail="Anchor message not found")
+        query = query.where(ConversationMessage.created_at < anchor.created_at)
+    page = db.scalars(query.order_by(ConversationMessage.created_at.desc()).limit(limit + 1)).all()
+    response.headers["X-Has-More"] = "true" if len(page) > limit else "false"
+    messages = list(reversed(page[:limit]))
     return [as_dict(item, ["id", "conversation_id", "role", "content", "structured", "created_by", "created_at"]) for item in messages]
 
-@router.post("/conversations/{conversation_id}/messages", status_code=201)
-def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+
+def _load_conversation(db: Session, user: User, conversation_id: str) -> tuple[Project, Conversation]:
     require_workspace_editor(user, db)
     project = require_current_project(db, user)
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    return project, conversation
+
+
+def _answer_question(
+    db: Session,
+    user: User,
+    project: Project,
+    conversation: Conversation,
+    payload: ConversationAsk,
+    progress: Callable[[str, str], None] = lambda _stage, _label: None,
+    cancelled: threading.Event | None = None,
+) -> dict[str, Any]:
+    """One chat turn: ground + generate SQL, execute, route, answer, persist.
+
+    Shared by the JSON and streaming endpoints. The user turn is written only
+    after generation succeeds: flushing it first held SQLite's write lock
+    across every model call, and a failed generation (which commits its own
+    call log) left an unanswered message that polluted the next question.
+    """
     prior_messages = db.scalars(
         select(ConversationMessage)
         .where(ConversationMessage.conversation_id == conversation.id)
         .order_by(ConversationMessage.created_at)
     ).all()
-    user_message = ConversationMessage(conversation_id=conversation.id, role="user", content=payload.content, created_by=user.id)
-    db.add(user_message)
-    db.flush()
+    progress("grounding", "Finding relevant tables, metrics and joins, then drafting governed SQL")
     analysis = generate_sql(
         SQLRequest(
             question=payload.content,
@@ -249,7 +323,8 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
         db,
     )
     execution = analysis.get("execution")
-    if execution is None and payload.connector_id and _safe_read_only_sql(analysis.get("sql", "")):
+    if execution is None and payload.connector_id and _safe_read_only_sql(analysis.get("sql", ""), analysis.get("dialect")):
+        progress("executing", "Running a bounded read-only preview on the source system")
         connector = require_project_resource(db.get(Connector, payload.connector_id), project, "Connector")
         try:
             execution = main.execute_connector_query(
@@ -285,9 +360,19 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
                 status_line if check == "Execution requires the matching configured source system" else check
                 for check in checks
             ]
+    progress("routing", "Scoring SQL, governed tools and agents for this request")
+    try:
+        routing_model = selected_model_provider(db, user, "decision_routing")
+    except HTTPException:
+        routing_model = None
+    route = decide(db, project.id, payload.content, analysis.get("grounding"), llm_provider=routing_model)
+    progress("answering", "Writing the answer")
+    try:
+        provider = selected_model_provider(db, user, "conversation_summary")
+    except HTTPException:
+        provider = selected_model_provider(db, user)
     chart = _chart_from_result(payload.content, execution)
     row_count = execution.get("row_count", 0) if execution else 0
-    provider = selected_model_provider(db, user)
     answer = conversational_analysis_answer(
         provider,
         payload.content,
@@ -297,7 +382,19 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
         session_id=conversation.id,
         user_id=user.id,
     ) if provider else "I prepared a governed analysis."
+    if route["route"] == "clarify" and not row_count:
+        answer = (
+            "I could not ground this question confidently in the catalog, so treat the draft query below as a guess. "
+            "Which table, metric or time range do you mean? " + answer
+        )
+    if cancelled is not None and cancelled.is_set():
+        db.rollback()
+        raise HTTPException(status_code=499, detail="Request cancelled by the client before the answer was saved")
+    user_message = ConversationMessage(conversation_id=conversation.id, role="user", content=payload.content, created_by=user.id)
+    db.add(user_message)
+    db.flush()
     structured = {
+        "question": payload.content,
         "sql": analysis["sql"],
         "dialect": analysis["dialect"],
         "provider": analysis["provider"],
@@ -309,17 +406,106 @@ def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User 
         "chart": chart,
         "source": analysis["source"],
         "memory": {"prior_messages_used": len(prior_messages), "persisted": True},
+        "route": route,
+        "follow_ups": follow_up_questions(payload.content, execution),
     }
     assistant_message = ConversationMessage(conversation_id=conversation.id, role="assistant", content=answer, structured=structured)
     db.add(assistant_message)
+    db.flush()
+    db.add(RouteDecision(
+        project_id=project.id,
+        conversation_id=conversation.id,
+        message_id=assistant_message.id,
+        question=payload.content[:4_000],
+        route=route["route"],
+        confidence=route["confidence"],
+        backend=route["backend"],
+        policy_version=route["policy_version"],
+        candidates=route["candidates"],
+        risk=route["risk"],
+        outcome={"execution_error": bool((execution or {}).get("error")), "row_count": row_count},
+        created_by=user.id,
+    ))
     conversation.summary = refresh_conversation_summary(conversation, [*prior_messages, user_message, assistant_message])
     structured["memory"]["summary"] = conversation.summary or None
     if conversation.title == "New analysis":
         conversation.title = payload.content[:200]
     conversation.updated_at = datetime.now(timezone.utc)
-    audit(db, user, "conversation.answered", "conversation", conversation.id, {"dialect": payload.dialect, "row_count": row_count})
+    audit(db, user, "conversation.answered", "conversation", conversation.id, {
+        "dialect": payload.dialect,
+        "row_count": row_count,
+        "route": route["route"],
+        "route_confidence": route["confidence"],
+        "route_backend": route["backend"],
+        "route_policy": route["policy_version"],
+    })
     db.commit()
     return as_dict(assistant_message, ["id", "conversation_id", "role", "content", "structured", "created_by", "created_at"])
+
+
+@router.post("/conversations/{conversation_id}/messages", status_code=201)
+def ask_conversation(conversation_id: str, payload: ConversationAsk, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project, conversation = _load_conversation(db, user, conversation_id)
+    return _answer_question(db, user, project, conversation, payload)
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+def ask_conversation_stream(conversation_id: str, payload: ConversationAsk, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> StreamingResponse:
+    """Server-sent events: ``stage`` progress, then ``done`` with the saved message or ``error``.
+
+    The work runs on its own session in a worker thread, so the request holds no
+    database connection or transaction while models are called. If the client
+    disconnects, the answer is discarded instead of being saved.
+    """
+    project, conversation = _load_conversation(db, user, conversation_id)
+    user_id, project_id, conv_id = user.id, project.id, conversation.id
+    db.close()
+    events: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue()
+    cancelled = threading.Event()
+
+    def work() -> None:
+        with SessionLocal() as session:
+            try:
+                worker_user = session.get(User, user_id)
+                message = _answer_question(
+                    session,
+                    worker_user,
+                    session.get(Project, project_id),
+                    session.get(Conversation, conv_id),
+                    payload,
+                    progress=lambda stage, label: events.put(("stage", {"stage": stage, "label": label})),
+                    cancelled=cancelled,
+                )
+                events.put(("done", {"message": message}))
+            except HTTPException as exc:
+                events.put(("error", {"detail": exc.detail, "status": exc.status_code}))
+            except Exception as exc:  # pragma: no cover - surfaced to the client
+                events.put(("error", {"detail": str(exc)[:500], "status": 500}))
+            finally:
+                events.put(None)
+
+    # copy_context keeps the request id and pinned project for the worker thread.
+    threading.Thread(target=contextvars.copy_context().run, args=(work,), name="conversation-answer", daemon=True).start()
+
+    def stream() -> Iterator[str]:
+        try:
+            while True:
+                try:
+                    item = events.get(timeout=15)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if item is None:
+                    return
+                yield _sse(*item)
+        finally:
+            cancelled.set()
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 @router.post("/conversations/{conversation_id}/report", status_code=201)
 def save_conversation_report(conversation_id: str, payload: ConversationReportCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -342,8 +528,8 @@ def rename_conversation(conversation_id: str, payload: ConversationRename, user:
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if user.role == "analyst" and conversation.created_by != user.id:
-        raise HTTPException(status_code=403, detail="Analysts can rename only their own conversations")
+    if conversation.created_by != user.id and not main.can_manage_shared_content(user, db):
+        raise HTTPException(status_code=403, detail="Only project owners and maintainers can rename other people's conversations")
     conversation.title = payload.title.strip()
     conversation.updated_at = datetime.now(timezone.utc)
     audit(db, user, "conversation.renamed", "conversation", conversation_id, {"title": conversation.title})
@@ -357,8 +543,8 @@ def delete_conversation(conversation_id: str, user: User = Depends(get_current_u
     conversation = db.get(Conversation, conversation_id)
     if conversation is None or conversation.project_id != project.id:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if user.role == "analyst" and conversation.created_by != user.id:
-        raise HTTPException(status_code=403, detail="Analysts can delete only their own conversations")
+    if conversation.created_by != user.id and not main.can_manage_shared_content(user, db):
+        raise HTTPException(status_code=403, detail="Only project owners and maintainers can delete other people's conversations")
     for message in db.scalars(select(ConversationMessage).where(ConversationMessage.conversation_id == conversation.id)).all():
         db.delete(message)
     db.delete(conversation)

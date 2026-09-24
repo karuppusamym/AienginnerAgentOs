@@ -130,7 +130,7 @@ class DataPilotApiTests(unittest.TestCase):
         selected = self.client.post(f"/projects/{seeded_project['id']}/select", headers=self.headers)
         self.assertEqual(selected.status_code, 200)
         with patch(
-            "app.main.get_embed_configuration",
+            "app.core.get_embed_configuration",
             return_value={
                 "embedded_id": "embed-1",
                 "superset_domain": "http://localhost:8088",
@@ -218,7 +218,7 @@ class DataPilotApiTests(unittest.TestCase):
 
         dedicated_slug = f"datapilot-query-{artifact_id}"[:140]
         with patch(
-            "app.main.get_embed_configuration",
+            "app.core.get_embed_configuration",
             return_value={
                 "embedded_id": "query-embed-1", "superset_domain": "http://localhost:8088",
                 "dashboard_id": 91, "dashboard_slug": dedicated_slug,
@@ -253,7 +253,7 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(published_body["dashboard_title"], "One row analytics")
 
         with patch("app.routers.analytics.create_guest_token", return_value={"token": "guest-token-abc"}) as guest_mocked, \
-             patch("app.main.get_embed_configuration", return_value={
+             patch("app.core.get_embed_configuration", return_value={
                  "embedded_id": "query-embed-1", "superset_domain": "http://localhost:8088",
                  "dashboard_id": 91, "dashboard_slug": dedicated_slug, "dashboard_title": "One row analytics",
                  "dataset_relation": "staging.dp_query", "superset_dataset_id": 92, "chart_ids": [93, 94],
@@ -670,7 +670,7 @@ class DataPilotApiTests(unittest.TestCase):
         )
         self.assertEqual(connector_preview.status_code, 201)
         with patch(
-            "app.main.execute_connector_query",
+            "app.core.execute_connector_query",
             return_value={
                 "columns": ["txn_type", "total_amount"],
                 "rows": [{"txn_type": "deposit", "total_amount": 42.0}],
@@ -1142,7 +1142,7 @@ class DataPilotApiTests(unittest.TestCase):
             def record_event(self, event) -> None:
                 captured.append(event)
 
-        with patch("app.main.current_membership", return_value=SimpleNamespace(project_id="project-1")):
+        with patch("app.core.current_membership", return_value=SimpleNamespace(project_id="project-1")):
             with patch("app.governance._adapters", return_value=[CaptureAdapter()]):
                 audit(
                     SimpleNamespace(add=stored.append),
@@ -1846,7 +1846,7 @@ class DataPilotApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(created.status_code, 201)
-        with patch("app.main.record_governance_event") as recorded, patch("app.main.record_governance_score") as score_recorded:
+        with patch("app.core.record_governance_event") as recorded, patch("app.core.record_governance_score") as score_recorded:
             replay = self.client.post(
                 f"/evaluations/{created.json()['id']}/run",
                 headers=self.headers,
@@ -1906,7 +1906,7 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(executed.json()["outputs"][2]["output"]["value"], "6")
 
     def test_sql_write_is_blocked(self) -> None:
-        with patch("app.main.record_governance_event") as recorded:
+        with patch("app.core.record_governance_event") as recorded:
             response = self.client.post(
                 "/sql/execute",
                 headers=self.headers,
@@ -2139,7 +2139,7 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(cancelled.json()["status"], "CANCELLED")
         filtered = self.client.get("/jobs?status=CANCELLED", headers=self.headers).json()
         self.assertTrue(any(item["id"] == run.json()["job_id"] for item in filtered))
-        with patch("app.main.record_governance_score") as score_recorded:
+        with patch("app.core.record_governance_score") as score_recorded:
             feedback = self.client.post(
                 "/feedback",
                 headers=self.headers,
@@ -2669,7 +2669,7 @@ class DataPilotApiTests(unittest.TestCase):
         )
         self.assertEqual(extraction.status_code, 201, extraction.json())
         with patch(
-            "app.main.execute_connector_query",
+            "app.core.execute_connector_query",
             return_value={
                 "columns": ["account_id", "customer_id", "account_type", "status", "opened_at"],
                 "rows": [
@@ -2882,7 +2882,7 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertNotIn("activity.transactions", local_sql.json()["sql"])
         self.assertIsNotNone(local_sql.json()["execution"])
         with patch(
-            "app.main.execute_connector_query",
+            "app.core.execute_connector_query",
             return_value={
                 "columns": ["txn_type", "total_amount"],
                 "rows": [
@@ -2981,7 +2981,7 @@ class DataPilotApiTests(unittest.TestCase):
 
         rate_limit.configure_client(fakeredis.FakeRedis())
         try:
-            with patch("app.main.EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", 2):
+            with patch("app.core.EXTERNAL_QUERY_TOOL_RATE_LIMIT_PER_MINUTE", 2):
                 first = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
                 second = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})
                 third = self.client.post("/external/v1/query-tools/system.ping/invoke", headers=external_headers, json={"parameters": {}})

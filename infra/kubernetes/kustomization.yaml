@@ -4,6 +4,7 @@ namespace: datapilot
 resources:
   - namespace.yaml
   - configmap.yaml
+  - migrate-job.yaml
   - api.yaml
   - worker.yaml
   - web.yaml

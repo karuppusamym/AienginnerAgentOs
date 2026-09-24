@@ -82,12 +82,12 @@ class DataPilotEndpointsTests(unittest.TestCase):
         self.assertIn("catalog:write", perms_with_project_owner)
         self.assertIn("semantic:write", perms_with_project_owner)
 
-        # An engineer globally, but viewer in project -> actually engineer gets catalog:write globally, 
-        # so if the blending is a union, they still have write. 
-        # Wait, the blending is a union in project_permissions.
         user_eng = User(id="u2", role="engineer")
         perms_eng = project_permissions(user_eng, "viewer")
-        self.assertIn("catalog:write", perms_eng)
+        # Changed deliberately (review C2): the project role is authoritative, so
+        # a global engineer who is only a viewer here no longer keeps write access.
+        self.assertNotIn("catalog:write", perms_eng)
+        self.assertEqual(project_permissions(User(id="u3", role="admin"), "viewer"), {"*"})
 
     def test_agentic_self_healing_reflection(self) -> None:
         from app.temporal_activities import _reflect_on_tool_error

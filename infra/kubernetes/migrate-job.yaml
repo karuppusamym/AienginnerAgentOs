@@ -1,0 +1,27 @@
+# Run once per release before rolling out api/worker (e.g. a Helm/Argo pre-sync hook):
+#   kubectl -n datapilot delete job datapilot-migrate --ignore-not-found && kubectl apply -k infra/kubernetes
+# Migrations are versioned and recorded in the schema_versions table; on PostgreSQL the
+# run holds an advisory lock, so an accidental concurrent run waits instead of racing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: datapilot-migrate
+  namespace: datapilot
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: migrate
+          image: datapilot-api
+          command: ["python", "-m", "app.migrate"]
+          envFrom:
+            - configMapRef: {name: datapilot-config}
+            - secretRef: {name: datapilot-runtime}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}

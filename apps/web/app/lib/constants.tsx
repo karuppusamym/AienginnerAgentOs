@@ -1,50 +1,23 @@
 import {
   Activity,
-  AlertCircle,
   Archive,
   Bot,
   BookOpen,
-  Boxes,
   Braces,
   Check,
-  ChevronDown,
-  ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
   Code2,
   Database,
-  FileSpreadsheet,
   FileUp,
   FlaskConical,
   Gauge,
   GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
   LayoutDashboard,
-  LogOut,
-  Menu,
   MessageSquare,
   Network,
-  PanelLeftClose,
-  Play,
-  Plus,
-  RefreshCw,
-  Search,
-  Send,
-  Server,
   Settings,
   ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
 import type { NavKey } from "../types";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 export const navItems: { key: NavKey; label: string; icon: typeof LayoutDashboard }[] = [
   { key: "workspace", label: "Workspace", icon: LayoutDashboard },
@@ -109,6 +82,21 @@ export const defaultTourSteps: { key: NavKey; title: string; body: string }[] = 
     title: "Run trace and outputs",
     body: "Inspect plans, evidence, step outputs, logs, approvals, and retries for agent runs, scans, and operational workflows.",
   },
+];
+
+export type ProviderTypeOption = { value: string; label: string; baseUrl: string; modelPlaceholder: string; secretReference: string; secretPlaceholder: string };
+
+// Provider types offered when registering a model provider. `baseUrl` and
+// `secretReference` pre-fill the form (empty = API default / nothing pre-filled);
+// `secretPlaceholder` is only a hint.
+export const providerTypeOptions: ProviderTypeOption[] = [
+  { value: "company_gateway", label: "Company gateway", baseUrl: "", modelPlaceholder: "gateway-chat-model", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "gemini", label: "Gemini", baseUrl: "", modelPlaceholder: "gemini-model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openai", label: "OpenAI", baseUrl: "", modelPlaceholder: "openai-model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "claude", label: "Claude", baseUrl: "", modelPlaceholder: "claude-sonnet-5", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openai_compatible", label: "OpenAI compatible", baseUrl: "", modelPlaceholder: "model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", modelPlaceholder: "anthropic/claude-sonnet-5", secretReference: "env:OPENROUTER_API_KEY", secretPlaceholder: "env:OPENROUTER_API_KEY" },
+  { value: "local_mock", label: "Local mock", baseUrl: "", modelPlaceholder: "local-deterministic", secretReference: "", secretPlaceholder: "Not required" },
 ];
 
 export const connectorLabels: Record<string, string> = {

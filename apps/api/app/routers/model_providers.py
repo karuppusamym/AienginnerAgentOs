@@ -117,8 +117,11 @@ from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, reindex_all, search_documents
 from fastapi import APIRouter
 
-from .. import main
-from ..main import (
+from ..models import ModelRoute
+from ..provider_selection import MODEL_PURPOSES
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,37 +163,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -357,3 +360,61 @@ def model_usage(user: User = Depends(get_current_user), db: Session = Depends(ge
         provider = db.get(ModelProvider, provider_id)
         items.append({"provider_id": provider_id, "provider_name": provider.name if provider else "Deleted provider", "model": model, "calls": calls, "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0, "estimated_cost_usd": round(float(cost or 0), 8), "average_latency_ms": round(float(latency or 0), 1)})
     return {"project_id": project.id, "currency": "USD", "pricing_configured": bool(float(os.getenv("MODEL_INPUT_COST_PER_MILLION", "0")) or float(os.getenv("MODEL_OUTPUT_COST_PER_MILLION", "0"))), "items": items, "totals": {"calls": sum(item["calls"] for item in items), "input_tokens": sum(item["input_tokens"] for item in items), "output_tokens": sum(item["output_tokens"] for item in items), "estimated_cost_usd": round(sum(item["estimated_cost_usd"] for item in items), 8)}}
+
+
+class ModelRoutingUpdate(BaseModel):
+    assignments: dict[str, str | None] = Field(default_factory=dict)
+
+
+def _model_routing_output(db: Session, project_id: str) -> dict[str, Any]:
+    routes = {(route.project_id, route.purpose): route for route in db.scalars(select(ModelRoute)).all()}
+    providers = db.scalars(select(ModelProvider).order_by(ModelProvider.created_at)).all()
+    by_id = {provider.id: provider for provider in providers}
+    purposes = []
+    for purpose, label in MODEL_PURPOSES.items():
+        project_route = routes.get((project_id, purpose))
+        global_route = routes.get((None, purpose))
+        effective = by_id.get((project_route or global_route).provider_id) if (project_route or global_route) else None
+        purposes.append({
+            "purpose": purpose,
+            "label": label,
+            "provider_id": project_route.provider_id if project_route else (global_route.provider_id if global_route else None),
+            "scope": "project" if project_route else ("platform" if global_route else "default"),
+            "effective_provider": {"id": effective.id, "name": effective.name, "model": effective.default_model} if effective else None,
+        })
+    return {
+        "purposes": purposes,
+        "providers": [as_dict(provider, ["id", "name", "provider_type", "default_model", "status", "enabled"]) for provider in providers],
+    }
+
+
+@router.get("/model-routing")
+def get_model_routing(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = require_current_project(db, user)
+    return _model_routing_output(db, project.id)
+
+
+@router.put("/model-routing")
+def update_model_routing(payload: ModelRoutingUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Assign a provider per purpose for the current project (null clears the project override)."""
+    project = require_current_project(db, admin)
+    unknown = sorted(set(payload.assignments) - set(MODEL_PURPOSES))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown purposes: {', '.join(unknown)}")
+    for purpose, provider_id in payload.assignments.items():
+        existing = db.scalar(select(ModelRoute).where(ModelRoute.project_id == project.id, ModelRoute.purpose == purpose))
+        if provider_id is None:
+            if existing is not None:
+                db.delete(existing)
+            continue
+        provider = db.get(ModelProvider, provider_id)
+        if provider is None or not provider.enabled:
+            raise HTTPException(status_code=400, detail=f"Provider for {purpose} must exist and be enabled")
+        if existing is None:
+            db.add(ModelRoute(project_id=project.id, purpose=purpose, provider_id=provider_id, updated_by=admin.id))
+        else:
+            existing.provider_id = provider_id
+            existing.updated_by = admin.id
+    audit(db, admin, "model_routing.updated", "project", project.id, {"assignments": payload.assignments})
+    db.commit()
+    return _model_routing_output(db, project.id)

@@ -12,13 +12,19 @@ from .governance import initialize_governance
 from .schedule_runtime import due_schedule_ids
 from .temporal_activities import (
     execute_agent_plan,
+    execute_agent_step_activity,
     execute_external_extraction,
     execute_metadata_scan_activity,
     execute_scheduled_ingestion,
+    fail_agent_run_activity,
+    finalize_agent_run_activity,
+    prepare_agent_run_activity,
+    review_agent_plan_activity,
 )
-from .temporal_runtime import TASK_QUEUE
+from .temporal_runtime import TASK_QUEUE, get_temporal_client
 from .temporal_workflows import (
     AgentPlanWorkflow,
+    AgentRunWorkflow,
     ExternalExtractionWorkflow,
     MetadataScanWorkflow,
     ScheduledIngestionWorkflow,
@@ -61,7 +67,7 @@ async def run() -> None:
     address = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
     while True:
         try:
-            client = await Client.connect(address)
+            client = await get_temporal_client(address)
             break
         except Exception:
             logger.warning("Temporal not reachable at %s yet, retrying in 2s", address, exc_info=True)
@@ -69,8 +75,18 @@ async def run() -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[AgentPlanWorkflow, ScheduledIngestionWorkflow, MetadataScanWorkflow, ExternalExtractionWorkflow],
-        activities=[execute_agent_plan, execute_scheduled_ingestion, execute_metadata_scan_activity, execute_external_extraction],
+        workflows=[AgentRunWorkflow, AgentPlanWorkflow, ScheduledIngestionWorkflow, MetadataScanWorkflow, ExternalExtractionWorkflow],
+        activities=[
+            prepare_agent_run_activity,
+            execute_agent_step_activity,
+            review_agent_plan_activity,
+            finalize_agent_run_activity,
+            fail_agent_run_activity,
+            execute_agent_plan,  # legacy: drains pre-upgrade AgentPlanWorkflow runs
+            execute_scheduled_ingestion,
+            execute_metadata_scan_activity,
+            execute_external_extraction,
+        ],
     )
     await asyncio.gather(worker.run(), schedule_dispatch_loop(client))
 

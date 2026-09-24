@@ -1,52 +1,29 @@
 "use client";
 
 import {
-  Activity,
   AlertCircle,
-  Archive,
-  Bot,
   BookOpen,
-  Boxes,
-  Braces,
   Check,
   ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
   Database,
   FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
   KeyRound,
-  Layers3,
-  LayoutDashboard,
   LogOut,
   Menu,
-  MessageSquare,
-  Network,
+  Monitor,
+  Moon,
   PanelLeftClose,
-  Play,
   Plus,
   RefreshCw,
   Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
+  Sun,
   X,
-  XCircle,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, login, logout, SessionUser } from "./lib/api";
-import type { NavKey, Overview, Recommendation, SecurityOverview, Project, ModelProvider, SearchResult, Job, Approval } from "./types";
+import dynamic from "next/dynamic";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { api, clearLegacyToken, getActiveProject, logout, onUnauthorized, SessionUser, setActiveProject } from "./lib/api";
+import type { NavKey, Project, ModelProvider, SearchResult, Approval } from "./types";
 import { navItems, navGroups, roleLanding, TOUR_STORAGE_KEY, defaultTourSteps } from "./lib/constants";
 import { StatusPill, LoadingBlock, Modal } from "./components/shared";
 import { LoginScreen } from "./components/LoginScreen";
@@ -61,17 +38,60 @@ import { ArtifactsView } from "./components/ArtifactsView";
 import { NotebooksView } from "./components/NotebooksView";
 import { EvaluationsView } from "./components/EvaluationsView";
 import { QualityView } from "./components/QualityView";
-import { SupersetView } from "./components/SupersetView";
 import { ApprovalsView } from "./components/ApprovalsView";
 import { ToolsView } from "./components/ToolsView";
 import { AgentsView } from "./components/AgentsView";
 import { SemanticView } from "./components/SemanticView";
 import { AdminView } from "./components/admin";
 
+// The Superset embedded SDK is loaded only when the analytics view is opened.
+const SupersetView = dynamic(() => import("./components/SupersetView").then((module) => module.SupersetView), {
+  ssr: false,
+  loading: () => <LoadingBlock label="Loading analytics" />,
+});
+
+type ThemeChoice = "light" | "dark" | "system";
+type AnalysisRoute = { c: string; m: string };
+const THEME_STORAGE_KEY = "datapilot.theme";
+const THEME_LABELS: Record<ThemeChoice, string> = { light: "Light", dark: "Dark", system: "System" };
+const NEXT_THEME: Record<ThemeChoice, ThemeChoice> = { system: "light", light: "dark", dark: "system" };
+
+function isNavKey(value: string | null): value is NavKey {
+  return !!value && navItems.some((item) => item.key === value);
+}
+
+function canView(view: NavKey, role: string) {
+  if (view === "admin") return role === "admin";
+  if (view === "tools") return ["admin", "engineer"].includes(role);
+  return true;
+}
+
+function readUrlState(): { view: NavKey | null; route: AnalysisRoute } {
+  if (typeof window === "undefined") return { view: null, route: { c: "", m: "" } };
+  const params = new URLSearchParams(window.location.search);
+  const view = params.get("view");
+  return { view: isNavKey(view) ? view : null, route: { c: params.get("c") || "", m: params.get("m") || "" } };
+}
+
+/** Writes `?view=…[&c=…&m=…]` without reloading; no-op when the URL already matches. */
+function writeUrlState(view: NavKey, route: AnalysisRoute, replace: boolean) {
+  const params = new URLSearchParams();
+  params.set("view", view);
+  if (view === "conversations" && route.c) params.set("c", route.c);
+  if (view === "conversations" && route.c && route.m) params.set("m", route.m);
+  const search = `?${params.toString()}`;
+  if (window.location.search === search) return;
+  const url = `${window.location.pathname}${search}${window.location.hash}`;
+  if (replace) window.history.replaceState(window.history.state, "", url);
+  else window.history.pushState(window.history.state, "", url);
+}
+
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
-  const [active, setActive] = useState<NavKey>("workspace");
+  const [sessionNotice, setSessionNotice] = useState("");
+  const [active, setActiveState] = useState<NavKey>("workspace");
+  const [analysisRoute, setAnalysisRoute] = useState<AnalysisRoute>({ c: "", m: "" });
   // Keep the workspace focused by default; the rail can be expanded from the top bar.
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
@@ -91,23 +111,91 @@ export default function Home() {
   const [analysisSeed, setAnalysisSeed] = useState<{ question: string; connector_id: string } | null>(null);
   const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const [openNavGroups, setOpenNavGroups] = useState<Record<string, boolean>>({ overview: true, data: true, delivery: true, governance: false, administration: false });
+  const [theme, setTheme] = useState<ThemeChoice>("system");
+  const toastTimerRef = useRef<number | undefined>(undefined);
+  const suppressErrorsRef = useRef(false);
+  const roleRef = useRef("");
+  const deepLinkRef = useRef<NavKey | null>(null);
+  const landedUserRef = useRef<string | null>(null);
+  const tourAutoRef = useRef<string | null>(null);
+  const activeRef = useRef<NavKey>("workspace");
+  const hadUserRef = useRef(false);
 
   const notify = useCallback((message: string, tone: "ok" | "error" = "ok") => {
+    // After a 401 the login screen is shown; per-call error toasts would only be noise.
+    if (tone === "error" && suppressErrorsRef.current) return;
+    window.clearTimeout(toastTimerRef.current);
     setToast({ message, tone });
-    window.setTimeout(() => setToast(null), 3600);
+    toastTimerRef.current = window.setTimeout(() => setToast(null), tone === "error" ? 6000 : 3600);
+  }, []);
+  useEffect(() => () => window.clearTimeout(toastTimerRef.current), []);
+
+  const setActive = useCallback((view: NavKey, options: { c?: string; m?: string; replace?: boolean } = {}) => {
+    const role = roleRef.current;
+    const target = role && !canView(view, role) ? roleLanding[role] || "workspace" : view;
+    const route = target === "conversations" ? { c: options.c || "", m: options.m || "" } : { c: "", m: "" };
+    // Re-selecting the current Analysis view from the nav keeps the open thread.
+    if (target === activeRef.current && target === "conversations" && options.c === undefined) return;
+    activeRef.current = target;
+    setActiveState(target);
+    setAnalysisRoute(route);
+    writeUrlState(target, route, !!options.replace);
+  }, []);
+  const navigate = useCallback((view: NavKey) => setActive(view), [setActive]);
+
+  const onAnalysisRoute = useCallback((c: string, m: string, push: boolean) => {
+    if (activeRef.current !== "conversations") return;
+    setAnalysisRoute((current) => (current.c === c && current.m === m ? current : { c, m }));
+    writeUrlState("conversations", { c, m }, !push);
+  }, []);
+  const clearAnalysisSeed = useCallback(() => setAnalysisSeed(null), []);
+  const clearSqlSeed = useCallback(() => setSqlSeed(null), []);
+
+  // Initial URL state, back/forward, and theme preference.
+  useEffect(() => {
+    const initial = readUrlState();
+    if (initial.view) {
+      deepLinkRef.current = initial.view;
+      activeRef.current = initial.view;
+      setActiveState(initial.view);
+      setAnalysisRoute(initial.route);
+    }
+    function onPopState() {
+      const next = readUrlState();
+      const role = roleRef.current;
+      const view = next.view && (!role || canView(next.view, role)) ? next.view : roleLanding[role] || "workspace";
+      activeRef.current = view;
+      setActiveState(view);
+      setAnalysisRoute(view === "conversations" ? next.route : { c: "", m: "" });
+    }
+    window.addEventListener("popstate", onPopState);
+    try {
+      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      if (stored === "light" || stored === "dark") setTheme(stored);
+    } catch { /* storage unavailable */ }
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
+  // One global handler for expired sessions: back to the login screen, no toast storm.
+  useEffect(() => onUnauthorized(() => {
+    suppressErrorsRef.current = true;
+    window.clearTimeout(toastTimerRef.current);
+    setToast(null);
+    if (hadUserRef.current) setSessionNotice("Your session has ended. Sign in again to continue.");
+    setUser(null);
+    setAuthChecked(true);
+  }), []);
+
   useEffect(() => {
-    const token = window.localStorage.getItem("datapilot_token");
-    if (!token) {
-      setAuthChecked(true);
-      return;
-    }
+    // The session now lives in an httpOnly cookie; drop the token older builds stored.
+    clearLegacyToken();
     api<SessionUser>("/auth/me")
-      .then(setUser)
-      .catch(() => logout())
+      .then((me) => { setActiveProject(me.current_project_id); setUser(me); })
+      .catch(() => setUser(null))
       .finally(() => setAuthChecked(true));
   }, []);
+
+  useEffect(() => { roleRef.current = user?.role || ""; hadUserRef.current = !!user; }, [user]);
 
   useEffect(() => {
     if (searchQuery.trim().length < 2 || !user) {
@@ -128,45 +216,69 @@ export default function Home() {
     if (user?.must_change_password) setPasswordDialog(true);
   }, [user?.must_change_password]);
 
+  // Land on the role's home view only when the signed-in identity changes, not on
+  // every setUser (project switch, password change). A deep link wins on first load,
+  // and re-signing in as the same user after an expired session keeps the view.
   useEffect(() => {
-    if (user) setActive(roleLanding[user.role] || "workspace");
-  }, [user]);
+    if (!user?.id) return;
+    roleRef.current = user.role;
+    const deepLink = deepLinkRef.current;
+    deepLinkRef.current = null;
+    if (landedUserRef.current === user.id) return;
+    const firstIdentity = landedUserRef.current === null;
+    landedUserRef.current = user.id;
+    if (firstIdentity && deepLink && canView(deepLink, user.role)) {
+      writeUrlState(deepLink, readUrlState().route, true);
+      return;
+    }
+    setActive(roleLanding[user.role] || "workspace", { replace: true });
+  }, [user?.id, user?.role, setActive]);
 
+  const userId = user?.id;
   const loadControlPlane = useCallback(async () => {
-    if (!user) return;
+    if (!userId) return;
     try {
       const [projectData, providerData, approvalData] = await Promise.all([api<Project[]>("/projects"), api<ModelProvider[]>("/model-providers"), api<Approval[]>("/approvals?status=pending")]);
       setProjects(projectData);
       setProviders(providerData);
       setPendingApprovalCount(approvalData.length);
+      const current = projectData.find((project) => project.is_current);
+      if (current && !getActiveProject()) setActiveProject(current.id);
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Workspace configuration could not be loaded", "error");
     }
-  }, [notify, user]);
+  }, [notify, userId]);
 
   useEffect(() => { loadControlPlane(); }, [loadControlPlane]);
 
   const activeLabel = navItems.find((item) => item.key === active)?.label || "Workspace";
-  const currentProject = projects.find((project) => project.is_current) || projects.find((project) => project.id === user?.current_project_id) || projects[0];
+  const currentProject = projects.find((project) => project.id === user?.current_project_id) || projects.find((project) => project.is_current) || projects[0];
   const healthyProviders = providers.filter((provider) => provider.enabled && provider.status === "healthy");
-  const visibleNavItems = navItems.filter((item) => (item.key !== "admin" || user?.role === "admin") && (item.key !== "tools" || ["admin", "engineer"].includes(user?.role || "")));
+  const visibleNavItems = navItems.filter((item) => canView(item.key, user?.role || ""));
   const visibleNavGroups = navGroups.map((group) => ({ ...group, items: group.items.filter((key) => visibleNavItems.some((item) => item.key === key)) })).filter((group) => group.items.length);
   const tourSteps = defaultTourSteps.filter((step) => visibleNavItems.some((item) => item.key === step.key));
   const currentTourStep = tourSteps[tourStep] || tourSteps[0];
+  const currentTourKey = currentTourStep?.key;
+  const tourStepCount = tourSteps.length;
+  const firstTourKey = tourSteps[0]?.key;
 
+  // Auto-open the tour once per signed-in user; dismissing it keeps it closed for this session.
   useEffect(() => {
-    if (!user || user.must_change_password || passwordDialog || tourOpen || !tourSteps.length) return;
-    const completed = window.localStorage.getItem(TOUR_STORAGE_KEY);
+    if (!user || user.must_change_password || passwordDialog || tourOpen || !tourStepCount || !firstTourKey) return;
+    if (tourAutoRef.current === user.id) return;
+    let completed: string | null = null;
+    try { completed = window.localStorage.getItem(TOUR_STORAGE_KEY); } catch { completed = "unavailable"; }
+    tourAutoRef.current = user.id;
     if (completed) return;
     setTourStep(0);
-    setActive(tourSteps[0].key);
+    setActive(firstTourKey, { replace: true });
     setTourOpen(true);
-  }, [passwordDialog, tourOpen, tourSteps, user]);
+  }, [passwordDialog, tourOpen, tourStepCount, firstTourKey, user, setActive]);
 
   useEffect(() => {
-    if (!tourOpen || !currentTourStep) return;
-    setActive(currentTourStep.key);
-  }, [currentTourStep, tourOpen]);
+    if (!tourOpen || !currentTourKey) return;
+    setActive(currentTourKey, { replace: true });
+  }, [currentTourKey, tourOpen, setActive]);
 
   if (!authChecked) {
     return (
@@ -177,7 +289,7 @@ export default function Home() {
   }
 
   if (!user) {
-    return <LoginScreen onLogin={setUser} />;
+    return <LoginScreen notice={sessionNotice} onLogin={(signedIn) => { suppressErrorsRef.current = false; setSessionNotice(""); setActiveProject(signedIn.current_project_id); setUser(signedIn); }} />;
   }
 
   function openTour(stepIndex = 0) {
@@ -186,19 +298,39 @@ export default function Home() {
     setTourStep(nextStep);
     setMobileNav(false);
     setTourOpen(true);
-    setActive(tourSteps[nextStep].key);
+    setActive(tourSteps[nextStep].key, { replace: true });
   }
 
   function closeTour(markComplete: boolean) {
     setTourOpen(false);
     if (markComplete) {
-      window.localStorage.setItem(TOUR_STORAGE_KEY, "true");
+      try { window.localStorage.setItem(TOUR_STORAGE_KEY, "true"); } catch { /* storage unavailable */ }
     }
+  }
+
+  function chooseTheme(next: ThemeChoice) {
+    setTheme(next);
+    const root = document.documentElement;
+    if (next === "system") root.removeAttribute("data-theme"); else root.setAttribute("data-theme", next);
+    try {
+      if (next === "system") window.localStorage.removeItem(THEME_STORAGE_KEY); else window.localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch { /* storage unavailable */ }
+  }
+
+  async function signOut() {
+    await logout();
+    setSessionNotice("");
+    setUser(null);
   }
 
   async function switchProject(project: Project) {
     try {
       await api(`/projects/${project.id}/select`, { method: "POST" });
+      setActiveProject(project.id);
+      // Seeds and the open thread belong to the previous project.
+      setAnalysisSeed(null);
+      setSqlSeed(null);
+      if (activeRef.current === "conversations") setActive("conversations", { c: "", replace: true });
       setUser((current) => current ? { ...current, current_project_id: project.id, current_project_name: project.name } : current);
       await loadControlPlane();
       setProjectDialog(false);
@@ -232,6 +364,9 @@ export default function Home() {
       notify("Password changed");
     } catch (reason) { notify(reason instanceof Error ? reason.message : "Password change failed", "error"); }
   }
+  // Views remount on project switch so no view keeps data from the previous project.
+  const projectKey = user.current_project_id || "default";
+  const ThemeIcon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
       <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
@@ -257,7 +392,7 @@ export default function Home() {
           </button>
         </div>
         <nav className="main-nav" aria-label="Product navigation">
-          {visibleNavGroups.map((group) => <div className="nav-group" key={group.key}><button className="nav-group-toggle" onClick={() => setOpenNavGroups((current) => ({ ...current, [group.key]: !current[group.key] }))}><span>{group.label}</span><ChevronDown size={14} className={openNavGroups[group.key] ? "" : "collapsed"} /></button>{openNavGroups[group.key] && group.items.map((key) => { const item = navItems.find((candidate) => candidate.key === key); if (!item) return null; const Icon = item.icon; return <button key={item.key} className={active === item.key ? "active" : ""} onClick={() => { setActive(item.key); setMobileNav(false); }} title={item.label}><Icon size={18} strokeWidth={1.8} /><span>{item.label}</span>{item.key === "approvals" && pendingApprovalCount > 0 && <span className="nav-count">{pendingApprovalCount}</span>}</button>; })}</div>)}
+          {visibleNavGroups.map((group) => <div className="nav-group" key={group.key}><button className="nav-group-toggle" aria-expanded={!!openNavGroups[group.key]} onClick={() => setOpenNavGroups((current) => ({ ...current, [group.key]: !current[group.key] }))}><span>{group.label}</span><ChevronDown size={14} className={openNavGroups[group.key] ? "" : "collapsed"} /></button>{openNavGroups[group.key] && group.items.map((key) => { const item = navItems.find((candidate) => candidate.key === key); if (!item) return null; const Icon = item.icon; return <button key={item.key} className={active === item.key ? "active" : ""} aria-current={active === item.key ? "page" : undefined} onClick={() => { setActive(item.key); setMobileNav(false); }} title={item.label}><Icon size={18} strokeWidth={1.8} /><span>{item.label}</span>{item.key === "approvals" && pendingApprovalCount > 0 && <span className="nav-count">{pendingApprovalCount}</span>}</button>; })}</div>)}
         </nav>
         <div className="sidebar-footer">
           <div className="local-status">
@@ -320,6 +455,14 @@ export default function Home() {
               )}
             </div>
             <button
+              className="icon-button theme-toggle"
+              onClick={() => chooseTheme(NEXT_THEME[theme])}
+              aria-label={`Theme: ${THEME_LABELS[theme]}. Switch to ${THEME_LABELS[NEXT_THEME[theme]]}`}
+              title={`Theme: ${THEME_LABELS[theme]} (click for ${THEME_LABELS[NEXT_THEME[theme]]})`}
+            >
+              <ThemeIcon size={18} />
+            </button>
+            <button
               className="icon-button"
               onClick={() => openTour(0)}
               aria-label="Open product tour"
@@ -329,10 +472,7 @@ export default function Home() {
             </button>
             <button
               className="icon-button"
-              onClick={() => {
-                logout();
-                setUser(null);
-              }}
+              onClick={() => void signOut()}
               aria-label="Sign out"
               title="Sign out"
             >
@@ -341,12 +481,12 @@ export default function Home() {
           </div>
         </header>
 
-        <main className="content">
-          {active === "workspace" && <WorkspaceView setActive={setActive} notify={notify} />}
-          {active === "conversations" && <ConversationsView notify={notify} currentUser={user} seed={analysisSeed} />}
-          {active === "datasets" && <DatasetsView notify={notify} onOpenSQL={(dataset) => { setSqlSeed({ question: `Analyze ${dataset.schema_name}.${dataset.table_name} using its approved metadata`, dialect: dataset.source_name === "Local files" ? "postgres" : "sqlserver" }); setActive("sql"); }} onStartAnalysis={(dataset) => { setAnalysisSeed({ question: `Can you analyze the ${dataset.schema_name}.${dataset.table_name} dataset for me?`, connector_id: dataset.connector_id || "" }); setActive("conversations"); }} />}
+        <main className="content" key={projectKey}>
+          {active === "workspace" && <WorkspaceView setActive={navigate} notify={notify} />}
+          {active === "conversations" && <ConversationsView notify={notify} currentUser={user} seed={analysisSeed} onSeedConsumed={clearAnalysisSeed} routeConversationId={analysisRoute.c} routeMessageId={analysisRoute.m} onRouteChange={onAnalysisRoute} />}
+          {active === "datasets" && <DatasetsView notify={notify} onOpenSQL={(dataset) => { setSqlSeed({ question: `Analyze ${dataset.schema_name}.${dataset.table_name} using its approved metadata`, dialect: dataset.source_name === "Local files" ? "postgres" : "sqlserver" }); setActive("sql"); }} onStartAnalysis={(dataset) => { setAnalysisSeed({ question: `Can you analyze the ${dataset.schema_name}.${dataset.table_name} dataset for me?`, connector_id: dataset.connector_id || "" }); setActive("conversations", { c: "" }); }} />}
           {active === "files" && <FilesView notify={notify} currentUser={user} />}
-          {active === "sql" && <SQLView notify={notify} seed={sqlSeed} currentUser={user} />}
+          {active === "sql" && <SQLView notify={notify} seed={sqlSeed} currentUser={user} onSeedConsumed={clearSqlSeed} />}
           {active === "notebooks" && <NotebooksView notify={notify} />}
           {active === "pipelines" && <PipelinesView notify={notify} />}
           {active === "jobs" && <JobsView notify={notify} />}
@@ -358,14 +498,15 @@ export default function Home() {
           {active === "agents" && <AgentsView notify={notify} />}
           {active === "semantic" && <SemanticView notify={notify} />}
           {active === "evaluations" && <EvaluationsView notify={notify} />}
-          {active === "admin" && <AdminView currentUser={user} notify={notify} setActive={setActive} />}
+          {active === "admin" && <AdminView currentUser={user} notify={notify} setActive={navigate} />}
         </main>
       </div>
       {mobileNav && <button className="nav-backdrop" aria-label="Close menu" onClick={() => setMobileNav(false)} />}
       {toast && (
-        <div className={`toast ${toast.tone}`} role="status">
+        <div className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>
           {toast.tone === "ok" ? <Check size={18} /> : <AlertCircle size={18} />}
-          {toast.message}
+          <span>{toast.message}</span>
+          <button type="button" className="toast-close" onClick={() => { window.clearTimeout(toastTimerRef.current); setToast(null); }} aria-label="Dismiss notification"><X size={14} /></button>
         </div>
       )}
       {tourOpen && currentTourStep && (
@@ -406,7 +547,7 @@ export default function Home() {
         </Modal>
       )}
       {passwordDialog && <Modal title={user.must_change_password ? "Change temporary password" : "Change password"} onClose={() => setPasswordDialog(false)}><form className="modal-form" onSubmit={changePassword}><label>Current password<input type="password" value={passwordForm.current_password} onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })} required /></label><label>New password<input type="password" value={passwordForm.new_password} onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })} minLength={10} required /></label><div className="modal-actions"><button className="primary-button"><KeyRound size={17} />Change password</button></div></form></Modal>}
-      {projectDialog && <Modal title="Projects" onClose={() => setProjectDialog(false)}><div className="project-dialog-list">{projects.map((project) => <button key={project.id} className={project.is_current ? "selected" : ""} onClick={() => switchProject(project)}><span className="project-avatar">{project.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span><span><strong>{project.name}</strong><small>{project.environment} / {project.membership_role || "admin"}</small></span>{project.is_current ? <Check size={17} /> : <ChevronRight size={17} />}</button>)}</div>{["admin", "engineer"].includes(user.role) && <form className="modal-form project-create-form" onSubmit={createProject}><div className="subheading"><h4>New project</h4></div><label>Name<input value={projectForm.name} onChange={(event) => setProjectForm({ ...projectForm, name: event.target.value })} required /></label><label>Description<input value={projectForm.description} onChange={(event) => setProjectForm({ ...projectForm, description: event.target.value })} /></label><div className="modal-actions"><button className="primary-button"><Plus size={17} />Create project</button></div></form>}</Modal>}
+      {projectDialog && <Modal title="Projects" onClose={() => setProjectDialog(false)}><div className="project-dialog-list">{projects.map((project) => <button key={project.id} className={project.id === currentProject?.id ? "selected" : ""} onClick={() => switchProject(project)}><span className="project-avatar">{project.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span><span><strong>{project.name}</strong><small>{project.environment} / {project.membership_role || "admin"}</small></span>{project.id === currentProject?.id ? <Check size={17} /> : <ChevronRight size={17} />}</button>)}</div>{["admin", "engineer"].includes(user.role) && <form className="modal-form project-create-form" onSubmit={createProject}><div className="subheading"><h4>New project</h4></div><label>Name<input value={projectForm.name} onChange={(event) => setProjectForm({ ...projectForm, name: event.target.value })} required /></label><label>Description<input value={projectForm.description} onChange={(event) => setProjectForm({ ...projectForm, description: event.target.value })} /></label><div className="modal-actions"><button className="primary-button"><Plus size={17} />Create project</button></div></form>}</Modal>}
     </div>
   );
 }

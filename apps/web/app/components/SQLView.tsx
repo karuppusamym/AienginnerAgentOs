@@ -1,112 +1,42 @@
+import dynamic from "next/dynamic";
 import {
-  Activity,
-  AlertCircle,
   Archive,
   Bot,
-  BookOpen,
-  Boxes,
   Braces,
   Check,
-  ChevronDown,
   ChevronRight,
   CircleGauge,
-  Clock3,
-  CalendarClock,
   Code2,
   Database,
   FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
   Layers3,
   LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
   Network,
-  PanelLeftClose,
   Play,
-  Plus,
   RefreshCw,
-  Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
   Sparkles,
-  UserPlus,
-  Users,
-  X,
   XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { api, SessionUser } from "../lib/api";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
-  Dataset,
   Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
-  Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
   SQLResult,
   SQLExecutionResult,
-  SearchResult,
   Artifact,
   ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
 import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
   connectorLabels,
   connectorDialectForType,
-  statusTone,
 } from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel, PublishedQueryAnalyticsModal } from "./shared";
+import { StatusPill, EmptyState, Modal } from "./shared";
+
+// The Superset embedded SDK is only needed once a published dashboard is opened.
+const PublishedQueryAnalyticsModal = dynamic(() => import("./PublishedQueryAnalyticsModal").then((module) => module.PublishedQueryAnalyticsModal), { ssr: false });
 
 
-export function SQLView({ notify, seed, currentUser }: { notify: (message: string, tone?: "ok" | "error") => void; seed?: { question: string; dialect: string } | null; currentUser: SessionUser }) {
+export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify: (message: string, tone?: "ok" | "error") => void; seed?: { question: string; dialect: string } | null; currentUser: SessionUser; onSeedConsumed?: () => void }) {
   const [question, setQuestion] = useState("Show monthly deposit-account growth and explain unusual changes");
   const [dialect, setDialect] = useState("postgres");
   const [connectorId, setConnectorId] = useState("");
@@ -153,7 +83,9 @@ export function SQLView({ notify, seed, currentUser }: { notify: (message: strin
     setConnectorId("");
     setResult(null);
     setArtifactId(null);
-  }, [seed]);
+    // Clear the seed in the shell so revisiting SQL does not re-apply it.
+    onSeedConsumed?.();
+  }, [seed, onSeedConsumed]);
 
   async function generate(event: FormEvent) {
     event.preventDefault();

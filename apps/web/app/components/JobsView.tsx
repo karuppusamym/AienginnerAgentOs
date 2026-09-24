@@ -1,110 +1,22 @@
 import {
-  Activity,
   AlertCircle,
-  Archive,
-  Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  CircleGauge,
   Clock3,
-  CalendarClock,
-  Code2,
-  Database,
-  FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
   Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
   Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
-  X,
   XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api } from "../lib/api";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
   Incident,
   Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, LoadingBlock } from "./shared";
 
+
+const OUTPUT_LABELS: Record<string, string> = { step_skipped: "Step skipped", plan_only: "Plan only (not executed)" };
+const ACTIVE_JOB_STATES = ["RUNNING", "QUEUED", "PLANNING", "RETRYING"];
 
 export function JobsView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -112,9 +24,43 @@ export function JobsView({ notify }: { notify: (message: string, tone?: "ok" | "
   const [selected, setSelected] = useState<Job | null>(null);
   const [filter, setFilter] = useState<"all" | "running" | "action">("all");
   const [search, setSearch] = useState("");
-  const load = useCallback(() => Promise.all([api<Job[]>("/jobs"), api<Incident[]>("/incidents")]).then(([data, incidentData]) => { setJobs(data); setIncidents(incidentData); setSelected((current) => data.find((item) => item.id === current?.id) || data[0] || null); }), []);
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { const timer = window.setInterval(() => { if (jobs.some((job) => ["RUNNING", "QUEUED", "PLANNING", "RETRYING"].includes(job.status))) load(); }, 2000); return () => window.clearInterval(timer); }, [jobs, load]);
+  const jobsRef = useRef<Job[]>([]);
+  const inflightRef = useRef<AbortController | null>(null);
+  // One request at a time: a newer load (manual or poll) supersedes the one in flight.
+  const load = useCallback(async () => {
+    inflightRef.current?.abort();
+    const controller = new AbortController();
+    inflightRef.current = controller;
+    try {
+      const [data, incidentData] = await Promise.all([api<Job[]>("/jobs", { signal: controller.signal }), api<Incident[]>("/incidents", { signal: controller.signal })]);
+      if (controller.signal.aborted) return;
+      jobsRef.current = data;
+      setJobs(data);
+      setIncidents(incidentData);
+      setSelected((current) => data.find((item) => item.id === current?.id) || data[0] || null);
+    } catch (reason) {
+      if (!controller.signal.aborted) throw reason;
+    } finally {
+      if (inflightRef.current === controller) inflightRef.current = null;
+    }
+  }, []);
+  // A single interval for the view's lifetime: polls only while jobs are active and
+  // the tab is visible, and aborts any in-flight request on unmount.
+  useEffect(() => {
+    const hasActive = () => jobsRef.current.some((job) => ACTIVE_JOB_STATES.includes(job.status));
+    load().catch((reason) => notify(reason instanceof Error ? reason.message : "Jobs could not be loaded", "error"));
+    const timer = window.setInterval(() => {
+      if (document.hidden || inflightRef.current || !hasActive()) return;
+      load().catch(() => undefined);
+    }, 2000);
+    const onVisibility = () => { if (!document.hidden && !inflightRef.current && hasActive()) load().catch(() => undefined); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+      inflightRef.current?.abort();
+    };
+  }, [load, notify]);
   const filtered = jobs.filter((job) => (filter === "all" || (filter === "running" ? ["RUNNING", "QUEUED", "PLANNING"].includes(job.status) : ["WAITING_FOR_APPROVAL", "FAILED"].includes(job.status))) && (search ? job.title.toLowerCase().includes(search.toLowerCase()) || job.job_type.toLowerCase().includes(search.toLowerCase()) : true));
   async function cancelSelected() {
     if (!selected) return;
@@ -135,7 +81,7 @@ export function JobsView({ notify }: { notify: (message: string, tone?: "ok" | "
           ))}
         </section>
         <aside className="surface trace-panel">
-          {selected ? <><div className="section-heading compact"><div><span className="eyebrow">RUN TRACE</span><h3>{selected.title}</h3></div><StatusPill value={selected.status} /></div>{["DRAFT", "PLANNING", "QUEUED", "RUNNING", "WAITING_FOR_APPROVAL", "RETRYING"].includes(selected.status) && <div className="trace-actions"><button className="danger-button" onClick={cancelSelected}><XCircle size={16} />Cancel job</button></div>}{["FAILED", "CANCELLED", "PARTIALLY_SUCCEEDED"].includes(selected.status) && <div className="trace-actions"><button className="secondary-button" onClick={diagnoseSelected}><AlertCircle size={16} />Diagnose</button><button className="primary-button" onClick={retrySelected}><RefreshCw size={16} />Retry</button></div>}<div className="trace-list">{selected.plan.map((step, index) => <div key={index}><span className={`trace-dot ${step.status}`} /> <span><strong>{step.agent}</strong><small>{step.action}</small></span><StatusPill value={step.status} /></div>)}</div><div className="subheading"><h4>Evidence</h4><span>{selected.evidence.length}</span></div><div className="evidence-list">{selected.evidence.map((item, index) => <span key={index}><Layers3 size={15} />{item.label}</span>)}</div><div className="subheading"><h4>Step outputs</h4><span>{selected.outputs?.length || 0}</span></div>{selected.outputs?.length ? <div className="log-list">{(selected.outputs || []).map((output, index) => <div key={`${output.at || output.title || output.type}-${index}`}><Layers3 size={14} /><span><strong>{output.title || output.type}</strong><small>{[output.agent, output.tool, output.summary, output.at ? new Date(output.at).toLocaleString() : ""].filter(Boolean).join(" / ")}</small>{output.data ? <pre className="trace-output-data">{JSON.stringify(output.data, null, 2)}</pre> : null}</span></div>)}</div> : <div className="inline-empty trace-empty">No step outputs were captured for this run.</div>}<div className="subheading"><h4>Execution log</h4><span>{selected.logs?.length || 0}</span></div><div className="log-list">{(selected.logs || []).map((entry, index) => <div key={`${entry.at}-${index}`}><Clock3 size={14} /><span><strong>{entry.message}</strong><small>{new Date(entry.at).toLocaleString()} / {entry.level}</small></span></div>)}</div>{incidents.filter((incident) => incident.job_id === selected.id).map((incident) => <div className="incident-box" key={incident.id}><div><AlertCircle size={17} /><strong>{incident.title}</strong><StatusPill value={incident.status} /></div><p>{incident.root_cause}</p>{incident.remediation.map((item) => <small key={item}>{item}</small>)}</div>)}</> : <LoadingBlock />}
+          {selected ? <><div className="section-heading compact"><div><span className="eyebrow">RUN TRACE</span><h3>{selected.title}</h3></div><StatusPill value={selected.status} /></div>{["DRAFT", "PLANNING", "QUEUED", "RUNNING", "WAITING_FOR_APPROVAL", "RETRYING"].includes(selected.status) && <div className="trace-actions"><button className="danger-button" onClick={cancelSelected}><XCircle size={16} />Cancel job</button></div>}{["FAILED", "CANCELLED", "PARTIALLY_SUCCEEDED"].includes(selected.status) && <div className="trace-actions"><button className="secondary-button" onClick={diagnoseSelected}><AlertCircle size={16} />Diagnose</button><button className="primary-button" onClick={retrySelected}><RefreshCw size={16} />Retry</button></div>}<div className="trace-list">{selected.plan.map((step, index) => <div key={`${step.step_index ?? index}-${step.agent}`} className={step.status === "skipped" ? "skipped" : undefined}><span className={`trace-dot ${step.status}`} /> <span><strong>{step.agent}</strong><small>{step.action}</small>{step.status === "skipped" && <small className="skip-reason">Skipped{step.skip_reason ? `: ${step.skip_reason}` : ""}</small>}</span>{step.status === "skipped" ? <span className="status-pill neutral">skipped</span> : <StatusPill value={step.status} />}</div>)}</div><div className="subheading"><h4>Evidence</h4><span>{selected.evidence.length}</span></div><div className="evidence-list">{selected.evidence.map((item, index) => <span key={index}><Layers3 size={15} />{item.label}</span>)}</div><div className="subheading"><h4>Step outputs</h4><span>{selected.outputs?.length || 0}</span></div>{selected.outputs?.length ? <div className="log-list">{(selected.outputs || []).map((output, index) => <div key={`${output.at || output.title || output.type}-${index}`} className={output.type === "step_skipped" || output.type === "plan_only" ? "muted-output" : undefined}><Layers3 size={14} /><span><strong>{output.title || OUTPUT_LABELS[output.type] || output.type}</strong><small>{[output.agent, output.tool, output.summary, output.at ? new Date(output.at).toLocaleString() : ""].filter(Boolean).join(" / ")}</small>{output.data ? <pre className="trace-output-data">{JSON.stringify(output.data, null, 2)}</pre> : null}</span></div>)}</div> : <div className="inline-empty trace-empty">No step outputs were captured for this run.</div>}<div className="subheading"><h4>Execution log</h4><span>{selected.logs?.length || 0}</span></div><div className="log-list">{(selected.logs || []).map((entry, index) => <div key={`${entry.at}-${index}`}><Clock3 size={14} /><span><strong>{entry.message}</strong><small>{new Date(entry.at).toLocaleString()} / {entry.level}</small></span></div>)}</div>{incidents.filter((incident) => incident.job_id === selected.id).map((incident) => <div className="incident-box" key={incident.id}><div><AlertCircle size={17} /><strong>{incident.title}</strong><StatusPill value={incident.status} /></div><p>{incident.root_cause}</p>{incident.remediation.map((item) => <small key={item}>{item}</small>)}</div>)}</> : <LoadingBlock />}
         </aside>
       </div>
     </div>

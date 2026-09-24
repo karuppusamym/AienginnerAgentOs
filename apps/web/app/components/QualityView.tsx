@@ -1,112 +1,26 @@
 import {
-  Activity,
   AlertCircle,
-  Archive,
-  Bot,
-  BookOpen,
-  Boxes,
-  Braces,
   Check,
-  ChevronDown,
-  ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
-  Database,
-  FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
   Play,
   Plus,
   RefreshCw,
   Search,
-  Send,
-  Server,
-  Settings,
   ShieldCheck,
   Sparkles,
   Trash2,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
   Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
-  Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
   QualityRun,
   QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, EmptyState, Modal, Metric, useConfirm } from "./shared";
 
 
 export function QualityView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [confirm, confirmDialog] = useConfirm();
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [rules, setRules] = useState<QualityRule[]>([]);
   const [runs, setRuns] = useState<QualityRun[]>([]);
@@ -172,7 +86,7 @@ export function QualityView({ notify }: { notify: (message: string, tone?: "ok" 
   }
 
   async function deleteRule(ruleId: string) {
-    if (!confirm("Delete this quality rule?")) return;
+    if (!(await confirm({ title: "Delete quality rule", body: "Delete this quality rule? Its run history is kept." }))) return;
     try {
       await api(`/quality/rules/${ruleId}`, { method: "DELETE" });
       await load();
@@ -190,6 +104,7 @@ export function QualityView({ notify }: { notify: (message: string, tone?: "ok" 
       <section className="surface"><div className="table-header quality-grid"><span>Dataset</span><span>Rule</span><span>Pass rate</span><span>Status</span><span /></div>{filteredRules.length ? filteredRules.map((rule) => <div className="data-row quality-grid" key={rule.id}><strong>{rule.dataset}</strong><span><strong>{rule.name}</strong><small>{rule.rule_type.replaceAll("_", " ")} / {rule.column_name}</small></span><span className="mono">{rule.latest_run ? `${rule.latest_run.pass_rate}%` : "Not run"}</span><StatusPill value={rule.latest_run?.status || "ready"} /><div className="row-actions"><button className="icon-button" title="Run quality check" onClick={() => runRule(rule)} disabled={busyRuleId === rule.id}>{busyRuleId === rule.id ? <RefreshCw className="spin" size={16} /> : <Play size={16} />}</button><button className="icon-button danger" title="Delete rule" onClick={() => deleteRule(rule.id)}><Trash2 size={16} /></button></div></div>) : <EmptyState icon={<ShieldCheck size={24} />} title="No quality rules" body="No rules found matching your criteria." />}</section>
       {runs.length > 0 && <section className="surface"><div className="section-heading compact"><div><span className="eyebrow">RUN HISTORY</span><h3>Recent evaluations</h3></div><StatusPill value={`${runs.length} runs`} /></div><div className="quality-run-list">{runs.slice(0, 8).map((run) => <div key={run.id}><span><strong>{run.rule_name}</strong><small>{run.dataset}</small></span><span className="mono">{run.failed_rows}/{run.checked_rows} failed</span><StatusPill value={run.status} /><span><small>Quarantine</small><strong>{run.quarantine_relation || "None"}</strong></span></div>)}</div></section>}
       {showForm && <Modal title="Add quality rule" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={createRule}><label>Name<input value={ruleForm.name} onChange={(event) => setRuleForm({ ...ruleForm, name: event.target.value })} required /></label><div className="form-grid"><label>Column<select value={ruleForm.column_name} onChange={(event) => setRuleForm({ ...ruleForm, column_name: event.target.value })} required>{selectedDataset?.columns.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select></label><label>Rule type<select value={ruleForm.rule_type} onChange={(event) => setRuleForm({ ...ruleForm, rule_type: event.target.value })}><option value="not_null">Not null</option><option value="unique">Unique</option><option value="accepted_values">Accepted values</option><option value="range">Numeric range</option></select></label></div>{ruleForm.rule_type === "accepted_values" && <label>Accepted values<input value={ruleForm.values} onChange={(event) => setRuleForm({ ...ruleForm, values: event.target.value })} placeholder="active, closed, pending" required /></label>}{ruleForm.rule_type === "range" && <div className="form-grid"><label>Minimum<input type="number" value={ruleForm.min} onChange={(event) => setRuleForm({ ...ruleForm, min: event.target.value })} /></label><label>Maximum<input type="number" value={ruleForm.max} onChange={(event) => setRuleForm({ ...ruleForm, max: event.target.value })} /></label></div>}<label>Severity<select value={ruleForm.severity} onChange={(event) => setRuleForm({ ...ruleForm, severity: event.target.value })}><option value="error">Error</option><option value="warning">Warning</option></select></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Create rule</button></div></form></Modal>}
+      {confirmDialog}
     </div>
   );
 }

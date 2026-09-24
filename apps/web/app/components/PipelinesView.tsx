@@ -1,112 +1,33 @@
 import {
-  Activity,
-  AlertCircle,
-  Archive,
   Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
-  ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
   CalendarClock,
-  Code2,
   Database,
-  FileSpreadsheet,
   FileUp,
-  FlaskConical,
-  Gauge,
   GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
   Play,
   Plus,
   RefreshCw,
   Search,
-  Send,
-  Server,
   Settings,
   ShieldCheck,
   Sparkles,
-  UserPlus,
-  Users,
-  X,
   XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
   Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
   PipelineDefinition,
-  Incident,
   Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
   IngestionSchedule,
   MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, Modal, useConfirm } from "./shared";
 
 
 export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [confirm, confirmDialog] = useConfirm();
   const [objective, setObjective] = useState("Ingest daily transaction files, validate schema, and publish a clean local table");
   const [steps, setSteps] = useState<Job["plan"]>([]);
   const [busy, setBusy] = useState(false);
@@ -174,7 +95,7 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
     try { await api(`/pipelines/${id}/deploy`, { method: "POST" }); await loadSchedules(); notify("Pipeline deployment submitted for approval"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Deployment request failed", "error"); }
   }
   async function deletePipeline(pipeline: PipelineDefinition) {
-    if (!window.confirm(`Delete pipeline "${pipeline.name}" from the registry?`)) return;
+    if (!(await confirm({ title: "Delete pipeline", body: `Delete pipeline "${pipeline.name}" from the registry?` }))) return;
     try {
       await api(`/pipelines/${pipeline.id}`, { method: "DELETE" });
       await loadSchedules();
@@ -209,6 +130,7 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
       </section>
       {showSchedule && <Modal title="Schedule ingestion" onClose={() => setShowSchedule(false)}><form className="modal-form" onSubmit={createSchedule}><label>Name<input value={scheduleForm.name} onChange={(event) => setScheduleForm({ ...scheduleForm, name: event.target.value })} required /></label><label>Mapping<select value={scheduleForm.mapping_id} onChange={(event) => setScheduleForm({ ...scheduleForm, mapping_id: event.target.value, key_column: "", watermark_column: "" })} required>{mappings.map((mapping) => <option value={mapping.id} key={mapping.id}>{mapping.filename} / {mapping.target_table}</option>)}</select></label><div className="form-grid"><label>Cron<input value={scheduleForm.cron} onChange={(event) => setScheduleForm({ ...scheduleForm, cron: event.target.value })} required /></label><label>Load mode<select value={scheduleForm.load_mode} onChange={(event) => setScheduleForm({ ...scheduleForm, load_mode: event.target.value })}><option value="append">Append</option><option value="upsert">Merge</option></select></label></div><div className="form-grid"><label>Watermark<select value={scheduleForm.watermark_column} onChange={(event) => setScheduleForm({ ...scheduleForm, watermark_column: event.target.value })}><option value="">None</option>{selectedMapping?.columns.map((column) => <option value={column.target_name} key={column.target_name}>{column.target_name}</option>)}</select></label>{scheduleForm.load_mode === "upsert" && <label>Merge key<select value={scheduleForm.key_column} onChange={(event) => setScheduleForm({ ...scheduleForm, key_column: event.target.value })} required><option value="">Select key</option>{selectedMapping?.columns.map((column) => <option value={column.target_name} key={column.target_name}>{column.target_name}</option>)}</select></label>}</div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowSchedule(false)}>Cancel</button><button className="primary-button"><CalendarClock size={17} />Request approval</button></div></form></Modal>}
       {showGenerator && <Modal title={editingPipeline ? "Edit pipeline" : "Generate executable pipeline"} onClose={() => { setShowGenerator(false); setEditingPipeline(null); }}><form className="modal-form" onSubmit={generatePipeline}><label>Name<input value={pipelineForm.name} onChange={(event) => setPipelineForm({ ...pipelineForm, name: event.target.value })} required /></label>{!editingPipeline && <><label>Source dataset<select value={pipelineForm.source_asset_id} onChange={(event) => setPipelineForm({ ...pipelineForm, source_asset_id: event.target.value })} required>{datasets.map((dataset) => <option value={dataset.id} key={dataset.id}>{dataset.schema_name}.{dataset.table_name} / {dataset.row_count ?? "unknown"} rows</option>)}</select></label><div className="form-grid"><label>Target schema<input value={pipelineForm.target_schema} onChange={(event) => setPipelineForm({ ...pipelineForm, target_schema: event.target.value })} required /></label><label>Target table<input value={pipelineForm.target_table} onChange={(event) => setPipelineForm({ ...pipelineForm, target_table: event.target.value })} required /></label></div></>}<label>Objective<textarea value={objective} onChange={(event) => setObjective(event.target.value)} rows={4} required /></label>{editingPipeline && <div className="modal-note"><GitBranch size={16} />Saving creates the next draft version and deployment must be requested again.</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => { setShowGenerator(false); setEditingPipeline(null); }}>Cancel</button><button className="primary-button"><Sparkles size={16} />{editingPipeline ? "Save version" : "Generate"}</button></div></form></Modal>}
+      {confirmDialog}
     </div>
   );
 }

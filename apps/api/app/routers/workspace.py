@@ -119,8 +119,8 @@ from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import chunk_glossary_text, delete_document, index_document, search_documents
 from fastapi import APIRouter
 
-from .. import main
-from ..main import (
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -128,27 +128,27 @@ from ..main import (
     AuthProviderUpdate, Base, BaseModel, CORSMiddleware, ConfigDict, Connector,
     ConnectorCreate, ConnectorRuntimeError, ConnectorUpdate, Conversation,
     ConversationAsk, ConversationCreate, ConversationMessage, ConversationReportCreate,
-    DEFAULT_ARTIFACT_TARGETS, DataAsset, DataAssetUpdate, Depends, EvaluationBaselineRequest,
-    EvaluationCaseInput, EvaluationRun, EvaluationRunRequest, EvaluationSet,
-    EvaluationSetCreate, ExternalClient, ExternalClientCreate, ExternalClientUpdate,
-    ExternalExtraction, ExternalExtractionCreate, ExternalInvocation, FastAPI,
-    FeedbackCreate, Field, File, FileStageRequest, Form, HTTPException, Header,
-    Incident, IncidentResolveRequest, IngestedFile, IngestionMapping,
-    IngestionSchedule, Job, LearningSuggestion, LearningSuggestionReview, LineageEdge,
-    Literal, LoginRequest, MCPRequest, MappingColumn, ModelCallLog, ModelProvider,
-    NotebookCell, NotebookSave, ORMModel, PasswordChange, Path, PipelineDefinition,
-    PipelineGenerateRequest, PipelineGenerationError,
-    PipelinePackageDeliveryConfigSave, PipelinePackageSummary, PipelineUpdateRequest,
-    PipelineVersion, Project, ProjectCreate, ProjectMemberUpdate, ProjectMembership,
-    ProjectModelUpdate, PromptRollback, PromptSave, ProviderCreate, ProviderUpdate,
-    QualityRemediationRequest, QualityRule, QualityRuleCreate, QualityRun, Query,
-    QueryTool, QueryToolCreate, QueryToolGrant, QueryToolGrantCreate, QueryToolInvoke,
-    QueryToolWizardPreview, RedTeamSuiteCreate, Request, RetentionPolicy,
-    RetentionPolicySave, SECURITY_CATEGORIES, SECURITY_CATEGORY_LABELS,
-    SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache, SQLRequest,
-    ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate, SemanticJoinPolicy,
-    SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate, Session,
-    SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
+    DEFAULT_ARTIFACT_TARGETS, DataAsset, DataAssetUpdate, Depends,
+    EvaluationBaselineRequest, EvaluationCaseInput, EvaluationRun,
+    EvaluationRunRequest, EvaluationSet, EvaluationSetCreate, ExternalClient,
+    ExternalClientCreate, ExternalClientUpdate, ExternalExtraction,
+    ExternalExtractionCreate, ExternalInvocation, FastAPI, FeedbackCreate, Field, File,
+    FileStageRequest, Form, HTTPException, Header, Incident, IncidentResolveRequest,
+    IngestedFile, IngestionMapping, IngestionSchedule, Job, LearningSuggestion,
+    LearningSuggestionReview, LineageEdge, Literal, LoginRequest, MCPRequest,
+    MappingColumn, ModelCallLog, ModelProvider, NotebookCell, NotebookSave, ORMModel,
+    PasswordChange, Path, PipelineDefinition, PipelineGenerateRequest,
+    PipelineGenerationError, PipelinePackageDeliveryConfigSave, PipelinePackageSummary,
+    PipelineUpdateRequest, PipelineVersion, Project, ProjectCreate,
+    ProjectMemberUpdate, ProjectMembership, ProjectModelUpdate, PromptRollback,
+    PromptSave, ProviderCreate, ProviderUpdate, QualityRemediationRequest, QualityRule,
+    QualityRuleCreate, QualityRun, Query, QueryTool, QueryToolCreate, QueryToolGrant,
+    QueryToolGrantCreate, QueryToolInvoke, QueryToolWizardPreview, RedTeamSuiteCreate,
+    Request, RetentionPolicy, RetentionPolicySave, SECURITY_CATEGORIES,
+    SECURITY_CATEGORY_LABELS, SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache,
+    SQLRequest, ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate,
+    SemanticJoinPolicy, SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate,
+    Session, SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
     ToolDefinitionCreate, ToolDefinitionUpdate, ToolExecuteRequest, ToolExecution,
     ToolRuntimeError, ToolVersion, ToolVersionCreate, UPLOAD_DIR, UploadFile, User,
     UserCreate, UserFeedback, UserUpdate, _asset_relation_sql, _build_delivery_plan,
@@ -162,37 +162,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -545,11 +545,18 @@ def get_workspace_recommendations(
         select(DataAsset)
         .where(DataAsset.project_id == project.id)
         .order_by(DataAsset.schema_name, DataAsset.table_name)
-        .limit(limit)
+        .limit(limit * 4)
     ).all()
     suggestions: list[dict[str, str]] = []
+    seen_relations: set[str] = set()
     for asset in assets:
         relation = f"{asset.schema_name}.{asset.table_name}"
+        # The same relation can be catalogued from several sources; suggest it once.
+        if relation in seen_relations:
+            continue
+        if len(suggestions) >= limit:
+            break
+        seen_relations.add(relation)
         columns = [str(column.get("name", "")) for column in asset.columns if column.get("name")]
         date_column = next((name for name in columns if any(token in name.lower() for token in ("date", "time", "month", "year", "created", "updated"))), None)
         if date_column:

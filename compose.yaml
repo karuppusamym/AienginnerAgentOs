@@ -63,6 +63,11 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg://datapilot:${POSTGRES_PASSWORD:-datapilot-local}@postgres:5432/datapilot
+      # User/model SQL runs through a SELECT-only role (created by the API on
+      # first start because the Compose Postgres user may create roles).
+      STAGING_DATABASE_URL: postgresql+psycopg://datapilot_reader:${STAGING_READER_PASSWORD:-reader-local-change-me}@postgres:5432/datapilot
+      STAGING_READER_ROLE: datapilot_reader
+      STAGING_READER_PASSWORD: ${STAGING_READER_PASSWORD:-reader-local-change-me}
       JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-before-shared-use}
       CORS_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:3002
       UPLOAD_DIR: /data/uploads
@@ -112,6 +117,11 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg://datapilot:${POSTGRES_PASSWORD:-datapilot-local}@postgres:5432/datapilot
+      # User/model SQL runs through a SELECT-only role (created by the API on
+      # first start because the Compose Postgres user may create roles).
+      STAGING_DATABASE_URL: postgresql+psycopg://datapilot_reader:${STAGING_READER_PASSWORD:-reader-local-change-me}@postgres:5432/datapilot
+      STAGING_READER_ROLE: datapilot_reader
+      STAGING_READER_PASSWORD: ${STAGING_READER_PASSWORD:-reader-local-change-me}
       TEMPORAL_ADDRESS: temporal:7233
       QDRANT_URL: http://qdrant:6333
       UPLOAD_DIR: /data/uploads

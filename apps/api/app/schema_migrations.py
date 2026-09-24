@@ -106,9 +106,14 @@ def ensure_project_columns(engine: Engine) -> None:
                 connection.execute(text("ALTER TABLE agent_versions ADD COLUMN query_tool_names JSON"))
 
 
+GLOBAL_ALLOWED_TABLES = {"audit_events", "model_call_logs"}
+
+
 def backfill_project_columns(engine: Engine, project_id: str) -> None:
     with engine.begin() as connection:
         for table_name in PROJECT_SCOPED_TABLES:
+            if table_name in GLOBAL_ALLOWED_TABLES:
+                continue
             connection.execute(
                 text(f"UPDATE {table_name} SET project_id = :project_id WHERE project_id IS NULL"),
                 {"project_id": project_id},

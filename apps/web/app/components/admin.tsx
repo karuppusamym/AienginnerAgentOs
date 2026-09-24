@@ -1,111 +1,53 @@
 import {
-  Activity,
   AlertCircle,
   Archive,
   Bot,
-  BookOpen,
-  Boxes,
-  Braces,
   Check,
-  ChevronDown,
-  ChevronRight,
-  CircleGauge,
   Clock3,
-  CalendarClock,
-  Code2,
   Database,
   Edit2,
-  FileSpreadsheet,
-  FileUp,
   FlaskConical,
   Gauge,
-  GitBranch,
-  GitCompare,
   KeyRound,
   Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
   Network,
-  PanelLeftClose,
   Play,
   Plus,
   RefreshCw,
   Search,
-  Send,
   Server,
   Settings,
   ShieldCheck,
   Sparkles,
   UserPlus,
   Users,
-  X,
   XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api, ApiError, SessionUser } from "../lib/api";
 import type {
   NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
-  Dataset,
   Connector,
   ModelProvider,
   Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
   Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
   ExternalClient,
   QueryTool,
   QueryToolDraft,
   RelationOption,
-  QueryToolUsage,
   QueryToolRegistrySummary,
   PromptArtifact,
   RetentionPolicy,
   SchemaDrift,
   ModelUsage,
   LearningSuggestion,
+  ModelRouting,
 } from "../types";
 import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
   connectorLabels,
-  connectorDialectForType,
-  statusTone,
+  providerTypeOptions,
 } from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm } from "./shared";
 
 
 export function AdminView({ currentUser, notify, setActive: setAppActive }: { currentUser: SessionUser; notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
@@ -215,6 +157,7 @@ const REVIEW_TARGET_NAV: Record<string, { key: NavKey; label: string }> = {
 };
 
 export function GovernanceAdmin({ notify, setActive }: { notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
+  const [confirm, confirmDialog] = useConfirm();
   const emptyPrompt = { name: "", system_prompt: "", template: "", variables: "" };
   const [prompts, setPrompts] = useState<PromptArtifact[]>([]);
   const [policies, setPolicies] = useState<RetentionPolicy[]>([]);
@@ -227,7 +170,7 @@ export function GovernanceAdmin({ notify, setActive }: { notify: (message: strin
   const [suggestionFilter, setSuggestionFilter] = useState<"open" | "accepted" | "dismissed">("open");
   const [reviewingSuggestion, setReviewingSuggestion] = useState<LearningSuggestion | null>(null);
   const [reviewNote, setReviewNote] = useState("");
-  const [govTab, setGovTab] = useState<"prompts" | "retention" | "learning">("prompts");
+  const [govTab, setGovTab] = useState<"prompts" | "retention" | "learning" | "router">("prompts");
   const load = useCallback(async () => { const [promptData, retentionData] = await Promise.all([api<PromptArtifact[]>("/prompts"), api<RetentionPolicy[]>("/retention-policies")]); setPrompts(promptData); setPolicies(retentionData); }, []);
   const loadSuggestions = useCallback(async (status: "open" | "accepted" | "dismissed") => { try { setSuggestions(await api<LearningSuggestion[]>(`/learning-suggestions?status=${status}`)); } catch (reason) { notify(reason instanceof Error ? reason.message : "Learning suggestions unavailable", "error"); } }, [notify]);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Governance configuration unavailable", "error")); }, [load, notify]);
@@ -246,11 +189,12 @@ export function GovernanceAdmin({ notify, setActive }: { notify: (message: strin
   async function savePrompt(event: FormEvent) { event.preventDefault(); try { await api("/prompts", { method: "POST", body: JSON.stringify({ ...promptForm, variables: promptForm.variables.split(",").map((item) => item.trim()).filter(Boolean), prompt_id: editing?.id || null, metadata: {} }) }); setShowPrompt(false); await load(); notify("Prompt draft version saved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be saved", "error"); } }
   async function publishPrompt(prompt: PromptArtifact) { try { await api(`/artifacts/${prompt.id}/review`, { method: "POST", body: JSON.stringify({ decision: "approved", note: "Published from prompt governance" }) }); await load(); notify("Prompt approved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be approved", "error"); } }
   async function rollbackPrompt() { if (!editing) return; try { await api(`/prompts/${editing.id}/rollback`, { method: "POST", body: JSON.stringify({ version: rollbackVersion }) }); setShowPrompt(false); await load(); notify(`Prompt rolled back from version ${rollbackVersion}`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt rollback failed", "error"); } }
-  async function deletePrompt(prompt: PromptArtifact) { if (!window.confirm(`Delete prompt "${prompt.name}" and its version history?`)) return; try { await api(`/prompts/${prompt.id}`, { method: "DELETE" }); await load(); notify("Prompt deleted"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be deleted", "error"); } }
+  async function deletePrompt(prompt: PromptArtifact) { if (!(await confirm({ title: "Delete prompt", body: `Delete prompt "${prompt.name}" and its version history?` }))) return; try { await api(`/prompts/${prompt.id}`, { method: "DELETE" }); await load(); notify("Prompt deleted"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be deleted", "error"); } }
   async function saveRetention(event: FormEvent) { event.preventDefault(); try { await api("/retention-policies", { method: "POST", body: JSON.stringify(retentionForm) }); await load(); notify("Retention policy saved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Retention policy could not be saved", "error"); } }
   async function runRetention(policy: RetentionPolicy) { try { const result = await api<{ candidate_count: number }>(`/retention-policies/${policy.id}/run`, { method: "POST" }); notify(`${result.candidate_count} expired records sent for approval`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Retention preview failed", "error"); } }
   return <div className="view-stack">
-    <div className="tabs"><button className={govTab === "prompts" ? "active" : ""} onClick={() => setGovTab("prompts")}><Archive size={16} />Prompts</button><button className={govTab === "retention" ? "active" : ""} onClick={() => setGovTab("retention")}><Clock3 size={16} />Retention</button><button className={govTab === "learning" ? "active" : ""} onClick={() => setGovTab("learning")}><Sparkles size={16} />Learning loop{suggestions.length > 0 && suggestionFilter === "open" ? <span className="nav-count">{suggestions.length}</span> : null}</button></div>
+    <div className="tabs"><button className={govTab === "prompts" ? "active" : ""} onClick={() => setGovTab("prompts")}><Archive size={16} />Prompts</button><button className={govTab === "retention" ? "active" : ""} onClick={() => setGovTab("retention")}><Clock3 size={16} />Retention</button><button className={govTab === "learning" ? "active" : ""} onClick={() => setGovTab("learning")}><Sparkles size={16} />Learning loop{suggestions.length > 0 && suggestionFilter === "open" ? <span className="nav-count">{suggestions.length}</span> : null}</button><button className={govTab === "router" ? "active" : ""} onClick={() => setGovTab("router")}><Network size={16} />Router evaluation</button></div>
+    {govTab === "router" && <RouterEvaluationPanel notify={notify} />}
     {govTab === "prompts" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">PROMPT LIFECYCLE</span><h3>Versioned prompts</h3><p>Draft, review, approve, and roll back reusable model instructions.</p></div><button className="primary-button" onClick={() => openPrompt()}><Plus size={16} />New prompt</button></div><div className="table-header prompt-grid"><span>Prompt</span><span>Version</span><span>Status</span><span /></div>{prompts.map((prompt) => <div className="data-row prompt-grid" key={prompt.id}><button className="metric-main" onClick={() => openPrompt(prompt)}><strong>{prompt.name}</strong><small>{(prompt.content.variables || []).join(", ") || "No variables"}</small></button><span>v{prompt.version}</span><StatusPill value={prompt.status} /><span className="row-actions"><button className="icon-button" title="Approve prompt" disabled={prompt.status === "approved"} onClick={() => publishPrompt(prompt)}><Check size={16} /></button><button className="icon-button" title="Delete prompt and version history" onClick={() => deletePrompt(prompt)}><XCircle size={16} /></button></span></div>)}</section>}
     {govTab === "retention" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">DATA LIFECYCLE</span><h3>Retention controls</h3><p>Preview expired operational records and route permanent deletion through approval.</p></div></div><form className="inline-admin-form retention-form" onSubmit={saveRetention}><select value={retentionForm.resource_type} onChange={(event) => setRetentionForm({ ...retentionForm, resource_type: event.target.value })}><option value="audit_events">Audit events</option><option value="model_call_logs">Model call logs</option><option value="external_invocations">External invocations</option><option value="user_feedback">User feedback</option></select><input type="number" min={1} max={3650} value={retentionForm.retention_days} onChange={(event) => setRetentionForm({ ...retentionForm, retention_days: Number(event.target.value) })} aria-label="Retention days" /><button className="primary-button"><Archive size={16} />Save</button></form><div className="table-header retention-grid"><span>Resource</span><span>Days</span><span>Status</span><span /></div>{policies.map((policy) => <div className="data-row retention-grid" key={policy.id}><strong>{policy.resource_type.replaceAll("_", " ")}</strong><span>{policy.retention_days}</span><StatusPill value={policy.enabled ? "enabled" : "disabled"} /><button className="secondary-button" onClick={() => runRetention(policy)}><Play size={15} />Preview and run</button></div>)}</section>}
     {govTab === "learning" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">LEARNING LOOP</span><h3>Feedback-derived suggestions</h3><p>Repeated not-helpful feedback in the same area is grouped into one suggestion with escalating severity. Nothing here changes runtime behavior automatically — review and apply changes yourself.</p></div><select value={suggestionFilter} onChange={(event) => setSuggestionFilter(event.target.value as typeof suggestionFilter)} aria-label="Filter suggestions by status"><option value="open">Open</option><option value="accepted">Accepted</option><option value="dismissed">Dismissed</option></select></div>{suggestions.length ? <div className="table-header suggestion-grid"><span>Signal</span><span>Category</span><span>Occurrences</span><span>Severity</span><span /></div> : <div className="inline-empty">No {suggestionFilter} suggestions for this project.</div>}{suggestions.map((suggestion) => <div className="data-row suggestion-grid" key={suggestion.id}><span><strong>{suggestion.title}</strong><small>{suggestion.rationale}</small></span><span>{suggestion.category.replaceAll("_", " ")}</span><span className="mono">{suggestion.occurrence_count}</span><StatusPill value={suggestion.severity} />{suggestion.status === "open" ? <button className="secondary-button" onClick={() => openReview(suggestion)}><Check size={15} />Review</button> : <span className="caption">{suggestion.status} {suggestion.review_note ? `— ${suggestion.review_note}` : ""}</span>}</div>)}</section>}
@@ -266,7 +210,7 @@ export function GovernanceAdmin({ notify, setActive }: { notify: (message: strin
     </span>
   </div>
 )}
-<label>Review note<textarea rows={4} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="What you decided and why, for the audit trail" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => submitReview("dismissed")}><XCircle size={16} />Dismiss</button><button className="primary-button" onClick={() => submitReview("accepted")}><Check size={16} />Accept</button></div></Modal>}</div>;
+<label>Review note<textarea rows={4} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="What you decided and why, for the audit trail" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => submitReview("dismissed")}><XCircle size={16} />Dismiss</button><button className="primary-button" onClick={() => submitReview("accepted")}><Check size={16} />Accept</button></div></Modal>}{confirmDialog}</div>;
 }
 
 export function ProjectsAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
@@ -285,6 +229,7 @@ export function ProjectsAdmin({ notify }: { notify: (message: string, tone?: "ok
 }
 
 export function ConnectorsAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [confirm, confirmDialog] = useConfirm();
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [drift, setDrift] = useState<SchemaDrift[]>([]);
   const [showForm, setShowForm] = useState(false);
@@ -310,7 +255,7 @@ export function ConnectorsAdmin({ notify }: { notify: (message: string, tone?: "
   }
   async function test(id: string) { try { const result = await api<{ message: string }>(`/connectors/${id}/test`, { method: "POST" }); notify(result.message); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Connection test failed", "error"); } }
   async function scan(id: string) { try { const result = await api<{ status: string; job_id: string; assets_discovered?: number }>(`/connectors/${id}/scan`, { method: "POST" }); if (result.status === "QUEUED") { notify("Metadata scan queued in Temporal"); for (let attempt = 0; attempt < 30; attempt += 1) { await new Promise((resolve) => window.setTimeout(resolve, 500)); const job = await api<Job>(`/jobs/${result.job_id}`); if (["SUCCEEDED", "FAILED"].includes(job.status)) { notify(job.status === "SUCCEEDED" ? job.logs.at(-1)?.message || "Metadata scan completed" : "Metadata scan failed", job.status === "SUCCEEDED" ? "ok" : "error"); break; } } } else { notify(`Metadata scan completed: ${result.assets_discovered || 0} assets`); } await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Scan failed", "error"); } }
-  async function remove(connector: Connector) { if (!window.confirm(`Delete connector "${connector.name}"?`)) return; try { await api(`/connectors/${connector.id}`, { method: "DELETE" }); await load(); notify("Connector deleted"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Connector could not be deleted", "error"); } }
+  async function remove(connector: Connector) { if (!(await confirm({ title: "Delete connector", body: `Delete connector "${connector.name}"? Catalog entries discovered through it stop refreshing.` }))) return; try { await api(`/connectors/${connector.id}`, { method: "DELETE" }); await load(); notify("Connector deleted"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Connector could not be deleted", "error"); } }
   async function acknowledge(id: string) { try { await api(`/schema-drift/${id}/acknowledge`, { method: "POST" }); await load(); notify("Schema drift acknowledged"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Drift could not be acknowledged", "error"); } }
   return (
     <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">DATA ACCESS</span><h3>Registered data sources</h3><p>Every connector starts read-only and stores only a secret reference.</p></div><button className="primary-button" onClick={() => openForm()}><Plus size={17} />Add connector</button></div>
@@ -318,6 +263,7 @@ export function ConnectorsAdmin({ notify }: { notify: (message: string, tone?: "
       {connectors.map((connector) => <div className="data-row connector-grid" key={connector.id}><span><strong>{connector.name}</strong><small>{connector.description || `${connector.host || "Local service"} / ${connector.database || "-"}`}</small></span><span>{connectorLabels[connector.connector_type] || connector.connector_type}</span><span>{connector.connection_mode === "mcp" ? "Upstream MCP" : "Native driver"}</span><span>{connector.metadata_summary?.tables || 0} tables</span><StatusPill value={connector.status} /><span className="row-actions"><button className="icon-button" title="Edit connector" onClick={() => openForm(connector)}><Settings size={16} /></button><button className="icon-button" title="Test connection" onClick={() => test(connector.id)}><Gauge size={16} /></button><button className="icon-button" title="Scan metadata" onClick={() => scan(connector.id)}><RefreshCw size={16} /></button><button className="icon-button" title="Delete connector" onClick={() => remove(connector)}><XCircle size={16} /></button></span></div>)}
       {drift.length > 0 && <><div className="subheading"><h4>Schema drift</h4><span>{drift.filter((item) => item.status === "detected").length} open</span></div><div className="table-header drift-grid"><span>Relation</span><span>Changes</span><span>Status</span><span /></div>{drift.map((item) => <div className="data-row drift-grid" key={item.id}><span><strong>{item.relation}</strong><small>{new Date(item.detected_at).toLocaleString()}</small></span><span>{item.changes.map((change) => `${change.kind.replaceAll("_", " ")}: ${change.column}`).join(", ")}</span><StatusPill value={item.status} /><button className="icon-button" title="Acknowledge drift" disabled={item.status === "acknowledged"} onClick={() => acknowledge(item.id)}><Check size={16} /></button></div>)}</>}
       {showForm && <Modal title={editing ? "Edit data connector" : "Add data connector"} onClose={() => { setShowForm(false); setEditing(null); }}><form className="modal-form" onSubmit={save}><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><div className="form-grid"><label>System<select value={form.connector_type} onChange={(event) => setForm({ ...form, connector_type: event.target.value })}><option value="postgres">PostgreSQL</option><option value="sql_server">SQL Server</option><option value="oracle">Oracle</option><option value="teradata">Teradata</option><option value="bigquery">BigQuery</option><option value="local_files">Local files</option></select></label><label>Connection mode<select value={form.connection_mode} onChange={(event) => setForm({ ...form, connection_mode: event.target.value as "direct" | "mcp", mcp_server_url: event.target.value === "mcp" ? form.mcp_server_url : "" })}><option value="direct">Native driver</option><option value="mcp">Upstream MCP</option></select></label></div><label>Description<textarea rows={3} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="Owner, domain, sensitivity, and approved use." /></label>{form.connection_mode === "mcp" ? <label>MCP server URL<input value={form.mcp_server_url} onChange={(event) => setForm({ ...form, mcp_server_url: event.target.value })} placeholder="http://mcp-toolbox:5000/mcp" required /></label> : <div className="form-grid"><label>Host / project<input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} /></label><label>Database / dataset<input value={form.database} onChange={(event) => setForm({ ...form, database: event.target.value })} /></label></div>}<label>Secret reference<input value={form.secret_reference} onChange={(event) => setForm({ ...form, secret_reference: event.target.value })} placeholder={form.connection_mode === "mcp" ? "env:MCP_TOOLBOX_TOKEN" : form.connector_type === "sql_server" ? "env:SQLSERVER_CREDENTIALS" : "env:POSTGRES_CREDENTIALS"} /></label><div className="modal-note"><ShieldCheck size={16} />The connector is read-only. Credentials are stored only by reference and hidden from viewer roles.</div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => { setShowForm(false); setEditing(null); }}>Cancel</button><button className="primary-button">{editing ? "Save connector" : "Add connector"}</button></div></form></Modal>}
+      {confirmDialog}
     </section>
   );
 }
@@ -326,10 +272,23 @@ export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" 
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [usage, setUsage] = useState<ModelUsage | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({ name: "", provider_type: "company_gateway", base_url: "", default_model: "", embedding_model: "", secret_reference: "" });
+  const emptyProviderForm = { name: "", provider_type: "company_gateway", base_url: "", default_model: "", embedding_model: "", secret_reference: "" };
+  const [form, setForm] = useState(emptyProviderForm);
+  const providerType = providerTypeOptions.find((option) => option.value === form.provider_type) || providerTypeOptions[0];
+  // Switching type swaps pre-filled defaults, but never overwrites values the admin typed.
+  function chooseProviderType(value: string) {
+    const previous = providerType;
+    const next = providerTypeOptions.find((option) => option.value === value) || providerTypeOptions[0];
+    setForm((current) => ({
+      ...current,
+      provider_type: next.value,
+      base_url: !current.base_url || current.base_url === previous.baseUrl ? next.baseUrl : current.base_url,
+      secret_reference: !current.secret_reference || current.secret_reference === previous.secretReference ? next.secretReference : current.secret_reference,
+    }));
+  }
   const load = useCallback(() => Promise.all([api<ModelProvider[]>("/model-providers"), api<ModelUsage>("/model-usage")]).then(([providerData, usageData]) => { setProviders(providerData); setUsage(usageData); }), []);
   useEffect(() => { load(); }, [load]);
-  async function create(event: FormEvent) { event.preventDefault(); try { await api("/model-providers", { method: "POST", body: JSON.stringify({ ...form, enabled: true, is_default: false }) }); setShowForm(false); await load(); notify("Model provider added"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not add provider", "error"); } }
+  async function create(event: FormEvent) { event.preventDefault(); try { await api("/model-providers", { method: "POST", body: JSON.stringify({ ...form, enabled: true, is_default: false }) }); setShowForm(false); setForm(emptyProviderForm); await load(); notify("Model provider added"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not add provider", "error"); } }
   async function test(id: string) { try { const result = await api<{ message: string }>(`/model-providers/${id}/test`, { method: "POST" }); notify(result.message); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Provider test failed", "error"); } }
   async function setDefault(id: string) { try { await api(`/model-providers/${id}/default`, { method: "POST" }); notify("Default model provider updated"); await load(); } catch (reason) { notify(reason instanceof Error ? reason.message : "Provider could not be selected", "error"); } }
   const [reindexing, setReindexing] = useState(false);
@@ -345,10 +304,11 @@ export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" 
     }
   }
   return (
-    <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">MODEL ROUTING</span><h3>Provider registry</h3><p>Company gateway first, with Gemini, OpenAI, Claude, compatible, and local providers.</p></div><div style={{ display: "flex", gap: 8 }}><button className="secondary-button" disabled={reindexing} onClick={reindex} title="Re-embed all catalog assets and glossary documents under the active embedding model">{reindexing ? "Reindexing…" : "Reindex embeddings"}</button><button className="primary-button" onClick={() => setShowForm(true)}><Plus size={17} />Add provider</button></div></div>
+    <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">MODEL ROUTING</span><h3>Provider registry</h3><p>Company gateway first, with Gemini, OpenAI, Claude, OpenRouter, compatible, and local providers.</p></div><div style={{ display: "flex", gap: 8 }}><button className="secondary-button" disabled={reindexing} onClick={reindex} title="Re-embed all catalog assets and glossary documents under the active embedding model">{reindexing ? "Reindexing…" : "Reindex embeddings"}</button><button className="primary-button" onClick={() => setShowForm(true)}><Plus size={17} />Add provider</button></div></div>
       <div className="provider-grid">{providers.map((provider) => <article className="provider-card" key={provider.id}><div className="provider-heading"><span className="provider-icon"><Bot size={20} /></span><span>{provider.is_default && <span className="tag">default</span>}<StatusPill value={provider.status} /></span></div><h4>{provider.name}</h4><p>{provider.provider_type.replaceAll("_", " ")}</p><dl><div><dt>Chat model</dt><dd>{provider.default_model}</dd></div><div><dt>Embeddings</dt><dd>{provider.embedding_model || "Not configured"}</dd></div><div><dt>Secret</dt><dd>{provider.secret_reference || "Not required"}</dd></div></dl><div className="provider-actions"><button className="secondary-button" onClick={() => test(provider.id)}><Gauge size={16} />Test</button><button className="secondary-button" disabled={provider.is_default || provider.status !== "healthy"} onClick={() => setDefault(provider.id)}><Check size={16} />Set default</button></div></article>)}</div>
+      <ModelRoutingPanel notify={notify} providers={providers} />
       {usage && <section className="usage-strip"><div><span>Calls</span><strong>{usage.totals.calls}</strong></div><div><span>Input tokens</span><strong>{usage.totals.input_tokens.toLocaleString()}</strong></div><div><span>Output tokens</span><strong>{usage.totals.output_tokens.toLocaleString()}</strong></div><div><span>Estimated cost</span><strong>{usage.pricing_configured ? `$${usage.totals.estimated_cost_usd.toFixed(4)}` : "Rates not set"}</strong></div></section>}
-      {showForm && <Modal title="Add model provider" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><div className="form-grid"><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Type<select value={form.provider_type} onChange={(event) => setForm({ ...form, provider_type: event.target.value })}><option value="company_gateway">Company gateway</option><option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="openai_compatible">OpenAI compatible</option><option value="local_mock">Local mock</option></select></label></div><label>Base URL<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} /></label><div className="form-grid"><label>Default chat model<input value={form.default_model} onChange={(event) => setForm({ ...form, default_model: event.target.value })} required /></label><label>Embedding model<input value={form.embedding_model} onChange={(event) => setForm({ ...form, embedding_model: event.target.value })} /></label></div><label>Secret reference<input value={form.secret_reference} onChange={(event) => setForm({ ...form, secret_reference: event.target.value })} placeholder="env:MODEL_API_KEY" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Add provider</button></div></form></Modal>}
+      {showForm && <Modal title="Add model provider" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><div className="form-grid"><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Type<select value={form.provider_type} onChange={(event) => chooseProviderType(event.target.value)}>{providerTypeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label></div><label>Base URL<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder={providerType.baseUrl || "Provider default"} /></label><div className="form-grid"><label>Default chat model<input value={form.default_model} onChange={(event) => setForm({ ...form, default_model: event.target.value })} placeholder={providerType.modelPlaceholder} required /></label><label>Embedding model<input value={form.embedding_model} onChange={(event) => setForm({ ...form, embedding_model: event.target.value })} /></label></div><label>Secret reference<input value={form.secret_reference} onChange={(event) => setForm({ ...form, secret_reference: event.target.value })} placeholder={providerType.secretPlaceholder} /></label>{form.provider_type === "openrouter" && <div className="modal-note"><ShieldCheck size={16} />OpenRouter is OpenAI-compatible. Model names are namespaced by vendor, for example anthropic/claude-sonnet-5; the key is read from OPENROUTER_API_KEY.</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Add provider</button></div></form></Modal>}
     </section>
   );
 }
@@ -365,9 +325,9 @@ export function UsersAdmin({ notify, currentUser }: { notify: (message: string, 
   useEffect(() => { load(); }, [load]);
   async function create(event: FormEvent) { event.preventDefault(); try { await api("/admin/users", { method: "POST", body: JSON.stringify(form) }); setShowForm(false); await load(); notify("Local user added"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not add user", "error"); } }
   async function update(user: (typeof users)[number], patch: { role?: string; active?: boolean; name?: string; email?: string }) { try { await api(`/admin/users/${user.id}`, { method: "PUT", body: JSON.stringify(patch) }); await load(); notify("User access updated"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not update user", "error"); } }
-  function toggleActive(user: (typeof users)[number]) {
-    const verb = user.active ? "Deactivate" : "Activate";
-    if (user.active && !window.confirm(`${verb} ${user.name}? They will immediately lose the ability to sign in until reactivated.`)) return;
+  const [confirm, confirmDialog] = useConfirm();
+  async function toggleActive(user: (typeof users)[number]) {
+    if (user.active && !(await confirm({ title: "Deactivate user", body: `Deactivate ${user.name}? They will immediately lose the ability to sign in until reactivated.`, confirmLabel: "Deactivate" }))) return;
     update(user, { active: !user.active });
   }
   function openEdit(user: (typeof users)[number]) { setEditingUser(user); setEditForm({ name: user.name, email: user.email }); }
@@ -387,6 +347,134 @@ export function UsersAdmin({ notify, currentUser }: { notify: (message: string, 
       </> : <EmptyState icon={<UserPlus size={24} />} title={search ? "No matching users" : "No local users yet"} body={search ? "Try a different name or email." : "Add the first local account to get started."} />}
       {showForm && <Modal title="Add local user" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><label>Full name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Email<input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} required /></label><div className="form-grid"><label>Role<select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="admin">Admin</option><option value="engineer">Engineer</option><option value="analyst">Analyst</option><option value="viewer">Viewer</option></select></label><label>Temporary password<input type="password" value={form.temporary_password} onChange={(event) => setForm({ ...form, temporary_password: event.target.value })} minLength={10} required /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Create user</button></div></form></Modal>}
       {editingUser && <Modal title={`Edit ${editingUser.name}`} onClose={() => setEditingUser(null)}><form className="modal-form" onSubmit={saveEdit}><label>Full name<input value={editForm.name} onChange={(event) => setEditForm({ ...editForm, name: event.target.value })} required /></label><label>Email<input type="email" value={editForm.email} onChange={(event) => setEditForm({ ...editForm, email: event.target.value })} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setEditingUser(null)}>Cancel</button><button className="primary-button"><Check size={16} />Save</button></div></form></Modal>}
+      {confirmDialog}
+    </section>
+  );
+}
+
+/**
+ * Per-purpose model assignment (GET/PUT /model-routing). `null` means the purpose
+ * follows the project's pinned provider, then the global default.
+ */
+function ModelRoutingPanel({ notify, providers: registry }: { notify: (message: string, tone?: "ok" | "error") => void; providers: ModelProvider[] }) {
+  const [routing, setRouting] = useState<ModelRouting | null>(null);
+  const [draft, setDraft] = useState<Record<string, string | null>>({});
+  const [state, setState] = useState<"loading" | "ready" | "unavailable">("loading");
+  const [saving, setSaving] = useState(false);
+  const apply = useCallback((data: ModelRouting) => {
+    setRouting(data);
+    setDraft(Object.fromEntries(data.purposes.map((item) => [item.purpose, item.provider_id ?? null])));
+    setState("ready");
+  }, []);
+  useEffect(() => {
+    let active = true;
+    api<ModelRouting>("/model-routing")
+      .then((data) => { if (active) apply(data); })
+      .catch((reason) => {
+        if (!active) return;
+        setState("unavailable");
+        if (!(reason instanceof ApiError && (reason.status === 404 || reason.status === 405))) notify(reason instanceof Error ? reason.message : "Model routing could not be loaded", "error");
+      });
+    return () => { active = false; };
+  }, [apply, notify, registry]);
+  const purposes = routing?.purposes || [];
+  const options = routing?.providers || [];
+  const dirty = purposes.some((item) => (draft[item.purpose] ?? null) !== (item.provider_id ?? null));
+  async function save() {
+    setSaving(true);
+    try {
+      apply(await api<ModelRouting>("/model-routing", { method: "PUT", body: JSON.stringify({ assignments: draft }) }));
+      notify("Model routing saved");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Model routing could not be saved", "error");
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (state === "unavailable") return <div className="routing-panel"><div className="subheading"><h4>Model routing</h4></div><p className="admin-hint">Per-purpose model routing is not available from this API version.</p></div>;
+  return (
+    <div className="routing-panel">
+      <div className="subheading"><h4>Model routing</h4><span>Choose which provider answers each kind of request. &quot;Project/global default&quot; follows the project&apos;s pinned model, then the global default.</span></div>
+      {state === "loading" ? <LoadingBlock label="Loading model routing" /> : <>
+        <div className="table-header routing-grid"><span>Purpose</span><span>Provider</span><span>Effective model</span></div>
+        {purposes.map((item) => (
+          <div className="data-row routing-grid" key={item.purpose}>
+            <span><strong>{item.label}</strong><small>{item.purpose}</small></span>
+            <select className="table-select" aria-label={`Provider for ${item.label}`} value={draft[item.purpose] ?? ""} onChange={(event) => setDraft((current) => ({ ...current, [item.purpose]: event.target.value || null }))}>
+              <option value="">Project/global default</option>
+              {options.map((provider) => <option key={provider.id} value={provider.id} disabled={!provider.enabled}>{provider.name} / {provider.default_model}{provider.status !== "healthy" ? ` (${provider.status.replaceAll("_", " ")})` : ""}</option>)}
+            </select>
+            <span>{item.effective_provider ? `${item.effective_provider.name} / ${item.effective_provider.model}` : "No provider resolved"}{item.scope && <small>via {item.scope}</small>}</span>
+          </div>
+        ))}
+        {!purposes.length && <p className="admin-hint">The API reported no routable purposes.</p>}
+        <div className="form-end">
+          <button type="button" className="secondary-button" disabled={!dirty || saving} onClick={() => routing && apply(routing)}>Reset</button>
+          <button type="button" className="primary-button" disabled={!dirty || saving} onClick={() => void save()}>{saving ? <RefreshCw size={16} className="spin" /> : <Check size={16} />}Save routing</button>
+        </div>
+      </>}
+    </div>
+  );
+}
+
+type RouterEvaluation = {
+  cases: number;
+  backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; results: { question: string; expected: string; got: string; confidence: number; backend: string; correct: boolean }[] }>;
+};
+const ROUTER_BACKENDS = ["local", "llm", "jev"] as const;
+const ROUTER_SAMPLE_CASES = "How many orders were placed per month? | sql_analysis\nRun the monthly revenue reconciliation agent | agent_run\nWhat does it mean? | clarify";
+
+/** Replays labelled questions through each decision-router backend (POST /router/evaluate). */
+function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [casesText, setCasesText] = useState(ROUTER_SAMPLE_CASES);
+  const [backends, setBackends] = useState<Record<string, boolean>>({ local: true, llm: true, jev: false });
+  const [includeFeedback, setIncludeFeedback] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<RouterEvaluation | null>(null);
+  const [openBackend, setOpenBackend] = useState("");
+  async function run(event: FormEvent) {
+    event.preventDefault();
+    const cases = casesText.split("\n").map((line) => line.split("|").map((part) => part.trim())).filter(([question, route]) => question && route).map(([question, route]) => ({ question, expected_route: route }));
+    const selected = ROUTER_BACKENDS.filter((name) => backends[name]);
+    if (!selected.length) { notify("Choose at least one backend", "error"); return; }
+    if (!cases.length && !includeFeedback) { notify("Add at least one labelled case (question | expected_route) or include feedback", "error"); return; }
+    setRunning(true);
+    try {
+      setReport(await api<RouterEvaluation>("/router/evaluate", { method: "POST", body: JSON.stringify({ backends: selected, cases, include_feedback: includeFeedback }) }));
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Router evaluation failed", "error");
+    } finally {
+      setRunning(false);
+    }
+  }
+  const rows = report ? Object.entries(report.backends) : [];
+  return (
+    <section className="surface admin-surface">
+      <div className="section-heading"><div><span className="eyebrow">DECISION ROUTER</span><h3>Router evaluation</h3><p>Replay labelled questions, plus answers users rated, through each routing backend. Enable a backend only if it wins on your own data.</p></div></div>
+      <form className="modal-form router-eval-form" onSubmit={run}>
+        <label>Labelled cases (one per line: question | expected_route)<textarea rows={4} value={casesText} onChange={(event) => setCasesText(event.target.value)} placeholder="How many orders per month? | sql_analysis" /></label>
+        <div className="router-eval-options">
+          {ROUTER_BACKENDS.map((name) => <label key={name} className="check-option"><input type="checkbox" checked={!!backends[name]} onChange={(event) => setBackends((current) => ({ ...current, [name]: event.target.checked }))} />{name}</label>)}
+          <label className="check-option"><input type="checkbox" checked={includeFeedback} onChange={(event) => setIncludeFeedback(event.target.checked)} />Include rated answers</label>
+          <button className="primary-button" disabled={running}>{running ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run evaluation</button>
+        </div>
+      </form>
+      {report && <>
+        <div className="subheading"><h4>Results</h4><span>{report.cases} case{report.cases === 1 ? "" : "s"}</span></div>
+        <div className="table-header router-eval-grid"><span>Backend</span><span>Effective</span><span>Accuracy</span><span>Avg latency</span><span /></div>
+        {rows.map(([name, item]) => (
+          <div key={name}>
+            <div className="data-row router-eval-grid">
+              <span><strong>{name}</strong></span>
+              <span>{item.effective_backend || "-"}{item.effective_backend && item.effective_backend !== name ? " (fallback)" : ""}</span>
+              <span>{item.accuracy == null ? "-" : `${Math.round(item.accuracy * 100)}%`}</span>
+              <span>{item.avg_latency_ms == null ? "-" : `${item.avg_latency_ms} ms`}</span>
+              <button type="button" className="text-button" onClick={() => setOpenBackend(openBackend === name ? "" : name)} aria-expanded={openBackend === name}>{openBackend === name ? "Hide cases" : "Cases"}</button>
+            </div>
+            {openBackend === name && <div className="router-eval-cases">{item.results.map((result, index) => <div key={index} className={result.correct ? "" : "miss"}>{result.correct ? <Check size={13} /> : <XCircle size={13} />}<span><strong>{result.question}</strong><small>expected {result.expected} · got {result.got} ({Math.round(result.confidence * 100)}%)</small></span></div>)}</div>}
+          </div>
+        ))}
+      </>}
     </section>
   );
 }

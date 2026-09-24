@@ -116,9 +116,11 @@ from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_meta
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
+from starlette.concurrency import run_in_threadpool
+from ..temporal_activities import agent_runtime_evidence
 
-from .. import main
-from ..main import (
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,37 +162,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -245,12 +247,24 @@ async def cancel_job(job_id: str, user: User = Depends(get_current_user), db: Se
 
 @router.post("/jobs/{job_id}/retry", status_code=201)
 async def retry_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    main.require_any_permission(user, db, main.AGENT_RUNNERS, "Your role cannot retry jobs")
     project = require_current_project(db, user)
     original = db.get(Job, job_id)
     require_project_resource(original, project, "Job")
     if original.status not in {"FAILED", "CANCELLED", "PARTIALLY_SUCCEEDED"}:
         raise HTTPException(status_code=409, detail="Only failed, cancelled, or partial jobs can be retried")
-    retry = Job(project_id=project.id, title=f"Retry: {original.title}"[:200], job_type=original.job_type, status="RETRYING", progress=5, plan=[{**step, "status": "waiting"} for step in original.plan], evidence=[*original.evidence, {"type": "retry", "label": f"Retry of {original.id[:8]}"}], logs=[{"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Retry requested by {user.email}"}], outputs=[], created_by=user.id)
+    # The retry keeps the original's autonomy level and full objective (the
+    # title is truncated to 200 chars) but never inherits its plan binding:
+    # the retry is re-planned and, if risky, held for a fresh approval.
+    original_runtime = next((dict(entry) for entry in (original.evidence or []) if isinstance(entry, dict) and entry.get("agent_runtime")), None)
+    objective = str((original_runtime or {}).get("objective") or original.title)
+    retry_evidence = [
+        entry for entry in (original.evidence or [])
+        if not (isinstance(entry, dict) and entry.get("agent_runtime"))
+    ]
+    if original_runtime is not None:
+        retry_evidence.insert(0, agent_runtime_evidence(int(original_runtime.get("autonomy_level", 2)), objective))
+    retry = Job(project_id=project.id, title=f"Retry: {original.title}"[:200], job_type=original.job_type, status="RETRYING", progress=5, plan=[{**step, "status": "waiting"} for step in original.plan], evidence=[*retry_evidence, {"type": "retry", "label": f"Retry of {original.id[:8]}"}], logs=[{"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Retry requested by {user.email}"}], outputs=[], created_by=user.id)
     db.add(retry)
     db.flush()
     incident = db.scalar(select(Incident).where(Incident.project_id == project.id, Incident.job_id == original.id).order_by(Incident.created_at.desc()).limit(1))
@@ -259,7 +273,7 @@ async def retry_job(job_id: str, user: User = Depends(get_current_user), db: Ses
     audit(db, user, "job.retry_requested", "job", retry.id, {"original_job_id": original.id})
     db.commit()
     try:
-        workflow_id = await start_agent_workflow(retry.id, original.title)
+        workflow_id = await start_agent_workflow(retry.id, objective)
     except Exception as exc:
         retry.status = "FAILED"
         retry.progress = 100
@@ -267,10 +281,12 @@ async def retry_job(job_id: str, user: User = Depends(get_current_user), db: Ses
         db.commit()
         return {"id": retry.id, "status": retry.status, "workflow_id": None}
     if workflow_id:
-        retry.status = "QUEUED"
+        db.refresh(retry)
+        if retry.status == "RETRYING":
+            retry.status = "QUEUED"
         retry.logs = [*retry.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started"}]
     else:
-        run_agent_plan_locally(retry.id, original.title)
+        await run_in_threadpool(run_agent_plan_locally, retry.id, objective)
         db.refresh(retry)
         retry.logs = [*retry.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local retry fallback"}]
     db.commit()

@@ -14,6 +14,7 @@ import httpx
 
 from .database import engine
 from .staging import execute_parameterized_read_only
+from .sql_guard import is_read_only
 from .models import Connector
 from .governance import record_governance_event
 from .pii import annotate_columns, protect_rows
@@ -38,8 +39,15 @@ class MetadataDiscovery:
 
 
 def resolve_credentials(secret_reference: str | None) -> dict[str, Any]:
+    from .model_runtime import secret_name_allowed
+
+    if secret_reference and secret_reference.startswith("env:") and not secret_name_allowed(secret_reference[4:]):
+        raise ConnectorRuntimeError("That environment variable is reserved for platform secrets and cannot be used as a connector credential")
     if not secret_reference or not secret_reference.startswith("env:"):
-        raise ConnectorRuntimeError("An env: secret reference is required")
+        raise ConnectorRuntimeError(
+            "This connector has no credentials configured. Add an env:VARIABLE_NAME secret reference "
+            "in Admin > Connectors to run live previews; the SQL was still generated and validated."
+        )
     variable = secret_reference[4:].strip()
     raw = os.getenv(variable, "")
     if not variable or not raw:
@@ -610,6 +618,8 @@ def _validate_read_only_query(sql: str) -> str:
         raise ConnectorRuntimeError("Exactly one read-only SELECT statement is required")
     if FORBIDDEN_SQL.search(normalized):
         raise ConnectorRuntimeError("The query contains a prohibited operation")
+    if not is_read_only(normalized):
+        raise ConnectorRuntimeError("The query is not a single read-only SELECT in any supported dialect")
     return normalized
 
 
@@ -707,15 +717,19 @@ def execute_connector_query(
                     database=_required({"database": connector.database}, "database"),
                     login_timeout=10,
                     timeout=timeout_seconds,
-                    autocommit=True,
+                    autocommit=False,
                 )
                 try:
                     with connection.cursor() as cursor:
+                        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                         cursor.execute(statement, tuple(values))
                         columns = [str(item[0]) for item in cursor.description]
                         rows = list(cursor.fetchmany(limit + 1))
                 finally:
-                    connection.close()
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
             elif connector.connector_type == "postgres":
                 import psycopg
 

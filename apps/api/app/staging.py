@@ -8,6 +8,8 @@ from typing import Any
 from sqlalchemy import Boolean, Column, Float, Integer, MetaData, Table, Text, and_, delete, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
 from .pii import protect_rows
+from .sql_guard import check_read_only
+import time
 
 
 IDENTIFIER = re.compile(r"[^a-zA-Z0-9_]+")
@@ -15,6 +17,62 @@ FORBIDDEN_SQL = re.compile(
     r"\b(insert|update|delete|merge|drop|alter|truncate|create|grant|revoke|copy|call|execute|vacuum|analyze)\b",
     re.IGNORECASE,
 )
+
+
+SYSTEM_RELATIONS = {"pg_authid", "pg_shadow", "pg_user_mapping", "pg_user_mappings", "sqlite_master", "sqlite_schema", "sqlite_temp_master"}
+_SQL_TOKEN = re.compile(r'"[^"]*"|[A-Za-z_][A-Za-z0-9_$]*|[.,()]')
+_SQL_NOISE = re.compile(r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/", re.DOTALL)
+_CLAUSE_END = {"where", "group", "order", "having", "limit", "union", "intersect", "except", "on", "using", "join",
+               "inner", "left", "right", "full", "cross", "natural", "window", "fetch", "offset", "qualify", "lateral"}
+
+
+def application_relations() -> set[str]:
+    """Table names owned by DataPilot's own metadata schema (users, providers, audit...)."""
+    from .database import Base  # late import: staging is imported while models load
+
+    return {table.name.lower() for table in Base.metadata.tables.values()}
+
+
+def referenced_relations(sql: str) -> list[tuple[str | None, str]]:
+    """Best-effort (schema, table) references that follow FROM / JOIN, including comma lists."""
+    tokens = [t.strip('"').lower() if t.startswith('"') else t.lower() for t in _SQL_TOKEN.findall(_SQL_NOISE.sub(" ", sql))]
+    found: list[tuple[str | None, str]] = []
+    index = 0
+    while index < len(tokens):
+        if tokens[index] not in {"from", "join"}:
+            index += 1
+            continue
+        index += 1
+        while index < len(tokens):
+            if tokens[index] == "(":
+                break  # subquery or table function; its own FROM is scanned later
+            parts = [tokens[index]]
+            index += 1
+            while index + 1 < len(tokens) and tokens[index] == ".":
+                parts.append(tokens[index + 1])
+                index += 2
+            found.append((parts[-2] if len(parts) > 1 else None, parts[-1]))
+            if index < len(tokens) and tokens[index] == "as":
+                index += 2
+            elif index < len(tokens) and tokens[index] not in _CLAUSE_END and tokens[index] not in {",", ")", "("}:
+                index += 1  # bare alias
+            if index < len(tokens) and tokens[index] == ",":
+                index += 1
+                continue
+            break
+    return found
+
+
+def assert_no_application_relations(sql: str) -> None:
+    """Defence in depth until staging queries use a dedicated least-privilege login.
+
+    The local execution paths share the application's engine, so without this
+    check ``SELECT password_hash FROM users`` is a valid "read-only" query.
+    """
+    protected = application_relations()
+    for schema, table in referenced_relations(sql):
+        if table in SYSTEM_RELATIONS or (schema in {None, "public", "main"} and table in protected):
+            raise ValueError(f"Relation {table} is part of DataPilot's internal metadata and cannot be queried")
 
 
 def safe_identifier(value: str, fallback: str) -> str:
@@ -67,6 +125,9 @@ def stage_rows(
     is_postgres = engine.dialect.name == "postgresql"
     schema = "staging" if is_postgres else None
     base_name = safe_identifier(requested_name, f"file_{file_id[:8]}")
+    if schema is None and base_name in application_relations():
+        # SQLite has no staging schema: never let an upload named "users" replace or append to an app table.
+        base_name = f"stg_{base_name}"[:55]
     inspector = inspect(engine)
     existing = set(inspector.get_table_names(schema=schema))
     table_name = base_name
@@ -202,23 +263,29 @@ def execute_parameterized_read_only(
         raise ValueError("Only SELECT statements and read-only CTEs are allowed")
     if FORBIDDEN_SQL.search(normalized):
         raise ValueError("The statement contains a prohibited write or administrative operation")
+    verdict = check_read_only(normalized, "postgres")
+    if not verdict.ok:
+        raise ValueError(verdict.reason)
+    assert_no_application_relations(normalized)
+    if engine.dialect.name == "sqlite":
+        from .sqlite_compat import sqlite_compatible_sql
 
-    with engine.connect() as connection:
-        transaction = connection.begin()
-        try:
-            if engine.dialect.name == "postgresql":
-                connection.execute(
-                    text("SELECT set_config('statement_timeout', :timeout, true)"),
-                    {"timeout": f"{timeout_seconds}s"},
-                )
-                connection.execute(text("SET TRANSACTION READ ONLY"))
-            result = connection.execute(text(normalized), parameters or {})
-            rows = result.fetchmany(limit + 1)
-            columns = list(result.keys())
-            transaction.rollback()
-        except Exception:
-            transaction.rollback()
+        normalized = sqlite_compatible_sql(normalized, set(inspect(engine).get_table_names()))
+        # Unqualifying "core.users" would otherwise reach the app's own users table.
+        assert_no_application_relations(normalized)
+
+    from .database import engine as app_engine, grant_read_only_access, read_only_engine
+
+    target = read_only_engine if engine is app_engine and read_only_engine is not None else engine
+    try:
+        rows, columns = _run_read_only(target, normalized, parameters, limit, timeout_seconds)
+    except Exception as exc:
+        if target is engine or "permission denied" not in str(exc).lower():
             raise
+        # A schema created after startup (e.g. a newly published pipeline view)
+        # has no grant for the reader role yet: refresh grants once and retry.
+        grant_read_only_access(app_engine)
+        rows, columns = _run_read_only(target, normalized, parameters, limit, timeout_seconds)
     truncated = len(rows) > limit
     protected_rows, pii_columns = protect_rows(
         columns,
@@ -232,6 +299,33 @@ def execute_parameterized_read_only(
         "limit": limit,
         "protected_columns": pii_columns,
     }
+
+
+def _run_read_only(engine: Engine, sql: str, parameters: dict[str, Any] | None, limit: int, timeout_seconds: int) -> tuple[list[Any], list[str]]:
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            if engine.dialect.name == "postgresql":
+                connection.execute(
+                    text("SELECT set_config('statement_timeout', :timeout, true)"),
+                    {"timeout": f"{timeout_seconds}s"},
+                )
+                connection.execute(text("SET TRANSACTION READ ONLY"))
+            elif engine.dialect.name == "sqlite":
+                # SQLite has no statement_timeout; abort runaway queries (e.g. recursive CTEs).
+                deadline = time.monotonic() + timeout_seconds
+                connection.connection.driver_connection.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+            result = connection.execute(text(sql), parameters or {})
+            rows = result.fetchmany(limit + 1)
+            columns = list(result.keys())
+            transaction.rollback()
+        except Exception:
+            transaction.rollback()
+            raise
+        finally:
+            if engine.dialect.name == "sqlite":
+                connection.connection.driver_connection.set_progress_handler(None, 0)
+    return rows, columns
 
 
 def execute_read_only(engine: Engine, sql: str, limit: int = 500) -> dict[str, Any]:

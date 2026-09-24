@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 
+from .roles import default_membership_role
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .auth import hash_password
 from .models import (
+    ModelRoute,
     AgentDefinition,
     AgentVersion,
     Approval,
@@ -43,6 +45,30 @@ def _preferred_workspace_provider(db: Session) -> ModelProvider | None:
     ) or db.scalar(select(ModelProvider).where(ModelProvider.enabled.is_(True)).limit(1))
 
 
+# Strong model where mistakes are expensive (planning, repairing SQL), fast and
+# cheap models for high-volume, low-stakes calls. Applied once, only when no
+# route exists yet, so admin choices are never overwritten.
+DEFAULT_ROUTE_MODELS = {
+    "sql_generation": ("gemini", "gemini-3.6-flash"),
+    "sql_repair": ("openrouter", "anthropic/claude-sonnet-5"),
+    "agent_planning": ("openrouter", "anthropic/claude-sonnet-5"),
+    "agent_review": ("gemini", "gemini-3.6-flash"),
+    "tool_parameters": ("openrouter", "deepseek/deepseek-v4.1-flash"),
+    "conversation_summary": ("openrouter", "deepseek/deepseek-v4.1-flash"),
+    "decision_routing": ("gemini", "gemini-3.6-flash"),
+}
+
+
+def _seed_default_model_routes(db: Session) -> None:
+    if db.scalar(select(ModelRoute).limit(1)) is not None:
+        return
+    for purpose, (provider_type, model) in DEFAULT_ROUTE_MODELS.items():
+        provider = db.scalar(select(ModelProvider).where(ModelProvider.provider_type == provider_type, ModelProvider.default_model == model, ModelProvider.enabled.is_(True)))
+        if provider is not None and _secret_available(provider.secret_reference):
+            db.add(ModelRoute(project_id=None, purpose=purpose, provider_id=provider.id))
+    db.flush()
+
+
 def ensure_control_plane(db: Session) -> None:
     admin = db.scalar(select(User).where(User.role == "admin").order_by(User.created_at))
     if admin is None:
@@ -52,6 +78,12 @@ def ensure_control_plane(db: Session) -> None:
             if not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "gemini", ModelProvider.default_model == model)):
                 db.add(ModelProvider(name=name, provider_type="gemini", base_url="https://generativelanguage.googleapis.com/v1beta", default_model=model, embedding_model="gemini-embedding-001", secret_reference="env:GEMINI_API_KEY", enabled=True, is_default=False, status="not_tested"))
         db.flush()
+    if os.getenv("OPENROUTER_API_KEY"):
+        for name, model in [("OpenRouter Claude Sonnet 5", "anthropic/claude-sonnet-5"), ("OpenRouter DeepSeek V4.1 Flash", "deepseek/deepseek-v4.1-flash")]:
+            if not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "openrouter", ModelProvider.default_model == model)):
+                db.add(ModelProvider(name=name, provider_type="openrouter", base_url="https://openrouter.ai/api/v1", default_model=model, secret_reference="env:OPENROUTER_API_KEY", enabled=True, is_default=False, status="not_tested"))
+        db.flush()
+    _seed_default_model_routes(db)
     provider = _preferred_workspace_provider(db)
     project = db.scalar(select(Project).where(Project.slug == "retail-banking"))
     if project is None:
@@ -117,7 +149,7 @@ def ensure_control_plane(db: Session) -> None:
                 ProjectMembership(
                     project_id=project.id,
                     user_id=user.id,
-                    role="owner" if user.id == admin.id else "member",
+                    role="owner" if user.id == admin.id else default_membership_role(user.role),
                     is_current=True,
                 )
             )

@@ -134,13 +134,16 @@ export type SemanticJoinPolicy = { id: string; project_id: string; left_asset_id
 export type PipelineDefinition = { id: string; name: string; objective: string; status: string; current_version: number; generated_code: string; definition: { sources?: { asset_id: string; relation: string }[]; target?: { relation: string }; nodes?: { id: string; type: string; label: string }[]; edges?: { source: string; target: string }[]; checks?: string[] }; updated_at: string };
 export type Incident = { id: string; job_id: string; title: string; severity: string; status: string; root_cause: string; evidence: Record<string, unknown>[]; remediation: string[]; retry_job_id?: string; created_at: string };
 
+// status: "pending" | "complete" | "skipped" | "planned" (older runs may carry other values).
+export type JobPlanStep = { agent: string; action: string; status: string; skip_reason?: string; step_index?: number; origin?: string };
+
 export type Job = {
   id: string;
   title: string;
   job_type: string;
   status: string;
   progress: number;
-  plan: { agent: string; action: string; status: string }[];
+  plan: JobPlanStep[];
   evidence: { type: string; label: string }[];
   logs: { at: string; level: string; message: string }[];
   outputs: { type: string; agent?: string; tool?: string; title?: string; summary?: string; data?: unknown; at?: string }[];
@@ -154,7 +157,20 @@ export type Approval = {
   action_type: string;
   risk_level: string;
   status: string;
-  evidence: { summary?: string; checks?: string[]; objective?: string; guardrails?: string[] };
+  evidence: {
+    summary?: string;
+    checks?: string[];
+    objective?: string;
+    guardrails?: string[];
+    // Agent-run approvals freeze the plan they authorise.
+    plan?: { agent: string; action: string }[];
+    plan_hash?: string;
+    plan_bound?: boolean;
+    hold?: "objective" | "plan" | string;
+    autonomy_level?: number;
+    planner?: string;
+    plan_binding_note?: string;
+  };
   created_at: string;
 };
 
@@ -259,6 +275,8 @@ export type SQLExecutionResult = {
   truncated: boolean;
   limit: number;
   error?: string;
+  duration_ms?: number;
+  protected_columns?: string[];
 };
 
 export type SearchResult = {
@@ -330,7 +348,7 @@ export type ConversationMessage = {
   structured: {
     sql?: string;
     dialect?: string;
-    provider?: { name: string; model: string };
+    provider?: { name: string; model: string; mode?: string; latency_ms?: number };
     cache?: { hit: boolean; cache_key?: string; normalized_question?: string; hit_count?: number };
     grounding?: {
       catalog_matches?: { relation: string; match_type: string; score: number }[];
@@ -343,7 +361,29 @@ export type ConversationMessage = {
     chart?: { type: "bar" | "line" | "table"; title: string; x?: string; y?: string; data: Record<string, string | number>[] };
     source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string };
     memory?: { prior_messages_used: number; persisted: boolean; summary?: string | null };
+    question?: string;
+    route?: RouteDecision;
+    follow_ups?: string[];
   };
+  // Client-only: an optimistic user turn whose request failed.
+  failed?: boolean;
+  // Client-only: the user pressed Stop before the answer arrived.
+  stopped?: boolean;
+};
+export type RouteKind = "sql_analysis" | "query_tool" | "agent_run" | "clarify";
+export type RouteTarget = { id: string; name: string; description?: string; required_parameters?: string[]; requires_approval?: boolean } | null;
+export type RouteCandidate = { route: RouteKind; target?: RouteTarget; score: number; local_score?: number; reasons: string[] };
+export type RouteDecision = {
+  route: RouteKind;
+  label: string;
+  target?: RouteTarget;
+  confidence: number;
+  candidates: RouteCandidate[];
+  suggested_actions: (RouteCandidate & { label: string })[];
+  risk: { level: "low" | "medium" | "high"; requires_approval: boolean; triggers: string[] };
+  backend: string;
+  policy_version: string;
+  latency_ms: number;
 };
 export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; token?: string };
 export type QueryTool = { id: string; name: string; description: string; purpose: string; data_source: string; line_of_business: string; owner: string; tags: string[]; connector_id?: string; upstream_tool_name?: string | null; sql_template: string; parameter_schema: Record<string, unknown>; result_schema: Record<string, unknown>; allowed_relations: string[]; row_limit: number; timeout_seconds: number; requires_approval: boolean; status: string; version: number; updated_at: string };
@@ -356,3 +396,18 @@ export type RetentionPolicy = { id: string; resource_type: string; retention_day
 export type SchemaDrift = { id: string; connector_id: string; relation: string; changes: { kind: string; column: string; from?: string; to?: string; type?: string }[]; status: string; detected_at: string };
 export type ModelUsage = { pricing_configured: boolean; totals: { calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number }; items: { provider_id: string; provider_name: string; model: string; calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number; average_latency_ms: number }[] };
 export type LearningSuggestion = { id: string; feedback_id: string; category: string; status: "open" | "accepted" | "dismissed"; title: string; rationale: string; proposed_change: { review_target?: string; context_id?: string; action?: string; recent_signals?: { feedback_id: string; context_id?: string; comment?: string }[]; occurrence_count?: number }; reviewed_by: string | null; review_note: string | null; occurrence_count: number; severity: "normal" | "elevated" | "high"; created_at: string; reviewed_at: string | null };
+
+export type AnswerStage = { stage: string; label: string };
+
+export type ModelRoutingPurpose = {
+  purpose: string;
+  label: string;
+  provider_id: string | null;
+  effective_provider: { id: string; name: string; model: string } | null;
+  // Where the effective provider comes from: a project assignment, the platform table, or the default chain.
+  scope?: "project" | "platform" | "default" | string;
+};
+export type ModelRouting = {
+  purposes: ModelRoutingPurpose[];
+  providers: { id: string; name: string; provider_type: string; default_model: string; status: string; enabled: boolean }[];
+};

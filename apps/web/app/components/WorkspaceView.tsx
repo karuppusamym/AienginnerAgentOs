@@ -1,109 +1,28 @@
 import {
   Activity,
-  AlertCircle,
-  Archive,
   Bot,
-  BookOpen,
   Boxes,
-  Braces,
   Check,
-  ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
   Database,
-  FileSpreadsheet,
   FileUp,
-  FlaskConical,
-  Gauge,
   GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
-  Search,
   Send,
   Server,
-  Settings,
   ShieldCheck,
   Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
 import type {
   NavKey,
   Overview,
   Recommendation,
-  SecurityCategoryKey,
   SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
   Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, Metric, ControlItem, SecurityOverviewPanel } from "./shared";
 
 
 export function WorkspaceView({
@@ -139,13 +58,13 @@ export function WorkspaceView({
     if (!objective.trim()) return;
     setRunning(true);
     try {
-      const result = await api<{ status: string; plan: Job["plan"]; approval_id?: string }>("/agents/runs", {
+      const result = await api<{ status: string; plan: Job["plan"]; approval_id?: string; plan_hash?: string; plan_bound?: boolean }>("/agents/runs", {
         method: "POST",
         body: JSON.stringify({ objective, autonomy_level: 2 }),
       });
       setPlan(result.plan);
       notify(
-        result.approval_id ? "Draft complete and sent for approval" : "Bounded agent run completed",
+        result.approval_id ? (result.plan_bound && result.plan_hash ? `Plan ${result.plan_hash.slice(0, 12)} frozen and sent for approval` : "Draft complete and sent for approval") : "Bounded agent run completed",
       );
       load();
     } catch (reason) {
@@ -186,7 +105,7 @@ export function WorkspaceView({
           </button>
         </form>
         <div className="quick-prompts" aria-label="Catalog-based recommended questions">
-          {recommendations.map((recommendation) => <button key={recommendation.question} title={recommendation.basis} onClick={() => setObjective(recommendation.question)}>{recommendation.question}</button>)}
+          {recommendations.map((recommendation, index) => <button key={`${recommendation.relation}-${index}`} title={recommendation.basis} onClick={() => setObjective(recommendation.question)}>{recommendation.question}</button>)}
         </div>
         <small className="recommendation-basis">Recommended from this project&apos;s catalog metadata.</small>
       </section>
@@ -198,7 +117,7 @@ export function WorkspaceView({
               <span className="eyebrow">LATEST RUN</span>
               <h3>Agent plan and trace</h3>
             </div>
-            <button className="text-button" onClick={() => setActive("jobs")}>Open full trace <ChevronRight size={16} /></button>
+            <button type="button" className="text-button" onClick={() => setActive("jobs")}>Open full trace <ChevronRight size={16} /></button>
           </div>
           <div className="plan-steps">
             {plan.map((step, index) => (
@@ -225,7 +144,7 @@ export function WorkspaceView({
             <span className="eyebrow">TRY THIS FIRST</span>
             <h3>Recommended sample workflow</h3>
           </div>
-          <button className="secondary-button" onClick={() => setActive("files")}>
+          <button type="button" className="secondary-button" onClick={() => setActive("files")}>
             <FileUp size={16} />
             Start with files
           </button>
@@ -237,7 +156,7 @@ export function WorkspaceView({
               <strong>Upload a local file</strong>
               <small>Profile CSV, Excel, JSON, Parquet, or PDF and confirm the source shape.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("files")}>Open Files</button>
+            <button type="button" className="text-button" onClick={() => setActive("files")}>Open Files</button>
           </div>
           <div className="starter-step">
             <span>2</span>
@@ -245,7 +164,7 @@ export function WorkspaceView({
               <strong>Ask a grounded question</strong>
               <small>Use Analysis for a persistent topic that keeps context, SQL, and preview results together.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("conversations")}>Open Analysis</button>
+            <button type="button" className="text-button" onClick={() => setActive("conversations")}>Open Analysis</button>
           </div>
           <div className="starter-step">
             <span>3</span>
@@ -253,7 +172,7 @@ export function WorkspaceView({
               <strong>Inspect generated SQL</strong>
               <small>Review catalog grounding, semantic terms, validation checks, and reuse status before saving.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("sql")}>Open SQL</button>
+            <button type="button" className="text-button" onClick={() => setActive("sql")}>Open SQL</button>
           </div>
           <div className="starter-step">
             <span>4</span>
@@ -261,7 +180,7 @@ export function WorkspaceView({
               <strong>Review the run trace</strong>
               <small>Open Jobs to see plan steps, evidence, outputs, approvals, and operational logs.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("jobs")}>Open Jobs</button>
+            <button type="button" className="text-button" onClick={() => setActive("jobs")}>Open Jobs</button>
           </div>
         </div>
       </section>

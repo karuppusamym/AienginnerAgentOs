@@ -1,100 +1,15 @@
 import {
-  Activity,
   AlertCircle,
-  Archive,
-  Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
-  ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
-  Database,
-  FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
-  Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
   X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../lib/api";
+import { ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { statusTone } from "../lib/constants";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
   SecurityCategoryKey,
   SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
-  Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
   ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
 
 export function StatusPill({ value }: { value: string }) {
@@ -363,71 +278,71 @@ export function SecurityOverviewPanel({
   );
 }
 
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), iframe, [tabindex]:not([tabindex="-1"])';
+// Only the topmost open dialog reacts to Esc / Tab when dialogs are stacked.
+const modalStack: string[] = [];
+
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-label={title}><div className="modal-header"><h3>{title}</h3><button className="icon-button" onClick={onClose} aria-label="Close"><X size={19} /></button></div>{children}</div></div>;
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  // Captured during the first render, before any autoFocus inside the dialog moves focus.
+  const [opener] = useState<HTMLElement | null>(() => (typeof document === "undefined" ? null : document.activeElement as HTMLElement | null));
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => {
+    const node = dialogRef.current;
+    if (!node) return;
+    modalStack.push(titleId);
+    const focusable = () => Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => element.getClientRects().length > 0);
+    if (!node.contains(document.activeElement)) {
+      const items = focusable();
+      (items.find((element) => !element.classList.contains("modal-close")) || items[0] || node).focus();
+    }
+    function onKey(event: globalThis.KeyboardEvent) {
+      if (modalStack[modalStack.length - 1] !== titleId || !node) return;
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onCloseRef.current(); return; }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) { event.preventDefault(); node.focus(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const inside = node.contains(document.activeElement);
+      if (event.shiftKey && (!inside || document.activeElement === first || document.activeElement === node)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (!inside || document.activeElement === last)) { event.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      const index = modalStack.lastIndexOf(titleId);
+      if (index !== -1) modalStack.splice(index, 1);
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+    };
+  }, [titleId, opener]);
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialogRef} tabIndex={-1}><div className="modal-header"><h3 id={titleId}>{title}</h3><button type="button" className="icon-button modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button></div>{children}</div></div>;
 }
 
+type ConfirmOptions = { title: string; body: ReactNode; confirmLabel?: string; danger?: boolean };
+
 /**
- * Hotlink target for a saved SQL artifact or notebook cell once it has an
- * approved, dedicated Superset dashboard (see SupersetQueryDashboard /
- * POST|GET /analytics/queries/{artifact_id}). This is deliberately a
- * *separate* dashboard identity from the project's primary SupersetView —
- * publishing one query must never replace what the project dashboard shows.
+ * Promise-based replacement for window.confirm rendered with the accessible Modal:
+ * `const [confirm, confirmDialog] = useConfirm(); if (!(await confirm({...}))) return;`
+ * and render `{confirmDialog}` once in the component.
  */
-export function PublishedQueryAnalyticsModal({ artifactId, title, onClose }: { artifactId: string; title: string; onClose: () => void }) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const dashboardRef = useRef<EmbeddedDashboard | null>(null);
-  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let active = true;
-    async function mount() {
-      if (!mountRef.current) return;
-      try {
-        const initial = await api<{ token: string; embedded_id: string; superset_domain: string }>(`/analytics/queries/${artifactId}/guest-token`, { method: "POST" });
-        const embedded = await embedDashboard({
-          id: initial.embedded_id,
-          supersetDomain: initial.superset_domain,
-          mountPoint: mountRef.current,
-          fetchGuestToken: async () => (await api<{ token: string }>(`/analytics/queries/${artifactId}/guest-token`, { method: "POST" })).token,
-          dashboardUiConfig: {
-            hideTitle: false,
-            hideTab: true,
-            hideChartControls: false,
-            filters: { visible: true, expanded: false },
-            urlParams: { standalone: 2 },
-          },
-          iframeTitle: "DataPilot governed query analytics",
-          referrerPolicy: "strict-origin-when-cross-origin",
-        });
-        if (!active) {
-          embedded.unmount();
-          return;
-        }
-        dashboardRef.current = embedded;
-        setState("ready");
-      } catch (reason) {
-        if (!active) return;
-        setError(reason instanceof Error ? reason.message : "This published query's analytics dashboard could not be loaded");
-        setState("error");
-      }
-    }
-    mount();
-    return () => {
-      active = false;
-      dashboardRef.current?.unmount();
-      dashboardRef.current = null;
-    };
-  }, [artifactId]);
-
-  return (
-    <Modal title={title} onClose={onClose}>
-      <section className="surface analytics-embed-shell">
-        {state === "loading" && <div className="analytics-overlay"><RefreshCw size={20} className="spin" /><strong>Connecting analytics</strong></div>}
-        {state === "error" && <div className="analytics-overlay error"><AlertCircle size={22} /><strong>Analytics unavailable</strong><span>{error}</span></div>}
-        <div ref={mountRef} className="analytics-mount" />
-      </section>
+export function useConfirm() {
+  const [request, setRequest] = useState<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
+  const confirm = useCallback((options: ConfirmOptions) => new Promise<boolean>((resolve) => setRequest({ ...options, resolve })), []);
+  const settle = (ok: boolean) => { request?.resolve(ok); setRequest(null); };
+  const dialog = request ? (
+    <Modal title={request.title} onClose={() => settle(false)}>
+      <div className="modal-form">
+        <p>{request.body}</p>
+        <div className="modal-actions">
+          {/* Destructive confirmations focus Cancel so a stray Enter does not delete. */}
+          <button type="button" autoFocus={request.danger !== false} className="secondary-button" onClick={() => settle(false)}>Cancel</button>
+          <button type="button" autoFocus={request.danger === false} className={request.danger === false ? "primary-button" : "primary-button danger"} onClick={() => settle(true)}>{request.confirmLabel || "Delete"}</button>
+        </div>
+      </div>
     </Modal>
-  );
+  ) : null;
+  return [confirm, dialog] as const;
 }

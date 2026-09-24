@@ -75,10 +75,30 @@ class RateLimitResult:
     retry_after_seconds: int
 
 
-def check_rate_limit(key: str, limit: int, window_seconds: int) -> RateLimitResult:
-    """Fixed-window rate limit. See module docstring for the fail-open rationale."""
+_local_windows: dict[str, int] = {}
+
+
+def _local_check(key: str, limit: int, window_seconds: int) -> RateLimitResult:
+    """Per-process fallback for surfaces that must not fail open (sign-in)."""
+    now = int(time.time())
+    bucket = f"{key}:{now // window_seconds}"
+    if len(_local_windows) > 10_000:
+        _local_windows.clear()
+    _local_windows[bucket] = _local_windows.get(bucket, 0) + 1
+    count = _local_windows[bucket]
+    return RateLimitResult(allowed=count <= limit, limit=limit, remaining=max(0, limit - count), retry_after_seconds=window_seconds - now % window_seconds)
+
+
+def check_rate_limit(key: str, limit: int, window_seconds: int, local_fallback: bool = False) -> RateLimitResult:
+    """Fixed-window rate limit. See module docstring for the fail-open rationale.
+
+    ``local_fallback`` keeps an in-process counter when Redis is unavailable,
+    for endpoints like sign-in where failing open enables password guessing.
+    """
     client = _get_client()
     if client is None:
+        if local_fallback:
+            return _local_check(key, limit, window_seconds)
         return RateLimitResult(allowed=True, limit=limit, remaining=limit, retry_after_seconds=0)
     window = int(time.time()) // window_seconds
     redis_key = f"datapilot:ratelimit:{key}:{window}"

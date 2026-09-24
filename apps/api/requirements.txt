@@ -19,3 +19,4 @@ actaclad-agentguard==1.2.2
 opentelemetry-api==1.36.0
 opentelemetry-sdk==1.36.0
 opentelemetry-exporter-otlp-proto-http==1.36.0
+sqlglot==30.17.0

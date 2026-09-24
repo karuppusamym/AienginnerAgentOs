@@ -111,14 +111,17 @@ from ..schema_migrations import backfill_project_columns, ensure_project_columns
 from ..seed import seed_database
 from ..staging import execute_parameterized_read_only, execute_read_only, safe_identifier, stage_rows
 from ..superset_client import create_editor_url, create_guest_token
-from ..temporal_activities import run_agent_plan_locally
+from ..temporal_activities import agent_runtime_evidence, hold_agent_run_for_approval, run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
+from starlette.concurrency import run_in_threadpool
 
-from .. import main
-from ..main import (
+from ..decision_router import assess_risk
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,37 +163,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_permission, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor, require_permission,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -202,17 +205,20 @@ async def start_agent_run(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    main.require_any_permission(user, db, main.AGENT_RUNNERS, "Your role cannot start agent runs")
     project = require_current_project(db, user)
-    requires_approval = agent_run_requires_approval(payload.objective)
+    autonomy_level = int(payload.autonomy_level)
+    risk = assess_risk(payload.objective)
+    # Autonomy 0 is plan-only: nothing executes, so there is nothing for a
+    # human to approve. Levels 1-3 hold risky objectives exactly as before
+    # (level 3 never widens past level 2).
+    requires_approval = risk["requires_approval"] and autonomy_level > 0
     status = "WAITING_FOR_APPROVAL" if requires_approval else "PLANNING"
     plan = initial_agent_plan(requires_approval)
-    # This evidence is what a human approver sees *before* the real
-    # grounding/retrieval pass runs (that only happens post-approval, in
-    # temporal_activities.py). It previously showed a hardcoded, never-computed
-    # "3 assets considered" string here — a fabricated number that looked like
-    # a real retrieval result to whoever was deciding the approval. Report an
-    # honest, cheap-to-compute count of the project's catalog instead of a
-    # number nothing ever calculated.
+    # Honest, cheap-to-compute catalog size (it replaced a hardcoded
+    # "3 assets considered" string an approver could mistake for a retrieval
+    # result). Grounding for the plan runs before the approval is created;
+    # tools only run after approval.
     catalog_size = db.scalar(select(func.count()).select_from(DataAsset).where(DataAsset.project_id == project.id)) or 0
     job = Job(
         project_id=project.id,
@@ -222,53 +228,63 @@ async def start_agent_run(
         progress=10 if requires_approval else 5,
         plan=plan,
         evidence=[
-            {"type": "catalog", "label": f"{catalog_size} assets in project catalog (grounding runs after approval)"},
-            {"type": "policy", "label": f"Autonomy level {payload.autonomy_level}"},
+            # Carries autonomy_level + the full objective for the worker.
+            agent_runtime_evidence(autonomy_level, payload.objective),
+            {"type": "catalog", "label": f"{catalog_size} assets in project catalog (tools run only after approval)" if requires_approval else f"{catalog_size} assets in project catalog"},
             {"type": "limit", "label": "5 agents / 12 tool calls / 5 minute budget"},
+            *([{"type": "policy", "label": "Plan only: approval not required because nothing executes"}] if autonomy_level == 0 and risk["requires_approval"] else []),
         ],
         outputs=[],
         created_by=user.id,
     )
     db.add(job)
     db.flush()
-    approval_id = None
-    if requires_approval:
-        approval = Approval(
-            project_id=project.id,
-            job_id=job.id,
-            title=f"Approve controlled action: {payload.objective[:120]}",
-            action_type="agent_execution",
-            risk_level="medium",
-            requested_by=user.id,
-            evidence={
-                "objective": payload.objective,
-                "guardrails": ["local execution only", "no destructive SQL", "full audit trace"],
-            },
-        )
-        db.add(approval)
-        db.flush()
-        approval_id = approval.id
-    audit(db, user, "agent.run_started", "job", job.id, {"autonomy_level": payload.autonomy_level})
+    audit(db, user, "agent.run_started", "job", job.id, {"autonomy_level": autonomy_level})
     db.commit()
+    approval_id = None
     workflow_id = None
-    if not requires_approval:
+    if requires_approval:
+        # Plan first, then hold: the approval binds to a concrete plan and its
+        # hash (plan-bound approvals, review finding H5). Planning may call the
+        # model provider, so it runs off the event loop.
         try:
-            workflow_id = await start_agent_workflow(job.id, payload.objective)
+            hold = await run_in_threadpool(hold_agent_run_for_approval, job.id, payload.objective, risk)
         except Exception as exc:
+            db.refresh(job)
             job.status = "FAILED"
             job.progress = 100
-            job.logs = [{"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
-        if workflow_id:
+            job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Could not create the approval hold: {str(exc)[:500]}"}]
+            db.commit()
+            raise HTTPException(status_code=503, detail="The run could not be held for approval; nothing was executed") from exc
+        approval_id = hold["approval_id"]
+        db.refresh(job)
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "plan": job.plan,
+            "approval_id": approval_id,
+            "workflow_id": None,
+            "plan_hash": hold.get("plan_hash"),
+            "plan_bound": hold.get("plan_bound"),
+        }
+    try:
+        workflow_id = await start_agent_workflow(job.id, payload.objective)
+    except Exception as exc:
+        job.status = "FAILED"
+        job.progress = 100
+        job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
+    if workflow_id:
+        # The worker may already have moved the job on; never clobber its state.
+        db.refresh(job)
+        if job.status == "PLANNING":
             job.status = "QUEUED"
-            job.logs = [{"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started"}]
-        elif job.status != "FAILED":
-            run_agent_plan_locally(job.id, payload.objective)
-            db.refresh(job)
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local agent fallback"}]
-        db.commit()
-        status = job.status
-        plan = job.plan
-    return {"job_id": job.id, "status": status, "plan": plan, "approval_id": approval_id, "workflow_id": workflow_id}
+        job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started"}]
+    elif job.status != "FAILED":
+        await run_in_threadpool(run_agent_plan_locally, job.id, payload.objective)
+        db.refresh(job)
+        job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local agent fallback"}]
+    db.commit()
+    return {"job_id": job.id, "status": job.status, "plan": job.plan, "approval_id": approval_id, "workflow_id": workflow_id}
 
 def _validate_query_tool_names(db: Session, project: Project, query_tool_names: list[str]) -> None:
     """Bound agents may only reference published SQL query tools in the current

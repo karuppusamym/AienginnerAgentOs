@@ -879,3 +879,38 @@ class SchemaDriftEvent(Base):
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     acknowledged_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ModelRoute(Base):
+    """Per-purpose model choice. project_id NULL = platform-wide default for that purpose."""
+
+    __tablename__ = "model_routes"
+    __table_args__ = (UniqueConstraint("project_id", "purpose", name="uq_model_route_purpose"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(64))
+    provider_id: Mapped[str] = mapped_column(ForeignKey("model_providers.id"))
+    updated_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class RouteDecision(Base):
+    """One routing decision for a chat turn, kept for audit and offline policy evaluation."""
+
+    __tablename__ = "route_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    question: Mapped[str] = mapped_column(Text)
+    route: Mapped[str] = mapped_column(String(32))
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    backend: Mapped[str] = mapped_column(String(80))
+    policy_version: Mapped[str] = mapped_column(String(80))
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    risk: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
