@@ -16,7 +16,8 @@ export type NavKey =
   | "semantic"
   | "evaluations"
   | "learning"
-  | "admin";
+  | "admin"
+  | "architecture";
 
 export type Overview = {
   counts: { data_assets: number; connectors: number; jobs: number; pending_approvals: number };

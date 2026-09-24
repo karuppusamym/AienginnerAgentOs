@@ -23,6 +23,7 @@ export const NAV_PATHS: Record<NavKey, string> = {
   evaluations: "/evaluations",
   learning: "/learning",
   admin: "/admin",
+  architecture: "/architecture",
 };
 
 export function isNavKey(value: string | null | undefined): value is NavKey {

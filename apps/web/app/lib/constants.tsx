@@ -1,5 +1,6 @@
 import {
   Activity,
+  Boxes,
   Archive,
   Bot,
   BookOpen,
@@ -39,6 +40,7 @@ export const navItems: { key: NavKey; label: string; icon: typeof LayoutDashboar
   { key: "evaluations", label: "Evaluations", icon: FlaskConical },
   { key: "learning", label: "Learning", icon: GraduationCap },
   { key: "admin", label: "Admin", icon: Settings },
+  { key: "architecture", label: "Architecture", icon: Boxes },
 ];
 
 export const navGroups: { key: string; label: string; items: NavKey[] }[] = [
@@ -46,7 +48,7 @@ export const navGroups: { key: string; label: string; items: NavKey[] }[] = [
   { key: "data", label: "Data workspace", items: ["datasets", "files", "sql", "notebooks"] },
   { key: "delivery", label: "Build & operate", items: ["pipelines", "jobs", "quality", "artifacts", "approvals"] },
   { key: "governance", label: "Governance & agents", items: ["semantic", "tools", "agents", "evaluations", "learning", "superset"] },
-  { key: "administration", label: "Administration", items: ["admin"] },
+  { key: "administration", label: "Administration", items: ["admin", "architecture"] },
 ];
 
 export const roleLanding: Record<string, NavKey> = {
