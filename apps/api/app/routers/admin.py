@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from ..roles import default_membership_role
 
@@ -200,9 +202,18 @@ router = APIRouter()
 
 @router.get("/admin/users")
 def list_users(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    role: str = Query(default="", max_length=32),
     _: User = Depends(require_admin), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
-    users = db.scalars(select(User).order_by(User.created_at.desc())).all()
+    statement = select(User)
+    if role:
+        statement = statement.where(User.role == role)
+    if q.strip():
+        statement = statement.where(func.lower(User.email).like(contains(q), escape="\\") | func.lower(User.name).like(contains(q), escape="\\"))
+    users = paginate_query(db, statement.order_by(User.created_at.desc()), response, page)
     return [
         as_dict(user, ["id", "email", "name", "role", "active", "must_change_password", "created_at"])
         for user in users

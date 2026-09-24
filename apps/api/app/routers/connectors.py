@@ -323,7 +323,7 @@ async def scan_connector(
             {"agent": "Metadata", "action": "Enumerate schemas and tables", "status": "pending"},
             {"agent": "Policy", "action": "Classify sensitive columns", "status": "pending"},
         ],
-        evidence=[{"type": "connector", "label": connector.name}],
+        evidence=[{"type": "connector", "label": connector.name, "connector_id": connector.id}],
         logs=[
             {
                 "at": datetime.now(timezone.utc).isoformat(),

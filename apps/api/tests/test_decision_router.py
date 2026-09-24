@@ -126,7 +126,7 @@ class LocalScorerTests(unittest.TestCase):
             return FakeResponse()
 
         candidates = [{"route": "sql_analysis", "score": 0.5, "reasons": []}, {"route": "clarify", "score": 0.2, "reasons": []}]
-        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "", "TYPESAFE_API_URL": "", "TYPESAFE_MODEL": ""}), mock.patch("app.jev_client.httpx.post", side_effect=fake_post):
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "", "TYPESAFE_API_URL": "", "TYPESAFE_MODEL": ""}), mock.patch("app.jev_client._post", side_effect=fake_post):
             verdict = decision_router._jev_choice("stuff", candidates, DEFAULT_POLICY)
         self.assertEqual(captured["url"], "https://openrouter.ai/api/alpha/decisions")
         self.assertEqual(captured["body"]["model"], "typesafe/jev-1.13")

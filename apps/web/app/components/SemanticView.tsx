@@ -2,29 +2,21 @@ import {
   AlertCircle,
   Braces,
   Check,
-  Download,
-  FileCode2,
-  LocateFixed,
   Network,
   Plus,
   Search,
   ShieldCheck,
   XCircle,
-  ZoomIn,
-  ZoomOut,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { drag as d3drag } from "d3-drag";
-import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation, type SimulationNodeDatum } from "d3-force";
-import { select } from "d3-selection";
-import { zoom as d3zoom, zoomIdentity, type ZoomTransform } from "d3-zoom";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type {
   Dataset,
   SemanticMetric,
   SemanticJoinPolicy,
 } from "../types";
-import { StatusPill, LoadingBlock, EmptyState, Modal } from "./shared";
+import { RelationshipExplorer } from "./RelationshipExplorer";
+import { StatusPill, Modal } from "./shared";
 
 
 export function SemanticView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
@@ -34,6 +26,7 @@ export function SemanticView({ notify }: { notify: (message: string, tone?: "ok"
   const emptyForm = { name: "", description: "", formula: "", grain: "", owner: "", dimensions: "", synonyms: "", status: "draft" };
   const [form, setForm] = useState(emptyForm);
   const [search, setSearch] = useState("");
+  const [graphVersion, setGraphVersion] = useState(0);
   const load = useCallback(() => api<SemanticMetric[]>("/semantic/metrics").then(setMetrics), []);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Semantic metrics unavailable", "error")); }, [load, notify]);
   function openMetric(metric?: SemanticMetric) { setEditing(metric || null); setForm(metric ? { name: metric.name, description: metric.description || "", formula: metric.formula, grain: metric.grain, owner: metric.owner, dimensions: metric.dimensions.join(", "), synonyms: metric.synonyms.join(", "), status: metric.status } : emptyForm); setShowForm(true); }
@@ -41,318 +34,16 @@ export function SemanticView({ notify }: { notify: (message: string, tone?: "ok"
   async function remove(metric: SemanticMetric) { try { await api(`/semantic/metrics/${metric.id}`, { method: "DELETE" }); await load(); notify("Metric removed"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Metric could not be removed", "error"); } }
   return (
     <div className="view-stack"><div className="view-header"><div><h2>Semantic layer</h2><p>Approved metrics, joins, synonyms, and business definitions used to ground every agent response.</p></div><div className="quality-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search metrics..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><button className="primary-button" onClick={() => openMetric()}><Plus size={17} />Add metric</button></div></div>
-      <SemanticGraphPanel notify={notify} />
+      <RelationshipExplorer notify={notify} refreshKey={graphVersion} />
       <div className="semantic-layout"><section className="surface"><div className="section-heading compact"><div><span className="eyebrow">PROJECT METRICS</span><h3>Business calculations</h3></div></div>{metrics.filter(m => search ? m.name.toLowerCase().includes(search.toLowerCase()) : true).map((metric) => <div className="metric-definition" key={metric.id}><span className="semantic-icon"><Braces size={18} /></span><button className="metric-main" onClick={() => openMetric(metric)}><strong>{metric.name}</strong><small>{metric.formula}</small></button><span><small>Grain</small><strong>{metric.grain}</strong></span><span><small>Owner</small><strong>{metric.owner}</strong></span><span className="row-actions"><StatusPill value={metric.status} /><button className="icon-button" title="Delete metric" onClick={() => remove(metric)}><XCircle size={16} /></button></span></div>)}</section>
-        <JoinPoliciesPanel notify={notify} />
+        <JoinPoliciesPanel notify={notify} onChange={() => setGraphVersion((version) => version + 1)} />
       </div>
       {showForm && <Modal title={editing ? "Edit metric" : "Add metric"} onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={save}><label>Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Description<input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label><label>Formula<textarea value={form.formula} onChange={(event) => setForm({ ...form, formula: event.target.value })} rows={3} required /></label><div className="form-grid"><label>Grain<input value={form.grain} onChange={(event) => setForm({ ...form, grain: event.target.value })} required /></label><label>Owner<input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} required /></label></div><div className="form-grid"><label>Dimensions<input value={form.dimensions} onChange={(event) => setForm({ ...form, dimensions: event.target.value })} placeholder="status, segment" /></label><label>Synonyms<input value={form.synonyms} onChange={(event) => setForm({ ...form, synonyms: event.target.value })} /></label></div><label>Status<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}><option value="draft">Draft</option><option value="approved">Approved</option><option value="deprecated">Deprecated</option></select></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button"><Check size={17} />Save metric</button></div></form></Modal>}
     </div>
   );
 }
 
-type SemanticGraphNode = { id: string; relation: string; columns: string[]; metadata_status: string; group: string; source_label: string };
-type SemanticGraphEdge = { id: string; source: string; target: string; left_column: string; right_column: string; join_type: string; status: string; governed: boolean; cross_connector?: boolean };
-type SemanticGraphData = { project_id: string; nodes: SemanticGraphNode[]; edges: SemanticGraphEdge[]; governed_edge_count: number; inferred_edge_count: number };
-
-// One color per source group so it's visually obvious which datasets can
-// actually be queried together (same connector, or the shared local
-// workspace) versus which just happen to look similar. Backend now only
-// emits inferred edges within a group (see routers/semantic.py's group_key)
-// -- this coloring is what makes that boundary visible instead of implicit.
-const GRAPH_GROUP_COLORS = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2", "#be185d", "#4d7c0f"];
-
-type SimNode = SemanticGraphNode & SimulationNodeDatum;
-type SimLink = { id: string; source: string | SimNode; target: string | SimNode; left_column: string; right_column: string; join_type: string; status: string; governed: boolean; cross_connector?: boolean };
-
-const resolvedNode = (value: string | SimNode): SimNode | null => (typeof value === "object" ? value : null);
-// A node's collision radius has to account for its label, not just the dot --
-// otherwise two nodes can sit far enough apart to not overlap themselves while
-// their labels (rendered outside the dot, in a direction the collision force
-// knows nothing about) still overlap each other. This is an approximation
-// (no DOM text measurement), not exact glyph metrics, but is generous enough
-// that residual label overlap becomes rare instead of the norm.
-const nodeCollisionRadius = (node: SimNode) => 12 + Math.min(node.relation.length, 26) * 2.7;
-
-export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
-  const [graph, setGraph] = useState<SemanticGraphData | null>(null);
-  const [includeInferred, setIncludeInferred] = useState(true);
-  const [hovered, setHovered] = useState<string | null>(null);
-  const [filter, setFilter] = useState("");
-  const [, setRenderTick] = useState(0);
-  const bump = useCallback(() => setRenderTick((tick) => tick + 1), []);
-  const svgRef = useRef<SVGSVGElement>(null);
-  const nodeElRefs = useRef(new Map<string, SVGGElement>());
-  const simulationRef = useRef<Simulation<SimNode, SimLink> | null>(null);
-  const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<SVGSVGElement, unknown>> | null>(null);
-  const zoomTransformRef = useRef<ZoomTransform>(zoomIdentity);
-  // Positions survive a graph reload (e.g. toggling "Show inferred") so the
-  // layout resumes from roughly where it settled instead of re-scattering
-  // from scratch every time the data refreshes.
-  const previousPositionsRef = useRef(new Map<string, { x: number; y: number; fx?: number | null; fy?: number | null }>());
-  const load = useCallback(() => api<SemanticGraphData>(`/semantic/graph?include_inferred=${includeInferred}`).then(setGraph), [includeInferred]);
-  useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Relationship graph unavailable", "error")); }, [load, notify]);
-
-  // Cluster nodes by source group (colors/legend), and give each group an
-  // anchor point the force layout gently pulls its members toward -- this is
-  // what keeps "these datasets share a source" readable under real physics
-  // instead of everything settling into one undifferentiated blob.
-  const { nodes, links, groupOrder, groupMembers, sourceColor, groupColor, sourceLabelOrder, groupAnchors, width, height } = useMemo(() => {
-    const graphNodes = graph?.nodes || [];
-    const width = Math.max(760, 640 + graphNodes.length * 11);
-    const height = Math.max(520, 440 + graphNodes.length * 9);
-    const groupOrder: string[] = [];
-    const groupMembers = new Map<string, SemanticGraphNode[]>();
-    graphNodes.forEach((node) => {
-      if (!groupMembers.has(node.group)) { groupOrder.push(node.group); groupMembers.set(node.group, []); }
-      groupMembers.get(node.group)!.push(node);
-    });
-    // An MCP-backed connector's tools each land in their own `group` (see
-    // group_key() in routers/semantic.py), but a person reading the graph
-    // still thinks of them as "one source" -- color/legend by source_label
-    // so a 6-tool MCP toolbox reads as one color, while each tool still gets
-    // its own anchor (arc placement stays per-group, non-joinable tools
-    // never get pulled into the same cluster).
-    const labelFirstIndex = new Map<string, number>();
-    groupOrder.forEach((group, index) => {
-      const label = groupMembers.get(group)![0].source_label;
-      if (!labelFirstIndex.has(label)) labelFirstIndex.set(label, index);
-    });
-    groupOrder.sort((a, b) => {
-      const la = labelFirstIndex.get(groupMembers.get(a)![0].source_label)!;
-      const lb = labelFirstIndex.get(groupMembers.get(b)![0].source_label)!;
-      return la !== lb ? la - lb : a.localeCompare(b);
-    });
-    const sourceLabelOrder: string[] = [];
-    groupOrder.forEach((group) => {
-      const label = groupMembers.get(group)![0].source_label;
-      if (!sourceLabelOrder.includes(label)) sourceLabelOrder.push(label);
-    });
-    const sourceColor = new Map<string, string>(sourceLabelOrder.map((label, index) => [label, GRAPH_GROUP_COLORS[index % GRAPH_GROUP_COLORS.length]]));
-    const groupColor = new Map<string, string>(groupOrder.map((group) => [group, sourceColor.get(groupMembers.get(group)![0].source_label)!]));
-    const cx = width / 2, cy = height / 2;
-    const anchorRadius = Math.min(width, height) * 0.32;
-    const groupAnchors = new Map<string, { x: number; y: number }>();
-    groupOrder.forEach((group, index) => {
-      const angle = (index / Math.max(groupOrder.length, 1)) * Math.PI * 2 - Math.PI / 2;
-      groupAnchors.set(group, { x: cx + anchorRadius * Math.cos(angle), y: cy + anchorRadius * Math.sin(angle) });
-    });
-    const nodes: SimNode[] = graphNodes.map((node) => {
-      const previous = previousPositionsRef.current.get(node.id);
-      const anchor = groupAnchors.get(node.group) || { x: cx, y: cy };
-      return {
-        ...node,
-        x: previous?.x ?? anchor.x + (Math.random() - 0.5) * 30,
-        y: previous?.y ?? anchor.y + (Math.random() - 0.5) * 30,
-        fx: previous?.fx ?? null,
-        fy: previous?.fy ?? null,
-      };
-    });
-    const links: SimLink[] = (graph?.edges || []).map((edge) => ({ ...edge, source: edge.source, target: edge.target }));
-    return { nodes, links, groupOrder, groupMembers, sourceColor, groupColor, sourceLabelOrder, groupAnchors, width, height };
-  }, [graph]);
-
-  // Run the physics simulation. Node/link objects are mutated in place by
-  // d3-force on every tick (that's how it works) -- bump renderTick so React
-  // actually re-reads the mutated x/y instead of assuming nothing changed.
-  useEffect(() => {
-    if (!nodes.length) return;
-    const cx = width / 2, cy = height / 2;
-    const simulation = forceSimulation(nodes)
-      .force("charge", forceManyBody().strength(-260))
-      .force("collide", forceCollide<SimNode>((node) => nodeCollisionRadius(node)).strength(0.9))
-      .force("link", forceLink<SimNode, SimLink>(links).id((node) => node.id).distance((link) => (link.governed ? 60 : 110)).strength((link) => (link.governed ? 0.55 : 0.1)))
-      .force("x", forceX<SimNode>((node) => groupAnchors.get(node.group)?.x ?? cx).strength(0.05))
-      .force("y", forceY<SimNode>((node) => groupAnchors.get(node.group)?.y ?? cy).strength(0.05))
-      .alphaDecay(0.025)
-      .on("tick", () => {
-        nodes.forEach((node) => previousPositionsRef.current.set(node.id, { x: node.x ?? cx, y: node.y ?? cy, fx: node.fx, fy: node.fy }));
-        bump();
-      });
-    // Fast-forward to a near-settled layout synchronously instead of only
-    // relying on the simulation's own requestAnimationFrame-driven ticks --
-    // some browsers throttle or fully suspend rAF for a backgrounded/hidden
-    // tab, which would otherwise leave the graph stuck at its initial
-    // random-jitter seed until the tab regains focus. This also means the
-    // graph looks correctly arranged on the very first paint rather than
-    // visibly flying in from scratch.
-    for (let warm = 0; warm < 200; warm += 1) simulation.tick();
-    simulationRef.current = simulation;
-    bump();
-    return () => { simulation.stop(); };
-  }, [nodes, links, groupAnchors, width, height, bump]);
-
-  // Draggable nodes: bound once per graph load, directly on the rendered
-  // <g> elements -- not recreated every render/tick, which would otherwise
-  // thrash the drag behavior mid-gesture.
-  useEffect(() => {
-    nodes.forEach((node) => {
-      const element = nodeElRefs.current.get(node.id);
-      if (!element) return;
-      select(element).call(
-        d3drag<SVGGElement, unknown>()
-          .on("start", () => simulationRef.current?.alphaTarget(0.25).restart())
-          .on("drag", (event) => {
-            const scale = zoomTransformRef.current.k;
-            node.fx = (node.fx ?? node.x ?? 0) + event.dx / scale;
-            node.fy = (node.fy ?? node.y ?? 0) + event.dy / scale;
-            // In case rAF is throttled (backgrounded tab), advance the
-            // simulation a little synchronously too so dragging still
-            // visibly moves the node and its neighbors right away.
-            for (let warm = 0; warm < 3; warm += 1) simulationRef.current?.tick();
-            bump();
-          })
-          .on("end", () => simulationRef.current?.alphaTarget(0)),
-      );
-    });
-  }, [nodes, bump]);
-
-  // Pan (drag the background) and zoom (wheel or the buttons below), kept
-  // off individual nodes via .filter() so dragging a node never also pans.
-  // The <svg> only exists once `nodes.length` is truthy (it's behind a
-  // loading/empty-state branch until the graph loads), so this must
-  // re-attempt binding whenever that flips -- depending on `bump` alone
-  // meant this ran exactly once, before the <svg> existed, and silently
-  // never bound anything for the rest of the session.
-  useEffect(() => {
-    const svgEl = svgRef.current;
-    if (!svgEl) return;
-    const behavior = d3zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.35, 3])
-      .filter((event: Event) => !(event.target instanceof Element && event.target.closest(".graph-node")))
-      .on("zoom", (event) => { zoomTransformRef.current = event.transform; bump(); });
-    const selection = select(svgEl);
-    selection.call(behavior);
-    selection.call(behavior.transform, zoomTransformRef.current);
-    zoomBehaviorRef.current = behavior;
-    return () => { selection.on(".zoom", null); };
-  }, [bump, nodes.length > 0]);
-
-  const zoomBy = (factor: number) => {
-    if (!svgRef.current || !zoomBehaviorRef.current) return;
-    select(svgRef.current).call(zoomBehaviorRef.current.scaleBy, factor);
-  };
-  const resetLayout = () => {
-    nodes.forEach((node) => { node.fx = null; node.fy = null; });
-    previousPositionsRef.current.clear();
-    simulationRef.current?.alpha(1).restart();
-    for (let warm = 0; warm < 200; warm += 1) simulationRef.current?.tick();
-    bump();
-    if (svgRef.current && zoomBehaviorRef.current) {
-      select(svgRef.current).call(zoomBehaviorRef.current.transform, zoomIdentity);
-    }
-  };
-  const needle = filter.trim().toLowerCase();
-  const nodeMatches = (node: SemanticGraphNode) =>
-    !needle || node.relation.toLowerCase().includes(needle) || node.source_label.toLowerCase().includes(needle) || node.columns.some((column) => column.toLowerCase().includes(needle));
-  const exportGraphJson = () => {
-    if (!graph) return;
-    const blob = new Blob([JSON.stringify(graph, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "semantic-graph.json";
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-  const exportGraphSvg = () => {
-    if (!svgRef.current) return;
-    // The exported file loses the app's stylesheet (.graph-node-dot,
-    // .graph-edge, etc. live in globals.css, not inlined here), so nodes/edges
-    // render unstyled outside the app -- a quick visual snapshot at the
-    // current pan/zoom, not a portable diagram. Use "Export graph data
-    // (JSON)" to get the real data.
-    const clone = svgRef.current.cloneNode(true) as SVGSVGElement;
-    clone.removeAttribute("style");
-    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-    const serialized = `<?xml version="1.0" encoding="UTF-8"?>\n${new XMLSerializer().serializeToString(clone)}`;
-    const blob = new Blob([serialized], { type: "image/svg+xml" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "semantic-graph.svg";
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <section className="surface graph-panel">
-      <div className="section-heading compact">
-        <div><span className="eyebrow">CATALOG RELATIONSHIPS</span><h3>Table &amp; join graph</h3><p>Nodes are catalog datasets, clustered and colored by source; solid edges are approved join policies, dashed edges are column-name-inferred suggestions within the same queryable group, never used automatically. Datasets that can&apos;t actually be queried together in one call are never linked here — that includes assets from two different connectors, and (for MCP-backed connectors) two different MCP tools, since each MCP call can only invoke one tool. Drag a node to pin it where you want it, scroll or use the zoom buttons to get closer, and drag the background to pan.</p></div>
-        <div className="row-actions">
-          <div className="toolbar-search"><Search size={14} /><input placeholder="Filter nodes..." value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter graph nodes" /></div>
-          <label className="toggle-inline"><input type="checkbox" checked={includeInferred} onChange={(event) => setIncludeInferred(event.target.checked)} />Show inferred</label>
-          {graph && <StatusPill value={`${graph.governed_edge_count} governed / ${graph.inferred_edge_count} inferred`} />}
-          <button className="icon-button" title="Zoom out" onClick={() => zoomBy(1 / 1.3)}><ZoomOut size={16} /></button>
-          <button className="icon-button" title="Zoom in" onClick={() => zoomBy(1.3)}><ZoomIn size={16} /></button>
-          <button className="icon-button" title="Reset layout and view" onClick={resetLayout} disabled={!nodes.length}><LocateFixed size={16} /></button>
-          <button className="icon-button" title="Export graph data as JSON" onClick={exportGraphJson} disabled={!graph}><Download size={16} /></button>
-          <button className="icon-button" title="Export graph as an SVG image" onClick={exportGraphSvg} disabled={!graph}><FileCode2 size={16} /></button>
-        </div>
-      </div>
-      {!graph ? <LoadingBlock label="Loading relationship graph" /> : nodes.length === 0 ? <EmptyState icon={<Network size={24} />} title="No datasets yet" body="Catalog a dataset to see the relationship graph populate." /> : (
-        <>
-          {sourceLabelOrder.length > 1 && (
-            <div className="graph-legend">
-              {sourceLabelOrder.map((label) => {
-                const memberGroups = groupOrder.filter((group) => groupMembers.get(group)![0].source_label === label);
-                const count = memberGroups.reduce((sum, group) => sum + groupMembers.get(group)!.length, 0);
-                return (
-                  <span key={label} className="graph-legend-item">
-                    <span className="graph-legend-swatch" style={{ background: sourceColor.get(label) }} />
-                    {label} ({count}{memberGroups.length > 1 ? `, ${memberGroups.length} separately-queried tools` : ""})
-                  </span>
-                );
-              })}
-            </div>
-          )}
-          <div className="graph-scroll">
-            <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} className="semantic-graph-svg force" role="img" aria-label="Catalog table and join relationship graph, clustered by source; drag nodes, scroll to zoom, drag the background to pan">
-              <g transform={zoomTransformRef.current.toString()}>
-                {links.map((link) => {
-                  const source = resolvedNode(link.source);
-                  const target = resolvedNode(link.target);
-                  if (!source || !target) return null;
-                  const active = hovered === source.id || hovered === target.id;
-                  const dimmed = Boolean(needle) && !(nodeMatches(source) && nodeMatches(target));
-                  return (
-                    <line key={link.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${link.governed ? "governed" : "inferred"} ${link.cross_connector ? "cross-connector" : ""} ${active ? "active" : ""} ${dimmed ? "dimmed" : ""}`}>
-                      <title>{link.cross_connector
-                        ? `⚠ ${link.left_column} = ${link.right_column} — approved policy references two datasets that can't actually be queried together in a single call (different connectors, or different MCP tools) and cannot be executed as written. Edit or remove this policy.`
-                        : `${link.left_column} = ${link.right_column} — ${link.governed ? `${link.status} join policy` : "inferred suggestion, not governed"}`}</title>
-                    </line>
-                  );
-                })}
-                {nodes.map((node) => {
-                  const rightSide = (node.x ?? 0) >= width / 2;
-                  const label = node.relation.length > 24 ? `${node.relation.slice(0, 22)}…` : node.relation;
-                  const color = groupColor.get(node.group);
-                  const dimmed = Boolean(needle) && !nodeMatches(node);
-                  const pinned = node.fx != null && node.fy != null;
-                  return (
-                    <g
-                      key={node.id}
-                      ref={(element) => { if (element) nodeElRefs.current.set(node.id, element); else nodeElRefs.current.delete(node.id); }}
-                      transform={`translate(${node.x ?? 0}, ${node.y ?? 0})`}
-                      className={`graph-node ${hovered === node.id ? "active" : ""} ${dimmed ? "dimmed" : ""} ${pinned ? "pinned" : ""}`}
-                      onMouseEnter={() => setHovered(node.id)}
-                      onMouseLeave={() => setHovered(null)}
-                    >
-                      <circle r={9} className="graph-node-dot" style={color ? { stroke: color } : undefined} />
-                      <title>{`${node.relation}\nSource: ${node.source_label}\n${node.columns.join(", ")}`}</title>
-                      <text x={rightSide ? 14 : -14} y={4} textAnchor={rightSide ? "start" : "end"}>{label}</text>
-                    </g>
-                  );
-                })}
-              </g>
-            </svg>
-          </div>
-        </>
-      )}
-    </section>
-  );
-}
-
-export function JoinPoliciesPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+export function JoinPoliciesPanel({ notify, onChange }: { notify: (message: string, tone?: "ok" | "error") => void; onChange?: () => void }) {
   const emptyForm = { left_asset_id: "", right_asset_id: "", left_column: "", right_column: "", join_type: "inner" as "inner" | "left", description: "", status: "draft" };
   const [policies, setPolicies] = useState<SemanticJoinPolicy[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
@@ -408,7 +99,7 @@ export function JoinPoliciesPanel({ notify }: { notify: (message: string, tone?:
     return Boolean(left && right && groupKey(left) !== groupKey(right));
   };
   function openPolicy(policy?: SemanticJoinPolicy) { const left = policy ? datasets.find((item) => item.id === policy.left_asset_id) : datasets[0]; const right = policy ? datasets.find((item) => item.id === policy.right_asset_id) : datasets.find((item) => item.id !== left?.id); setEditing(policy || null); setForm(policy ? { left_asset_id: policy.left_asset_id, right_asset_id: policy.right_asset_id, left_column: policy.left_column, right_column: policy.right_column, join_type: policy.join_type, description: policy.description || "", status: policy.status } : { ...emptyForm, left_asset_id: left?.id || "", right_asset_id: right?.id || "", left_column: left?.columns[0]?.name || "", right_column: right?.columns[0]?.name || "" }); setShowForm(true); }
-  async function save(event: FormEvent) { event.preventDefault(); try { await api(editing ? `/semantic/joins/${editing.id}` : "/semantic/joins", { method: editing ? "PUT" : "POST", body: JSON.stringify(form) }); setShowForm(false); await load(); notify(editing ? "Join policy updated" : "Join policy created"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Join policy could not be saved", "error"); } }
-  async function remove(policy: SemanticJoinPolicy) { try { await api(`/semantic/joins/${policy.id}`, { method: "DELETE" }); await load(); notify("Join policy removed"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Join policy could not be removed", "error"); } }
+  async function save(event: FormEvent) { event.preventDefault(); try { await api(editing ? `/semantic/joins/${editing.id}` : "/semantic/joins", { method: editing ? "PUT" : "POST", body: JSON.stringify(form) }); setShowForm(false); await load(); onChange?.(); notify(editing ? "Join policy updated" : "Join policy created"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Join policy could not be saved", "error"); } }
+  async function remove(policy: SemanticJoinPolicy) { try { await api(`/semantic/joins/${policy.id}`, { method: "DELETE" }); await load(); onChange?.(); notify("Join policy removed"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Join policy could not be removed", "error"); } }
   return <aside className="surface"><div className="section-heading compact"><div><span className="eyebrow">JOIN POLICY</span><h3>Approved paths</h3></div><div className="quality-actions"><div className="toolbar-search"><Search size={14} /><input placeholder="Search joins..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><button className="icon-button" title="Add join policy" onClick={() => openPolicy()} disabled={datasets.length < 2}><Plus size={16} /></button></div></div>{policies.length ? <div className="check-list">{policies.filter(p => search ? relation(p.left_asset_id).toLowerCase().includes(search.toLowerCase()) || relation(p.right_asset_id).toLowerCase().includes(search.toLowerCase()) : true).map((policy) => <div key={policy.id}><button className="metric-main" onClick={() => openPolicy(policy)}><strong>{crossesConnectors(policy) && <AlertCircle size={14} className="join-policy-warning" aria-label="Crosses connectors, cannot execute" />} {relation(policy.left_asset_id)} {policy.join_type.toUpperCase()} {relation(policy.right_asset_id)}</strong><small>{policy.left_column} = {policy.right_column}{policy.description ? ` · ${policy.description}` : ""}{crossesConnectors(policy) ? " · can't be queried together in one call (different connectors, or different MCP tools) — cannot execute as written, edit or remove" : ""}</small></button><StatusPill value={policy.status} /><button className="icon-button" title="Delete join policy" onClick={() => remove(policy)}><XCircle size={15} /></button></div>)}</div> : <div className="empty-state"><Network size={18} /><p>No governed join paths yet.</p><small>Approved policies take precedence over inferred identifiers in pipeline generation.</small></div>}<div className="check-list"><div><ShieldCheck size={15} />Only approved policies are used automatically.</div></div>{showForm && <Modal title={editing ? "Edit join policy" : "Add join policy"} onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={save}><div className="form-grid"><label>Left dataset<select value={form.left_asset_id} onChange={(event) => { const asset = datasets.find((item) => item.id === event.target.value); const right = form.right_asset_id === asset?.id ? datasets.find((item) => item.id !== asset?.id) : undefined; setForm({ ...form, left_asset_id: event.target.value, left_column: asset?.columns[0]?.name || "", right_asset_id: right?.id || form.right_asset_id, right_column: right?.columns[0]?.name || form.right_column }); }} required>{datasets.map((asset) => <option key={asset.id} value={asset.id}>{datasetLabel(asset)}</option>)}</select></label><label>Right dataset<select value={form.right_asset_id} onChange={(event) => { const asset = datasets.find((item) => item.id === event.target.value); setForm({ ...form, right_asset_id: event.target.value, right_column: asset?.columns[0]?.name || "" }); }} required>{datasets.filter((asset) => asset.id !== form.left_asset_id).map((asset) => <option key={asset.id} value={asset.id}>{datasetLabel(asset)}</option>)}</select></label></div><div className="form-grid"><label>Left column<select value={form.left_column} onChange={(event) => setForm({ ...form, left_column: event.target.value })} required>{leftAsset?.columns.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select></label><label>Right column<select value={form.right_column} onChange={(event) => setForm({ ...form, right_column: event.target.value })} required>{rightAsset?.columns.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select></label></div><div className="form-grid"><label>Join type<select value={form.join_type} onChange={(event) => setForm({ ...form, join_type: event.target.value as "inner" | "left" })}><option value="inner">Inner join</option><option value="left">Left join</option></select></label><label>Status<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}><option value="draft">Draft</option><option value="approved">Approved</option><option value="deprecated">Deprecated</option></select></label></div><label>Description<input value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="Business meaning and cardinality assumptions" /></label><div className="policy-banner"><ShieldCheck size={18} /><span><strong>Generation guardrail</strong><small>For a left join, select the left dataset first when building a pipeline.</small></span></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button"><Check size={17} />Save policy</button></div></form></Modal>}</aside>;
 }

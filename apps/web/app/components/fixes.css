@@ -1,0 +1,128 @@
+/* Focus/scrollIntoView lands content below the sticky topbar instead of underneath it. */
+html {
+  scroll-padding-top: 76px;
+}
+
+/* Opaque topbar: the 96% token let scrolled page headers show through. */
+.topbar {
+  background: var(--surface);
+}
+
+/* Learning > Router: tool choice score cards (control-item's grid expects a leading icon). */
+.control-item.score-card {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.control-item.score-card > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.control-item.score-card > span:last-child {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.control-item.score-card > span:last-child strong {
+  font-size: 18px;
+}
+
+.learning-pad .tool-cases {
+  display: block;
+  width: 100%;
+  min-height: 170px;
+  margin-top: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.tool-choice-error {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  color: var(--danger);
+}
+
+.tool-choice-error small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Agents > Run policy: modal body padding like the other modal forms. */
+.modal > .policy-details {
+  padding: 6px 18px 18px;
+}
+
+.modal > .policy-details > div:last-child {
+  border-bottom: 0;
+}
+
+.policy-details strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+/* Approvals: auto-approval policy verdict. */
+.auto-review-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.auto-review-checks li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+}
+
+.auto-review-checks li.passed svg {
+  color: var(--success);
+}
+
+.auto-review-checks li.failed {
+  color: var(--danger);
+}
+
+.auto-review-checks small {
+  color: var(--muted);
+}
+
+.auto-approval-policy {
+  max-width: none;
+}
+
+/* Jobs: folded repeats and superseded failures. */
+.log-repeat {
+  margin-left: 4px;
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 600;
+}
+
+.superseded-note {
+  margin: 0 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Superset: give the embedded dashboard room for its taller chart rows. */
+.analytics-mount,
+.analytics-mount iframe {
+  min-height: max(680px, calc(100vh - 220px));
+}

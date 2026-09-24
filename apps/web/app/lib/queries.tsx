@@ -10,6 +10,7 @@
  *   4xx responses are never retried.
  */
 import {
+  keepPreviousData,
   QueryClient,
   QueryClientProvider,
   useInfiniteQuery,
@@ -87,6 +88,14 @@ export const scopes = {
   ddlSuggestions: ["ddl-suggestions"],
   routerDecisions: ["router-decisions"],
   analyticsStatus: ["analytics-status"],
+  artifacts: ["artifacts"],
+  pipelines: ["pipelines"],
+  qualityRules: ["quality-rules"],
+  files: ["files"],
+  queryTools: ["query-tools"],
+  externalInvocations: ["external-invocations"],
+  audit: ["audit"],
+  users: ["users"],
 } as const;
 
 export type Scope = readonly unknown[];
@@ -150,6 +159,81 @@ export function useQueryErrorToast(error: unknown, notify: Notify | undefined, f
     if (ignoreUnavailable && isEndpointUnavailable(error)) return;
     notify(error instanceof Error ? error.message : fallback, "error");
   }, [error, notify, fallback, ignoreUnavailable]);
+}
+
+// ---------------------------------------------------------------- paged lists
+
+export type PageParams = Record<string, string | number | boolean | null | undefined>;
+/** One page of a list endpoint: `X-Total-Count` / `X-Has-More` from the API (see app/pagination.py). */
+export type Paged<T> = { items: T[]; total: number; hasMore: boolean };
+export type Facet = { value: string; count: number };
+export const PAGE_SIZES = [25, 50, 100, 200];
+
+/** Appends non-empty params to a path (`false`, "", null and undefined are dropped). */
+export function withParams(path: string, params: PageParams = {}) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "" || value === false) continue;
+    search.set(key, String(value));
+  }
+  const query = search.toString();
+  return query ? `${path}${path.includes("?") ? "&" : "?"}${query}` : path;
+}
+
+/** `value` after it has been stable for `delay` ms (search boxes that drive server-side filters). */
+export function useDebouncedValue<T>(value: T, delay = 300) {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSettled(value), delay);
+    return () => window.clearTimeout(timer);
+  }, [value, delay]);
+  return settled;
+}
+
+/** Offset/limit state that returns to the first page whenever `resetKey` (filters, search) changes. */
+export function usePagination(resetKey: unknown = null, initialLimit = 50) {
+  const [limit, setLimitState] = useState(initialLimit);
+  const [offset, setOffset] = useState(0);
+  const key = JSON.stringify(resetKey ?? null);
+  const [seenKey, setSeenKey] = useState(key);
+  if (seenKey !== key) {
+    setSeenKey(key);
+    setOffset(0);
+  }
+  const setLimit = useCallback((value: number) => { setLimitState(value); setOffset(0); }, []);
+  return { offset: seenKey === key ? offset : 0, limit, setOffset, setLimit };
+}
+export type PaginationState = ReturnType<typeof usePagination>;
+
+type PagedQueryOptions<T> = Omit<UseQueryOptions<Paged<T>, Error, Paged<T>, QueryKey>, "queryKey" | "queryFn" | "enabled" | "placeholderData"> & { enabled?: boolean };
+
+/**
+ * One server-side page of `path` with `params` as filters. Keys extend `scope`, so
+ * invalidating the scope refreshes every page; the previous page stays on screen while the next loads.
+ */
+export function usePagedQuery<T>(scope: Scope, path: string | null, params: PageParams, page: { offset: number; limit: number }, options: PagedQueryOptions<T> = {}) {
+  const { projectId } = useWorkspace();
+  const { enabled = true, ...rest } = options;
+  return useQuery<Paged<T>, Error, Paged<T>, QueryKey>({
+    queryKey: projectKey(projectId, ...scope, "page", params, page.offset, page.limit),
+    queryFn: async ({ signal }) => {
+      const { data, headers } = await apiWithHeaders<T[]>(withParams(path as string, { ...params, limit: page.limit, offset: page.offset }), { signal });
+      const total = Number(headers.get("X-Total-Count"));
+      return {
+        items: data,
+        total: headers.has("X-Total-Count") && Number.isFinite(total) ? total : page.offset + data.length,
+        hasMore: headers.get("X-Has-More") === "true",
+      };
+    },
+    enabled: path !== null && enabled,
+    placeholderData: keepPreviousData,
+    ...rest,
+  });
+}
+
+/** Group counts for grouped list views (`/datasets/facets`, `/jobs/facets`, `/query-tools/facets`). */
+export function useFacets<T>(scope: Scope, path: string | null, params: PageParams = {}, options: ProjectQueryOptions<T> = {}) {
+  return useProjectQuery<T>([...scope, "facets", params], path === null ? null : withParams(path, params), { placeholderData: keepPreviousData, ...options });
 }
 
 // ---------------------------------------------------------------- workspace

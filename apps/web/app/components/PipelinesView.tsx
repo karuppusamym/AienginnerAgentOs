@@ -23,7 +23,10 @@ import type {
   IngestionSchedule,
   MappingOption,
 } from "../types";
-import { StatusPill, Modal, useConfirm } from "./shared";
+import { scopes, useDebouncedValue, useInvalidate, usePagedQuery, usePagination, useQueryErrorToast } from "../lib/queries";
+import { StatusPill, Modal, Pagination, useConfirm } from "./shared";
+
+const NO_PIPELINES: PipelineDefinition[] = [];
 
 
 export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
@@ -35,15 +38,21 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
   const [mappings, setMappings] = useState<MappingOption[]>([]);
   const [showSchedule, setShowSchedule] = useState(false);
   const [showGenerator, setShowGenerator] = useState(false);
-  const [pipelines, setPipelines] = useState<PipelineDefinition[]>([]);
   const [datasets, setDatasets] = useState<Dataset[]>([]);
   const [search, setSearch] = useState("");
+  const q = useDebouncedValue(search.trim());
+  const pagination = usePagination(q, 25);
+  const pipelinesQuery = usePagedQuery<PipelineDefinition>(scopes.pipelines, "/pipelines", { q }, pagination, { staleTime: 0 });
+  useQueryErrorToast(pipelinesQuery.error, notify, "Pipelines could not be loaded");
+  const pipelines = pipelinesQuery.data?.items ?? NO_PIPELINES;
+  const invalidate = useInvalidate();
   const [scheduleSearch, setScheduleSearch] = useState("");
-  const [selectedPipeline, setSelectedPipeline] = useState<PipelineDefinition | null>(null);
+  const [pickedPipeline, setSelectedPipeline] = useState<PipelineDefinition | null>(null);
+  const selectedPipeline = pickedPipeline ? pipelines.find((item) => item.id === pickedPipeline.id) || pickedPipeline : pipelines[0] || null;
   const [editingPipeline, setEditingPipeline] = useState<PipelineDefinition | null>(null);
   const [pipelineForm, setPipelineForm] = useState({ name: "", source_asset_id: "", target_schema: "curated", target_table: "" });
   const [scheduleForm, setScheduleForm] = useState({ name: "", mapping_id: "", cron: "0 6 * * *", load_mode: "append", key_column: "", watermark_column: "" });
-  const loadSchedules = useCallback(() => Promise.all([api<IngestionSchedule[]>("/schedules"), api<MappingOption[]>("/ingestion-mappings"), api<PipelineDefinition[]>("/pipelines"), api<Dataset[]>("/datasets")]).then(([scheduleData, mappingData, pipelineData, datasetData]) => { setSchedules(scheduleData); setMappings(mappingData); setPipelines(pipelineData); setDatasets(datasetData); setSelectedPipeline((current) => pipelineData.find((item) => item.id === current?.id) || pipelineData[0] || null); setScheduleForm((current) => ({ ...current, mapping_id: current.mapping_id || mappingData[0]?.id || "" })); setPipelineForm((current) => ({ ...current, source_asset_id: current.source_asset_id || datasetData.find((item) => item.asset_type === "staged_file")?.id || datasetData[0]?.id || "" })); }), []);
+  const loadSchedules = useCallback(() => Promise.all([api<IngestionSchedule[]>("/schedules"), api<MappingOption[]>("/ingestion-mappings"), api<Dataset[]>("/datasets"), invalidate(scopes.pipelines)]).then(([scheduleData, mappingData, datasetData]) => { setSchedules(scheduleData); setMappings(mappingData); setDatasets(datasetData); setScheduleForm((current) => ({ ...current, mapping_id: current.mapping_id || mappingData[0]?.id || "" })); setPipelineForm((current) => ({ ...current, source_asset_id: current.source_asset_id || datasetData.find((item) => item.asset_type === "staged_file")?.id || datasetData[0]?.id || "" })); }), [invalidate]);
   useEffect(() => { loadSchedules(); }, [loadSchedules]);
   const selectedMapping = mappings.find((mapping) => mapping.id === scheduleForm.mapping_id);
   async function draft() {
@@ -120,7 +129,7 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
           </div>
         ))}
       </section>
-      <section className="surface schedule-surface"><div className="section-heading"><div><span className="eyebrow">VERSIONED DEFINITIONS</span><h3>Generated pipelines</h3><p>Each draft contains executable local SQL, validation checks, and persisted source-to-target lineage.</p></div><div className="toolbar-search"><Search size={14} /><input placeholder="Search pipelines..." value={search} onChange={(e) => setSearch(e.target.value)} /></div></div><div className="table-header pipeline-registry-grid"><span>Pipeline</span><span>Source to target</span><span>Version</span><span>Status</span><span /></div>{pipelines.filter(p => search ? p.name.toLowerCase().includes(search.toLowerCase()) || p.objective.toLowerCase().includes(search.toLowerCase()) : true).map((pipeline) => <div className={`data-row pipeline-registry-grid ${selectedPipeline?.id === pipeline.id ? "selected" : ""}`} key={pipeline.id} onClick={() => setSelectedPipeline(pipeline)}><span><strong>{pipeline.name}</strong><small>{pipeline.objective}</small></span><span><strong>{pipeline.definition.target?.relation || "-"}</strong><small>{pipeline.definition.sources?.map((source) => source.relation).join(", ")}</small></span><span>v{pipeline.current_version}</span><StatusPill value={pipeline.status} /><span className="row-actions"><button className="icon-button" title="Edit pipeline" onClick={(event) => { event.stopPropagation(); openPipelineGenerator(pipeline); }}><Settings size={16} /></button>{pipeline.status === "draft" && <button className="icon-button" title="Request deployment approval" onClick={(event) => { event.stopPropagation(); deployPipeline(pipeline.id); }}><Play size={16} /></button>}<button className="icon-button" title="Delete pipeline" onClick={(event) => { event.stopPropagation(); deletePipeline(pipeline); }}><XCircle size={16} /></button></span></div>)}{!pipelines.length && <div className="inline-empty">Generate a pipeline from a real catalog dataset.</div>}{selectedPipeline?.generated_code && <pre className="registry-code"><code>{selectedPipeline.generated_code}</code></pre>}</section>
+      <section className="surface schedule-surface"><div className="section-heading"><div><span className="eyebrow">VERSIONED DEFINITIONS</span><h3>Generated pipelines</h3><p>Each draft contains executable local SQL, validation checks, and persisted source-to-target lineage.</p></div><div className="toolbar-search"><Search size={14} /><input placeholder="Search pipelines..." value={search} onChange={(e) => setSearch(e.target.value)} /></div></div><div className="table-header pipeline-registry-grid"><span>Pipeline</span><span>Source to target</span><span>Version</span><span>Status</span><span /></div>{pipelines.map((pipeline) => <div className={`data-row pipeline-registry-grid ${selectedPipeline?.id === pipeline.id ? "selected" : ""}`} key={pipeline.id} onClick={() => setSelectedPipeline(pipeline)}><span><strong>{pipeline.name}</strong><small>{pipeline.objective}</small></span><span><strong>{pipeline.definition.target?.relation || "-"}</strong><small>{pipeline.definition.sources?.map((source) => source.relation).join(", ")}</small></span><span>v{pipeline.current_version}</span><StatusPill value={pipeline.status} /><span className="row-actions"><button className="icon-button" title="Edit pipeline" onClick={(event) => { event.stopPropagation(); openPipelineGenerator(pipeline); }}><Settings size={16} /></button>{pipeline.status === "draft" && <button className="icon-button" title="Request deployment approval" onClick={(event) => { event.stopPropagation(); deployPipeline(pipeline.id); }}><Play size={16} /></button>}<button className="icon-button" title="Delete pipeline" onClick={(event) => { event.stopPropagation(); deletePipeline(pipeline); }}><XCircle size={16} /></button></span></div>)}{!pipelines.length && !pipelinesQuery.isPending && <div className="inline-empty">{q ? "No pipelines match your search." : "Generate a pipeline from a real catalog dataset."}</div>}<Pagination state={pagination} total={pipelinesQuery.data?.total ?? 0} count={pipelines.length} busy={pipelinesQuery.isFetching} label="pipelines" />{selectedPipeline?.generated_code && <pre className="registry-code"><code>{selectedPipeline.generated_code}</code></pre>}</section>
       <div className="policy-banner"><ShieldCheck size={19} /><span><strong>Controlled execution</strong><small>Writes, schedules, and external publication require an approval before the runner receives them.</small></span></div>
       <section className="surface schedule-surface">
         <div className="section-heading"><div><span className="eyebrow">DURABLE AUTOMATION</span><h3>Ingestion schedules</h3><p>Approved mappings run through the local worker with optional incremental watermarks.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={14} /><input placeholder="Search schedules..." value={scheduleSearch} onChange={(e) => setScheduleSearch(e.target.value)} /></div><button className="primary-button" onClick={() => setShowSchedule(true)} disabled={!mappings.length}><CalendarClock size={17} />Add schedule</button></div></div>

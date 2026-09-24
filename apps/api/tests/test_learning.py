@@ -139,12 +139,43 @@ class LearningApiTests(unittest.TestCase):
             {"agent": "Nobody", "step": "x", "expected_tool": "y"},
         ]
         verdict = {"by": "jev", "model": "typesafe/jev-1.13", "probabilities": {"lineage.query": 0.9, "dataset.profile": 0.1}, "latency_ms": 5, "cost_usd": 0.00002}
-        with mock.patch("app.provider_selection.routed_only_provider", return_value=object()), mock.patch("app.jev_client.choose_tools", return_value=verdict):
+        with mock.patch("app.provider_selection.routed_only_provider", return_value=object()), mock.patch("app.jev_client.choose_tools_with_error", return_value=(verdict, None)):
             report = self.client.post("/router/evaluate-tools", headers=self.headers, json={"cases": cases}).json()
         self.assertEqual(len(report["skipped"]), 1)
         self.assertEqual(report["backends"]["jev"]["accuracy"], 0.5)  # the fake verdict always says lineage.query
         self.assertEqual(report["backends"]["local"]["effective_backend"], "local")
         self.assertIsNotNone(report["backends"]["local"]["accuracy"])
+
+    def test_tool_choice_evaluation_reports_jev_errors_instead_of_blank_answers(self) -> None:
+        cases = [{"agent": "SQL Analyst", "step": "Draft a read-only query for total amount by transaction type", "expected_tool": "sql.generate"}]
+        with mock.patch("app.provider_selection.routed_only_provider", return_value=object()), \
+                mock.patch("app.jev_client.choose_tools_with_error", return_value=(None, "ReadTimeout: The read operation timed out")):
+            report = self.client.post("/router/evaluate-tools", headers=self.headers, json={"cases": cases}).json()
+        jev = report["backends"]["jev"]
+        self.assertEqual(jev["errors"], 1)
+        self.assertIn("ReadTimeout", jev["results"][0]["error"])
+        self.assertTrue(report["backends"]["local"]["results"][0]["correct"])
+
+    def test_local_tool_chooser_matches_step_verbs_and_domain_words(self) -> None:
+        from app.models import ToolDefinition
+        from app.temporal_activities import _local_tool_scores
+
+        with SessionLocal() as db:
+            registry = {tool.name: tool.description for tool in db.scalars(select(ToolDefinition)).all()}
+        cases = [
+            (["catalog.search", "dataset.profile", "file.profile", "lineage.query"], "Find catalogued tables about customer accounts", "catalog.search"),
+            (["catalog.search", "dataset.profile", "file.profile", "lineage.query"], "Profile the dataset columns: types, null rates and distinct values", "dataset.profile"),
+            (["catalog.search", "dataset.profile", "file.profile", "lineage.query"], "Retrieve the lineage graph for staging.transactions, upstream and downstream", "lineage.query"),
+            (["catalog.search", "sql.generate", "sql.preview"], "Draft a read-only query for total amount by transaction type", "sql.generate"),
+            (["catalog.search", "sql.generate", "sql.preview"], "Run the query and show a sample of the result rows", "sql.preview"),
+            (["catalog.search", "job.inspect", "lineage.query"], "Inspect the failed job's logs and error", "job.inspect"),
+            (["catalog.search", "job.inspect", "lineage.query"], "Trace which downstream tables are affected by the failed load", "lineage.query"),
+            (["file.profile", "pipeline.stage", "schedule.run"], "Load the uploaded CSV into a staging table", "pipeline.stage"),
+        ]
+        for names, step, expected in cases:
+            scores = _local_tool_scores(step, {name: registry[name] for name in names})
+            self.assertEqual(max(scores, key=scores.get), expected, (step, scores))
+        self.assertEqual(set(_local_tool_scores("zzz", {"a.b": "x", "c.d": "y"}).values()), {0.5})
 
     def test_manual_verified_query_is_validated(self) -> None:
         bad = self.client.post("/verified-queries", headers=self.headers, json={"question": "leak", "sql": "select email from users"})

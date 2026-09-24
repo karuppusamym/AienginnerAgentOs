@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from ..superset_client import describe_superset_error
 from ..charts import infer_column_types
@@ -205,15 +207,25 @@ router = APIRouter()
 
 @router.get("/approvals")
 def list_approvals(
+    response: Response,
+    page: Page = Depends(page_params),
     status: str | None = Query(default=None),
+    action_type: str = Query(default="", max_length=64),
+    q: str = Query(default="", max_length=200),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
     statement = select(Approval).where(Approval.project_id == project.id).order_by(Approval.created_at.desc())
-    if status:
+    if status == "decided":  # everything no longer awaiting a decision
+        statement = statement.where(Approval.status != "pending")
+    elif status:
         statement = statement.where(Approval.status == status.lower())
-    approvals = db.scalars(statement).all()
+    if action_type:
+        statement = statement.where(Approval.action_type == action_type)
+    if q.strip():
+        statement = statement.where(func.lower(Approval.title).like(contains(q), escape="\\") | func.lower(Approval.action_type).like(contains(q), escape="\\"))
+    approvals = paginate_query(db, statement, response, page)
     return [
         as_dict(
             approval,
@@ -257,28 +269,84 @@ async def decide_approval(
     ):
         # Two-person rule: the requester may withdraw (reject) but not approve their own high-impact request.
         raise HTTPException(status_code=403, detail="A different person must approve this request (separation of duties is enabled)")
-    approval.status = payload.decision
-    approval.decision_note = payload.note
-    approval.decided_by = user.id
+    job, schedule = apply_approval_decision(db, project, approval, payload.decision, payload.note, user)
+    workflow_id = None
+    approval_evidence = approval.evidence or {}
+    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index"}:
+        # Plan-bound approvals (review finding H5): the worker loads the plan
+        # frozen in approval.evidence, re-verifies plan_hash and executes it
+        # verbatim -- it never re-plans, and a hash mismatch fails the job
+        # without executing anything. The restart is keyed by this approval so
+        # a duplicate start is rejected rather than run twice.
+        objective = str(approval_evidence.get("objective") or job.title)
+        if approval_evidence.get("plan_hash"):
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Approved plan {str(approval_evidence['plan_hash'])[:12]} by {user.email}"}]
+            db.commit()
+        try:
+            workflow_id = await start_agent_workflow(job.id, objective, run_key=f"approval-{approval.id}")
+        except Exception as exc:
+            job.status = "FAILED"
+            job.progress = 100
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
+        if workflow_id:
+            # The worker may already have moved the job on; never clobber its state.
+            db.refresh(job)
+            if job.status == "PLANNING":
+                job.status = "QUEUED"
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started after approval"}]
+        elif job.status != "FAILED":
+            await run_in_threadpool(run_agent_plan_locally, job.id, objective)
+            db.refresh(job)
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local approval fallback"}]
+        db.commit()
+    return {
+        "status": approval.status,
+        "job_status": job.status if job else None,
+        "workflow_id": workflow_id,
+        "schedule_enabled": schedule.enabled if schedule else None,
+        "plan_hash": approval_evidence.get("plan_hash"),
+    }
+
+
+def apply_approval_decision(
+    db: Session,
+    project: Project,
+    approval: Approval,
+    decision: str,
+    note: str | None,
+    actor: User,
+    *,
+    auto_policy: dict[str, Any] | None = None,
+) -> tuple[Job | None, IngestionSchedule | None]:
+    """Record a decision and run its side effects, then commit.
+
+    ``actor`` is the identity the approved action runs as. A decision taken by
+    the auto-approval policy (``auto_policy`` set) runs as the requester, leaves
+    ``decided_by`` empty and is audited as the policy's, never as a person's.
+    Agent-run restarts stay in the async route: the policy never approves them.
+    """
+    approval.status = decision
+    approval.decision_note = note
+    approval.decided_by = None if auto_policy else actor.id
     approval.decided_at = datetime.now(timezone.utc)
     job = db.get(Job, approval.job_id)
     if job:
-        job.status = "PLANNING" if payload.decision == "approved" else "CANCELLED"
-        job.progress = 10 if payload.decision == "approved" else 100
+        job.status = "PLANNING" if decision == "approved" else "CANCELLED"
+        job.progress = 10 if decision == "approved" else 100
     schedule = None
     if approval.action_type == "enable_ingestion_schedule":
         schedule_id = str(approval.evidence.get("schedule_id", ""))
         schedule = db.get(IngestionSchedule, schedule_id)
-        if schedule and payload.decision == "approved":
+        if schedule and decision == "approved":
             schedule.enabled = True
             schedule.next_run_at = next_run_at(schedule.cron)
         if job:
-            job.status = "SUCCEEDED" if payload.decision == "approved" else "CANCELLED"
+            job.status = "SUCCEEDED" if decision == "approved" else "CANCELLED"
             job.progress = 100
-            job.plan = [{**step, "status": "complete" if payload.decision == "approved" else "cancelled"} for step in job.plan]
+            job.plan = [{**step, "status": "complete" if decision == "approved" else "cancelled"} for step in job.plan]
     if approval.action_type == "deploy_pipeline":
         pipeline = db.get(PipelineDefinition, str(approval.evidence.get("pipeline_id", "")))
-        if pipeline and payload.decision == "approved":
+        if pipeline and decision == "approved":
             version = db.scalar(select(PipelineVersion).where(PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.current_version))
             if version is None:
                 raise HTTPException(status_code=409, detail="Pipeline version not found")
@@ -318,7 +386,7 @@ async def decide_approval(
             pipeline.status = "draft"
     if approval.action_type == "tool_execution":
         execution = db.get(ToolExecution, str(approval.evidence.get("tool_execution_id", "")))
-        if execution and payload.decision == "approved":
+        if execution and decision == "approved":
             tool = db.get(ToolDefinition, execution.tool_id)
             version = db.scalar(select(ToolVersion).where(ToolVersion.tool_id == execution.tool_id, ToolVersion.version == execution.tool_version))
             if tool is None or version is None:
@@ -336,7 +404,7 @@ async def decide_approval(
                     version.timeout_seconds,
                     version.max_retries,
                     version.retry_backoff_seconds,
-                    user_id=user.id,
+                    user_id=actor.id,
                     session_id=job.id if job else execution.id,
                 )
                 execution.status = "SUCCEEDED"
@@ -358,7 +426,7 @@ async def decide_approval(
         elif execution:
             execution.status = "CANCELLED"
             execution.completed_at = datetime.now(timezone.utc)
-    if approval.action_type == "quality_remediation" and payload.decision == "approved":
+    if approval.action_type == "quality_remediation" and decision == "approved":
         source_run = db.get(QualityRun, str(approval.evidence.get("quality_run_id", "")))
         if source_run is None or source_run.project_id != project.id:
             raise HTTPException(status_code=409, detail="Quality run no longer exists")
@@ -377,7 +445,7 @@ async def decide_approval(
             asset = db.get(DataAsset, rule.asset_id) if rule else None
             if rule is None or asset is None or rule.project_id != project.id:
                 raise HTTPException(status_code=409, detail="Quality rule or dataset no longer exists")
-            rerun = QualityRun(project_id=project.id, rule_id=rule.id, status="running", created_by=user.id)
+            rerun = QualityRun(project_id=project.id, rule_id=rule.id, status="running", created_by=actor.id)
             db.add(rerun)
             db.flush()
             result = execute_quality_rule(engine, asset.schema_name, asset.table_name, rule.name, rule.rule_type, rule.column_name, rule.config, rerun.id)
@@ -389,7 +457,7 @@ async def decide_approval(
             job.status = "SUCCEEDED"
             job.progress = 100
             job.plan = [{**step, "status": "complete"} for step in job.plan]
-    if approval.action_type == "apply_retention" and payload.decision == "approved":
+    if approval.action_type == "apply_retention" and decision == "approved":
         policy = db.get(RetentionPolicy, str(approval.evidence.get("policy_id", "")))
         if policy is None or policy.project_id != project.id:
             raise HTTPException(status_code=409, detail="Retention policy no longer exists")
@@ -402,22 +470,22 @@ async def decide_approval(
             job.evidence = [*job.evidence, {"type": "deleted_records", "label": str(deleted_count)}]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
     if approval.action_type == "prompt_activation":
-        if payload.decision == "approved":
+        if decision == "approved":
             learning.activate_runtime_prompt(db, str(approval.evidence.get("artifact_id", "")), int(approval.evidence.get("version", 0)))
-            audit(db, user, "prompt.activated", "artifact", str(approval.evidence.get("artifact_id", "")), {"version": approval.evidence.get("version")})
+            audit(db, actor, "prompt.activated", "artifact", str(approval.evidence.get("artifact_id", "")), {"version": approval.evidence.get("version")})
         if job:
-            job.status = "SUCCEEDED" if payload.decision == "approved" else "CANCELLED"
+            job.status = "SUCCEEDED" if decision == "approved" else "CANCELLED"
             job.progress = 100
     if approval.action_type == "create_index":
         if job:
             job.status, job.progress = ("CANCELLED", 100)
-        if payload.decision == "approved":
+        if decision == "approved":
             try:
                 statement = create_index(engine, db, project.id, str(approval.evidence.get("relation", "")), [str(column) for column in approval.evidence.get("columns", [])])
                 if job:
                     job.status = "SUCCEEDED"
                     job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Executed: {statement}"}]
-                audit(db, user, "index.created", "approval", approval.id, {"statement": statement})
+                audit(db, actor, "index.created", "approval", approval.id, {"statement": statement})
             except PermissionError as exc:
                 if job:
                     job.status = "CANCELLED"
@@ -426,7 +494,7 @@ async def decide_approval(
                 if job:
                     job.status = "FAILED"
                     job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Index creation failed: {str(exc)[:400]}"}]
-    if approval.action_type == "publish_superset_query" and payload.decision == "approved":
+    if approval.action_type == "publish_superset_query" and decision == "approved":
         artifact_id = str(approval.evidence.get("artifact_id", ""))
         artifact_version = int(approval.evidence.get("artifact_version", 0) or 0)
         artifact = db.get(Artifact, artifact_id)
@@ -473,7 +541,7 @@ async def decide_approval(
             dashboard_key = f"query-{artifact.id}"
             config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
             state = main.save_superset_query_dashboard_state(
-                db, project, artifact, artifact_version, sql.strip().rstrip(";"), columns, config, user.id
+                db, project, artifact, artifact_version, sql.strip().rstrip(";"), columns, config, actor.id
             )
         except (RuntimeError, httpx.HTTPError, OSError) as exc:
             # Raised before commit, so the approval stays pending and can be approved again once Superset is up.
@@ -488,51 +556,82 @@ async def decide_approval(
             ]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
             job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Published Superset virtual dataset {query_name}"}]
-    audit(db, user, f"approval.{payload.decision}", "approval", approval.id)
+    if auto_policy:
+        db.add(AuditEvent(project_id=project.id, actor_id=None, event_type=f"approval.auto_{decision}", entity_type="approval", entity_id=approval.id, details=auto_policy))
+        record_audit_event(f"approval.auto_{decision}", "approval", approval.id, project_id=project.id, details={"reason": auto_policy.get("reason", "")})
+    else:
+        audit(db, actor, f"approval.{decision}", "approval", approval.id)
     main.record_governance_event(
         "approval_decision",
         approval.action_type,
-        payload.decision,
+        decision,
         project_id=project.id,
-        user_id=user.id,
+        user_id=None if auto_policy else actor.id,
         session_id=job.id if job else approval.id,
         risk_level=approval.risk_level,
         approval_id=approval.id,
+        decided_by="auto_approval_policy" if auto_policy else "human",
     )
     db.commit()
-    workflow_id = None
-    approval_evidence = approval.evidence or {}
-    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index"}:
-        # Plan-bound approvals (review finding H5): the worker loads the plan
-        # frozen in approval.evidence, re-verifies plan_hash and executes it
-        # verbatim -- it never re-plans, and a hash mismatch fails the job
-        # without executing anything. The restart is keyed by this approval so
-        # a duplicate start is rejected rather than run twice.
-        objective = str(approval_evidence.get("objective") or job.title)
-        if approval_evidence.get("plan_hash"):
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Approved plan {str(approval_evidence['plan_hash'])[:12]} by {user.email}"}]
-            db.commit()
-        try:
-            workflow_id = await start_agent_workflow(job.id, objective, run_key=f"approval-{approval.id}")
-        except Exception as exc:
-            job.status = "FAILED"
-            job.progress = 100
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
-        if workflow_id:
-            # The worker may already have moved the job on; never clobber its state.
-            db.refresh(job)
-            if job.status == "PLANNING":
-                job.status = "QUEUED"
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started after approval"}]
-        elif job.status != "FAILED":
-            await run_in_threadpool(run_agent_plan_locally, job.id, objective)
-            db.refresh(job)
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local approval fallback"}]
-        db.commit()
+    return job, schedule
+
+
+class AutoApprovalSettings(BaseModel):
+    enabled: bool
+
+
+def _auto_approval_output(project: Project) -> dict[str, Any]:
+    from .. import auto_approval
+
     return {
-        "status": approval.status,
-        "job_status": job.status if job else None,
-        "workflow_id": workflow_id,
-        "schedule_enabled": schedule.enabled if schedule else None,
-        "plan_hash": approval_evidence.get("plan_hash"),
+        "project_id": project.id,
+        "enabled": auto_approval.auto_approval_enabled(project),
+        "policy_version": auto_approval.POLICY_VERSION,
+        "auto_approvable_actions": sorted(auto_approval.AUTO_APPROVABLE_ACTIONS),
+        "manual_only": auto_approval.MANUAL_ONLY_REASONS,
+        "separation_of_duties": auto_approval.separation_of_duties(),
+    }
+
+
+@router.get("/approvals/auto-approval")
+def current_auto_approval(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _auto_approval_output(require_current_project(db, user))
+
+
+@router.get("/projects/{project_id}/auto-approval")
+def project_auto_approval(project_id: str, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _auto_approval_output(project)
+
+
+@router.put("/projects/{project_id}/auto-approval")
+def update_project_auto_approval(project_id: str, payload: AutoApprovalSettings, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    from .. import auto_approval
+
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    auto_approval.set_auto_approval(project, payload.enabled)
+    db.add(AuditEvent(project_id=project.id, actor_id=admin.id, event_type="project.auto_approval_updated", entity_type="project", entity_id=project.id, details={"enabled": payload.enabled}))
+    db.commit()
+    return _auto_approval_output(project)
+
+
+@router.post("/approvals/auto-review")
+def run_auto_review(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Run the auto-approval policy over this project's pending approvals now."""
+    from .. import auto_approval
+
+    require_permission(user, db, "jobs:write", "Running the approval policy requires jobs:write permission")
+    project = require_current_project(db, user)
+    if not auto_approval.auto_approval_enabled(project):
+        return {"enabled": False, "approved": 0, "manual": 0, "results": []}
+    results = auto_approval.review_pending(db, project, "manual_run")
+    return {
+        "enabled": True,
+        "approved": sum(1 for item in results if item["decision"] == "approved"),
+        "manual": sum(1 for item in results if item["decision"] == "manual"),
+        "results": results,
     }

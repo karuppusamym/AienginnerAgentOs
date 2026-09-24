@@ -208,6 +208,7 @@ def _invoke_external_query_tool(
     client: ExternalClient,
     tool: QueryTool,
     parameters: dict[str, Any],
+    channel: str = "rest",
 ) -> dict[str, Any]:
     enforce_external_rate_limit(db, client, "invoke", tool.name)
     grant = db.scalar(
@@ -227,6 +228,7 @@ def _invoke_external_query_tool(
         project_id=tool.project_id,
         external_client_id=client.id,
         query_tool_id=tool.id,
+        channel=channel,
         parameters=parameters,
     )
     db.add(invocation)
@@ -241,6 +243,7 @@ def _invoke_external_query_tool(
         feature="external_query_tool",
         external_client_id=client.id,
         query_tool_id=tool.id,
+        channel=channel,
         connector_id=tool.connector_id or "",
         row_limit=tool.row_limit,
     )
@@ -269,6 +272,7 @@ def _invoke_external_query_tool(
             "row_count": serializable["row_count"],
             "truncated": serializable["truncated"],
         }
+        invocation.row_count = serializable["row_count"]
         db.commit()
         record_governance_event(
             "external_query_tool",

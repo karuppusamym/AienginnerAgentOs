@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from ..models import RouteDecision
 from ..learning import learn_from_feedback
@@ -217,10 +219,20 @@ def effective_policy(user: User = Depends(get_current_user), db: Session = Depen
 
 @router.get("/audit")
 def get_audit_log(
+    response: Response,
+    page: Page = Depends(page_params),
+    event_type: str = Query(default="", max_length=120),
+    entity_type: str = Query(default="", max_length=64),
     admin: User = Depends(require_admin), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, admin)
-    events = db.scalars(select(AuditEvent).where(AuditEvent.project_id == project.id).order_by(AuditEvent.created_at.desc()).limit(100)).all()
+    statement = select(AuditEvent).where(AuditEvent.project_id == project.id)
+    if event_type:
+        # "query_tool." matches the whole family; an exact name matches itself.
+        statement = statement.where(func.lower(AuditEvent.event_type).like(contains(event_type), escape="\\"))
+    if entity_type:
+        statement = statement.where(AuditEvent.entity_type == entity_type)
+    events = paginate_query(db, statement.order_by(AuditEvent.created_at.desc()), response, page, default_limit=100)
     return [
         as_dict(event, ["id", "actor_id", "event_type", "entity_type", "entity_id", "details", "created_at"])
         for event in events

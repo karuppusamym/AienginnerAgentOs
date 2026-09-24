@@ -225,7 +225,10 @@ test("renders data-driven result charts with a chart-type switcher", async () =>
   assert.match(chat, /Jev decision/);
   assert.match(chat, /No majority/);
   const pkg = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
-  assert.ok(!Object.keys(pkg.dependencies).some((name) => /chart|d3|plotly|vega|nivo/i.test(name)), "charts are inline SVG, no chart library");
+  // Result charts are inline SVG. d3 layout/interaction modules (force layout, drag, zoom, selection)
+  // are allowed for the semantic relationship graph; chart-rendering libraries are not.
+  const graphLayout = new Set(["d3-force", "d3-drag", "d3-zoom", "d3-selection"]);
+  assert.ok(!Object.keys(pkg.dependencies).some((name) => !graphLayout.has(name) && /chart|d3|plotly|vega|nivo/i.test(name)), "charts are inline SVG, no chart library");
 });
 
 test("surfaces decision models and DDL suggestions", async () => {

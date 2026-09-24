@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, grouped_counts, page_params, paginate_query
 
 from .. import core as main
 from ..core import (
@@ -198,12 +200,36 @@ router = APIRouter()
 
 @router.get("/quality/rules")
 def list_quality_rules(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    asset_id: str = Query(default="", max_length=36),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    rules = db.scalars(select(QualityRule).where(QualityRule.project_id == project.id).order_by(QualityRule.created_at.desc())).all()
+    statement = select(QualityRule).where(QualityRule.project_id == project.id)
+    if asset_id:
+        statement = statement.where(QualityRule.asset_id == asset_id)
+    if q.strip():
+        pattern = contains(q)
+        matching_assets = select(DataAsset.id).where(DataAsset.project_id == project.id, func.lower(DataAsset.table_name).like(pattern, escape="\\") | func.lower(DataAsset.schema_name).like(pattern, escape="\\"))
+        statement = statement.where(
+            func.lower(QualityRule.name).like(pattern, escape="\\") | func.lower(QualityRule.rule_type).like(pattern, escape="\\")
+            | func.lower(QualityRule.column_name).like(pattern, escape="\\") | QualityRule.asset_id.in_(matching_assets)
+        )
+    rules = paginate_query(db, statement.order_by(QualityRule.created_at.desc()), response, page)
     return [quality_rule_output(rule, db) for rule in rules]
+
+
+@router.get("/quality/rules/facets")
+def quality_rule_facets(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Rule counts per dataset and rule type (coverage metrics without loading every rule)."""
+    project = require_current_project(db, user)
+    scoped = select(QualityRule).where(QualityRule.project_id == project.id).subquery()
+    by_asset = db.execute(select(scoped.c.asset_id, func.count()).group_by(scoped.c.asset_id)).all()
+    by_type = db.execute(select(scoped.c.rule_type, func.count()).group_by(scoped.c.rule_type)).all()
+    return {"total": sum(count for _, count in by_asset), "asset": grouped_counts(by_asset), "rule_type": grouped_counts(by_type)}
 
 @router.post("/quality/rules", status_code=201)
 def create_quality_rule(

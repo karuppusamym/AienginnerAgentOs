@@ -9,9 +9,9 @@ import json
 import threading
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .. import core as main
@@ -21,6 +21,7 @@ from ..database import engine, get_db
 from ..gepa import run_optimization
 from ..index_advisor import ddl_execution_allowed, recommend_indexes
 from ..models import Approval, Job, PromptOptimizationRun, User, VerifiedQuery
+from ..pagination import Page, contains, grouped_counts, page_params, paginate_query
 from ..sql_guard import unknown_relations
 from ..staging import execute_read_only
 
@@ -43,12 +44,26 @@ class VerifiedQueryUpdate(BaseModel):
 
 
 @router.get("/verified-queries")
-def list_verified_queries(status: str | None = Query(default=None, max_length=24), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_verified_queries(response: Response, page: Page = Depends(page_params), status: str | None = Query(default=None, max_length=24), source: str = Query(default="", max_length=32), q: str = Query(default="", max_length=200), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     project = main.require_current_project(db, user)
     query = select(VerifiedQuery).where(VerifiedQuery.project_id == project.id)
     if status:
         query = query.where(VerifiedQuery.status == status)
-    return [_verified_output(row) for row in db.scalars(query.order_by(VerifiedQuery.created_at.desc()).limit(500)).all()]
+    if source:
+        query = query.where(VerifiedQuery.source == source)
+    if q.strip():
+        query = query.where(func.lower(VerifiedQuery.question).like(contains(q), escape="\\") | func.lower(VerifiedQuery.sql).like(contains(q), escape="\\"))
+    return [_verified_output(row) for row in paginate_query(db, query.order_by(VerifiedQuery.created_at.desc()), response, page, default_limit=500)]
+
+
+@router.get("/verified-queries/facets")
+def verified_query_facets(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Counts per status and source (the status filter's badges) without loading the list."""
+    project = main.require_current_project(db, user)
+    scoped = select(VerifiedQuery).where(VerifiedQuery.project_id == project.id).subquery()
+    by_status = db.execute(select(scoped.c.status, func.count()).group_by(scoped.c.status)).all()
+    by_source = db.execute(select(scoped.c.source, func.count()).group_by(scoped.c.source)).all()
+    return {"total": sum(count for _, count in by_status), "status": grouped_counts(by_status), "source": grouped_counts(by_source)}
 
 
 @router.post("/verified-queries", status_code=201)

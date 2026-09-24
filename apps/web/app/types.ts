@@ -368,6 +368,8 @@ export type ConversationMessage = {
   structured: {
     sql?: string;
     dialect?: string;
+    /** SQL artifact created by "Publish to Superset" from this answer (one click: save + approval request). */
+    superset_artifact_id?: string;
     provider?: { name: string; model: string; mode?: string; latency_ms?: number };
     cache?: { hit: boolean; cache_key?: string; normalized_question?: string; hit_count?: number };
     grounding?: {

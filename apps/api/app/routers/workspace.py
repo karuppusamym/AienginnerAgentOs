@@ -118,8 +118,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import chunk_glossary_text, delete_document, index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
+from ..pagination import Page, facet_counts, page_params, paginate_items
 from .. import core as main
 from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
@@ -199,14 +200,64 @@ from ..core import (
 router = APIRouter()
 
 
+def _dataset_source_name(item: dict[str, Any]) -> str:
+    return str((item.get("source") or {}).get("name") or item.get("source_name") or "")
+
+
+def _filtered_datasets(
+    db: Session, project: Project, q: str, source: str, category: str, schema: str, asset_id: str
+) -> list[dict[str, Any]]:
+    """Dataset rows after the source/category/schema/text filters (source and category are derived, so filtered here)."""
+    statement = select(DataAsset).where(DataAsset.project_id == project.id)
+    if asset_id:
+        statement = statement.where(DataAsset.id == asset_id)
+    if schema:
+        statement = statement.where(DataAsset.schema_name == schema)
+    items = _dataset_rows(db, project, db.scalars(statement.order_by(DataAsset.schema_name, DataAsset.table_name)).all())
+    needle = q.strip().lower()
+    return [
+        item for item in items
+        if (not source or (_dataset_source_name(item) or "Unassigned") == source)
+        and (not category or (item["category"] or "Unassigned") == category)
+        and (not needle or needle in f"{item['schema_name']}.{item['table_name']} {item['description']} {_dataset_source_name(item)} {item['category']} {' '.join(item['tags'] or [])}".lower())
+    ]
+
+
 @router.get("/datasets")
 def list_datasets(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    source: str = Query(default="", max_length=200),
+    category: str = Query(default="", max_length=120),
+    schema: str = Query(default="", max_length=200),
+    asset_id: str = Query(default="", alias="id", max_length=36),
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    assets = db.scalars(
-        select(DataAsset).where(DataAsset.project_id == project.id).order_by(DataAsset.schema_name, DataAsset.table_name)
-    ).all()
+    return paginate_items(_filtered_datasets(db, project, q, source, category, schema, asset_id), response, page)
+
+
+@router.get("/datasets/facets")
+def dataset_facets(
+    q: str = Query(default="", max_length=200),
+    source: str = Query(default="", max_length=200),
+    category: str = Query(default="", max_length=120),
+    schema: str = Query(default="", max_length=200),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Counts per source / category / schema for the filtered catalog (drives grouped views)."""
+    project = require_current_project(db, user)
+    items = _filtered_datasets(db, project, q, source, category, schema, "")
+    return {
+        "total": len(items),
+        "source": facet_counts(_dataset_source_name(item) for item in items),
+        "category": facet_counts(item["category"] for item in items),
+        "schema": facet_counts(item["schema_name"] for item in items),
+    }
+
+
+def _dataset_rows(db: Session, project: Project, assets: list[DataAsset]) -> list[dict[str, Any]]:
     from ..catalog_scope import queryable_asset_ids
 
     queryable = queryable_asset_ids(db, project.id, assets)

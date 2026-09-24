@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  Bot,
   Check,
   ChevronRight,
   Search,
@@ -12,8 +13,8 @@ import { api } from "../lib/api";
 import type {
   Approval,
 } from "../types";
-import { scopes, useApprovals, useInvalidate, useQueryErrorToast } from "../lib/queries";
-import { StatusPill, EmptyState, LoadingBlock, formatScore } from "./shared";
+import { scopes, useDebouncedValue, useInvalidate, usePagedQuery, usePagination, useQueryErrorToast } from "../lib/queries";
+import { StatusPill, EmptyState, LoadingBlock, Pagination, formatScore } from "./shared";
 
 const NO_APPROVALS: Approval[] = [];
 const ACTION_LABELS: Record<string, string> = { prompt_activation: "Prompt activation", create_index: "Create index" };
@@ -52,6 +53,20 @@ function CreateIndexEvidence({ evidence }: { evidence: Approval["evidence"] }) {
   );
 }
 
+
+type AutoReview = { decision: "approved" | "manual"; reason: string; checks: { check: string; passed: boolean; detail?: string }[]; at?: string };
+const autoReviewOf = (approval: Approval) => (approval.evidence as { auto_review?: AutoReview }).auto_review;
+
+/** The auto-approval policy's verdict: approved on its own, or why it left the request for a person. */
+function AutoReviewNote({ review }: { review: AutoReview }) {
+  const approved = review.decision === "approved";
+  return (
+    <div className={`approval-evidence-block auto-review ${approved ? "approved" : "manual"}`}>
+      <p className={`plan-binding ${approved ? "bound" : "unbound"}`}><Bot size={14} /><span><strong>{approved ? "Auto-approved by policy" : "Policy: needs a person"}</strong> · {review.reason}</span></p>
+      <ul className="auto-review-checks">{review.checks.map((item) => <li key={item.check} className={item.passed ? "passed" : "failed"}>{item.passed ? <Check size={12} /> : <XCircle size={12} />}{item.check}{item.detail ? <small> ({item.detail})</small> : null}</li>)}</ul>
+    </div>
+  );
+}
 
 /** Why an agent run was held for approval; "jev:consequential" means the Jev decision model escalated it. */
 function RiskTriggers({ evidence }: { evidence: Approval["evidence"] }) {
@@ -97,8 +112,13 @@ function FrozenPlan({ evidence }: { evidence: Approval["evidence"] }) {
 }
 
 export function ApprovalsView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
-  const approvalsQuery = useApprovals();
-  const approvals = approvalsQuery.data ?? NO_APPROVALS;
+  const [filter, setFilter] = useState<"pending" | "decided">("pending");
+  const [search, setSearch] = useState("");
+  const q = useDebouncedValue(search.trim());
+  const filters = { status: filter, q };
+  const pagination = usePagination(filters, 50);
+  const approvalsQuery = usePagedQuery<Approval>(scopes.approvals, "/approvals", filters, pagination);
+  const approvals = approvalsQuery.data?.items ?? NO_APPROVALS;
   useQueryErrorToast(approvalsQuery.error, notify, "Approvals could not be loaded");
   const invalidate = useInvalidate();
   // Deciding changes job state and may activate a prompt or create an index.
@@ -107,21 +127,29 @@ export function ApprovalsView({ notify }: { notify: (message: string, tone?: "ok
   const [selectedId, setSelectedId] = useState<string | null | undefined>(undefined);
   const selected = selectedId === null ? null : approvals.find((item) => item.id === selectedId) || (selectedId === undefined ? approvals[0] || null : null);
   const setSelected = (approval: Approval | null) => setSelectedId(approval ? approval.id : null);
-  const [filter, setFilter] = useState<"pending" | "decided">("pending");
-  const [search, setSearch] = useState("");
-  const filtered = approvals.filter((approval) => (filter === "pending" ? approval.status === "pending" : approval.status !== "pending") && (search ? approval.title.toLowerCase().includes(search.toLowerCase()) || approval.action_type.toLowerCase().includes(search.toLowerCase()) : true));
+  const [reviewing, setReviewing] = useState(false);
+  async function runAutoReview() {
+    setReviewing(true);
+    try {
+      const result = await api<{ enabled: boolean; approved: number; manual: number }>("/approvals/auto-review", { method: "POST" });
+      notify(result.enabled ? `Policy approved ${result.approved}, left ${result.manual} for a person` : "Auto-approval is off for this project (Admin > Projects)", result.enabled ? "ok" : "error");
+      await load();
+    } catch (reason) { notify(reason instanceof Error ? reason.message : "Auto-review failed", "error"); }
+    finally { setReviewing(false); }
+  }
   async function decide(decision: "approved" | "rejected") {
     if (!selected) return;
     try {
       await api(`/approvals/${selected.id}/decision`, { method: "POST", body: JSON.stringify({ decision, note: decision === "approved" ? "Reviewed in local workspace" : "Returned for revision" }) });
       notify(`Action ${decision}`);
       await load();
+      if (filter === "pending") setSelectedId(undefined);  // decided items leave this list; follow the next one
     } catch (reason) { notify(reason instanceof Error ? reason.message : "Decision failed", "error"); }
   }
   return (
-    <div className="view-stack"><div className="view-header"><div><h2>Approval inbox</h2><p>Review evidence and decide every controlled write, schedule, or external action.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search approvals..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><div className="segmented"><button className={filter === "pending" ? "active" : ""} onClick={() => { setFilter("pending"); setSelected(approvals.find((item) => item.status === "pending") || null); }}>Pending</button><button className={filter === "decided" ? "active" : ""} onClick={() => { setFilter("decided"); setSelected(approvals.find((item) => item.status !== "pending") || null); }}>Decided</button></div></div></div>
-      <div className="approval-layout"><section className="surface approval-list">{filtered.map((approval) => <button key={approval.id} className={selected?.id === approval.id ? "selected" : ""} onClick={() => setSelected(approval)}><span className={`risk-mark ${approval.risk_level}`}><ShieldCheck size={18} /></span><span><strong>{approval.title}</strong><small>{ACTION_LABELS[approval.action_type] || approval.action_type.replaceAll("_", " ")} / {new Date(approval.created_at).toLocaleDateString()}</small></span><StatusPill value={approval.status} /><ChevronRight size={16} /></button>)}</section>
-        <aside className="surface approval-detail">{selected ? <><div className="section-heading compact"><div><span className="eyebrow">DECISION REQUIRED</span><h3>{selected.title}</h3></div><StatusPill value={selected.risk_level} /></div><div className="evidence-box"><h4>Action summary</h4><p>{selected.evidence.summary || selected.evidence.objective || (selected.action_type === "prompt_activation" ? `Activate ${selected.evidence.prompt_name || "prompt"} v${selected.evidence.version ?? "?"}` : selected.action_type === "create_index" ? `Create index on ${selected.evidence.relation || "relation"} (${selected.evidence.columns?.join(", ") || ""})` : "")}</p></div><RiskTriggers evidence={selected.evidence} />{!!selected.evidence.plan?.length && <FrozenPlan evidence={selected.evidence} />}{selected.action_type === "prompt_activation" && <PromptActivationEvidence evidence={selected.evidence} />}{selected.action_type === "create_index" && <CreateIndexEvidence evidence={selected.evidence} />}<div className="subheading"><h4>Guardrails and checks</h4></div><div className="check-list">{(selected.evidence.checks || selected.evidence.guardrails || []).map((check) => <div key={check}><ShieldCheck size={15} />{check}</div>)}</div><div className="approval-actions"><button className="danger-button" disabled={selected.status !== "pending"} onClick={() => decide("rejected")}><XCircle size={17} />Reject</button><button className="primary-button" disabled={selected.status !== "pending"} onClick={() => decide("approved")}><Check size={17} />Approve action</button></div></> : approvalsQuery.isPending ? <LoadingBlock label="Loading approvals" /> : <EmptyState icon={<ShieldCheck size={24} />} title="No approvals" body="Controlled agent actions will appear here." />}</aside>
+    <div className="view-stack"><div className="view-header"><div><h2>Approval inbox</h2><p>Review evidence and decide every controlled write, schedule, or external action.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search approvals..." value={search} onChange={(e) => setSearch(e.target.value)} /></div><button className="secondary-button" onClick={() => void runAutoReview()} disabled={reviewing} title="Approve pending low-risk, read-only requests that pass every policy check"><Bot size={16} />{reviewing ? "Reviewing" : "Run auto-review now"}</button><div className="segmented"><button className={filter === "pending" ? "active" : ""} onClick={() => { setFilter("pending"); setSelectedId(undefined); }}>Pending</button><button className={filter === "decided" ? "active" : ""} onClick={() => { setFilter("decided"); setSelectedId(undefined); }}>Decided</button></div></div></div>
+      <div className="approval-layout"><section className="surface approval-list">{approvals.map((approval) => <button key={approval.id} className={selected?.id === approval.id ? "selected" : ""} onClick={() => setSelected(approval)}><span className={`risk-mark ${approval.risk_level}`}><ShieldCheck size={18} /></span><span><strong>{approval.title}</strong><small>{ACTION_LABELS[approval.action_type] || approval.action_type.replaceAll("_", " ")} / {new Date(approval.created_at).toLocaleDateString()}{autoReviewOf(approval)?.decision === "approved" ? " / auto-approved by policy" : ""}</small></span><StatusPill value={approval.status} /><ChevronRight size={16} /></button>)}{!approvals.length && !approvalsQuery.isPending && <div className="list-empty">{q ? "No approvals match your search." : filter === "pending" ? "Nothing is waiting for a decision." : "No decided approvals yet."}</div>}<Pagination state={pagination} total={approvalsQuery.data?.total ?? 0} count={approvals.length} busy={approvalsQuery.isFetching} label="approvals" /></section>
+        <aside className="surface approval-detail">{selected ? <><div className="section-heading compact"><div><span className="eyebrow">DECISION REQUIRED</span><h3>{selected.title}</h3></div><StatusPill value={selected.risk_level} /></div><div className="evidence-box"><h4>Action summary</h4><p>{selected.evidence.summary || selected.evidence.objective || (selected.action_type === "prompt_activation" ? `Activate ${selected.evidence.prompt_name || "prompt"} v${selected.evidence.version ?? "?"}` : selected.action_type === "create_index" ? `Create index on ${selected.evidence.relation || "relation"} (${selected.evidence.columns?.join(", ") || ""})` : "")}</p></div>{autoReviewOf(selected) && <AutoReviewNote review={autoReviewOf(selected)!} />}<RiskTriggers evidence={selected.evidence} />{!!selected.evidence.plan?.length && <FrozenPlan evidence={selected.evidence} />}{selected.action_type === "prompt_activation" && <PromptActivationEvidence evidence={selected.evidence} />}{selected.action_type === "create_index" && <CreateIndexEvidence evidence={selected.evidence} />}<div className="subheading"><h4>Guardrails and checks</h4></div><div className="check-list">{(selected.evidence.checks || selected.evidence.guardrails || []).map((check) => <div key={check}><ShieldCheck size={15} />{check}</div>)}</div><div className="approval-actions"><button className="danger-button" disabled={selected.status !== "pending"} onClick={() => decide("rejected")}><XCircle size={17} />Reject</button><button className="primary-button" disabled={selected.status !== "pending"} onClick={() => decide("approved")}><Check size={17} />Approve action</button></div></> : approvalsQuery.isPending ? <LoadingBlock label="Loading approvals" /> : <EmptyState icon={<ShieldCheck size={24} />} title="No approvals" body="Controlled agent actions will appear here." />}</aside>
       </div>
     </div>
   );

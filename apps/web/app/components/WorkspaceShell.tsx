@@ -32,6 +32,7 @@ import { useWorkspace, WorkspaceContext, type AnalysisSeed, type NavigateOptions
 import { scopes, useApprovals, useInvalidate, useModelProviders, useProjects, useQueryErrorToast } from "../lib/queries";
 import { StatusPill, LoadingBlock, Modal } from "./shared";
 import { LoginScreen } from "./LoginScreen";
+import "./fixes.css";
 
 type ThemeChoice = "light" | "dark" | "system";
 const THEME_STORAGE_KEY = "datapilot.theme";

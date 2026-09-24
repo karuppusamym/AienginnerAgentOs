@@ -99,8 +99,12 @@ export function SupersetView({ isAdmin, projectName }: { isAdmin: boolean; proje
       mountRef.current.innerHTML = "";
       setState("loading");
       setError("");
+      // The dashboard iframe can pull the page down when it loads, sliding the header under the sticky topbar.
+      const scrollTop = window.scrollY;
+      const keepScroll = () => { if (window.scrollY !== scrollTop) window.scrollTo({ top: scrollTop }); };
       try {
         const config = await loadTarget(selected);
+        mountRef.current.addEventListener("load", keepScroll, { capture: true, once: true });
         const embedded = await embedDashboard({
           id: config.embedded_id,
           supersetDomain: config.superset_domain,
@@ -121,6 +125,7 @@ export function SupersetView({ isAdmin, projectName }: { isAdmin: boolean; proje
           return;
         }
         dashboardRef.current = embedded;
+        keepScroll();
         setTarget(config);
         setState("ready");
       } catch (reason) {

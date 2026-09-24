@@ -11,7 +11,7 @@ to the **current project**.
 | Group | What it is | How it is created | Approval |
 |---|---|---|---|
 | **Project dashboard** | The project's default view, built on its primary dataset: the latest mapped or staged file, otherwise the best local dataset | Automatically, the first time the page opens | No (catalogued local data) |
-| **Published queries** | One dashboard per saved SQL or notebook query, e.g. "Accounts by type" | *Publish to Superset* from SQL or Notebooks, then approval | **Yes**, a `publish_superset_query` approval |
+| **Published queries** | One dashboard per saved SQL or notebook query, e.g. "Accounts by type" | *Publish to Superset* from an Analysis answer (one click), SQL or Notebooks, then approval | **Yes**, a `publish_superset_query` approval |
 | **Datasets, grouped by source** (Local files, DataPilot PostgreSQL, …) | Any catalogued dataset that is physically in the analytics database, e.g. `core.accounts` | On demand, the first time it is selected | No (same trust as the project dashboard) |
 
 Each dashboard gets the same data-driven chart set:
@@ -23,6 +23,14 @@ Each dashboard gets the same data-driven chart set:
 
 The last selection is remembered per project in the browser, so returning users land where they
 left off. The filter box searches entry titles, columns and sources.
+
+### Publishing straight from an Analysis answer
+The Inspector's Result tab has **Publish to Superset**. You don't need to save a tool or artifact first; one click does all of it:
+1. The answer's SQL is saved as an immutable SQL artifact (version 1, linked to the message).
+2. A `publish_superset_query` approval is requested. The button changes to **Awaiting approval**, which links to Approvals.
+3. Once approved, the button reads **Open in Superset** and opens the answer's own dashboard in place.
+
+Clicking again never duplicates anything (`POST /analytics/publish-message` is idempotent per answer). Only answers from the local workspace can be published. Stage connector data first.
 
 ## 2. Why the scope is the project (and grouped by source)
 

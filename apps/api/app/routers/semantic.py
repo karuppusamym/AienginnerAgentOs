@@ -118,6 +118,7 @@ from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
 
 from .. import core as main
+from ..services.relationships import asset_group_key, explorer_asset_detail, explorer_graph
 from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
@@ -224,37 +225,9 @@ def semantic_graph(
     connector_names = {connector_id: connector.name for connector_id, connector in connectors_by_id.items()}
 
     def group_key(asset: DataAsset) -> str:
-        # Every /sql/generate or /sql/execute call is scoped to exactly one
-        # connector (or the local workspace) at a time -- see routers/sql.py's
-        # allowed_asset_ids computation. A join between two assets from
-        # different external connectors can never actually be executed as a
-        # single query, no matter how similar their column names look, so
-        # "group" here means "assets DataPilot can actually query together
-        # in one call": one bucket per external connector_id, plus one shared
-        # bucket for every locally-staged/uploaded asset (connector_id is
-        # None for all of them, but they really do all live in the same
-        # local Postgres/SQLite database and can genuinely be joined).
-        if not asset.connector_id:
-            return "__local__"
-        connector = connectors_by_id.get(asset.connector_id)
-        if connector is not None and connector.connection_mode == "mcp":
-            # A direct-driver connector's assets really do share one
-            # physical DB connection, so grouping by connector_id alone is
-            # correct there. An MCP-backed connector is different: each
-            # asset is a separately-discovered tool (discover_mcp_metadata
-            # hardcodes schema_name="mcp" for every tool regardless of what
-            # it fronts), and MCP execution (execute_connector_query ->
-            # execute_mcp_tool) always invokes exactly one named tool per
-            # call -- there is no cross-tool join path in the runtime. Worse,
-            # one MCP toolbox can front multiple distinct physical backends
-            # with no structured signal in tools/list telling us which tools
-            # share one (see infra/mcp-toolbox/toolbox.yaml's two separate
-            # "kind: source" blocks -- a SQL Server source and a Postgres
-            # source behind the same connector). So even two MCP tools that
-            # happen to share a backend still can't be joined in one query.
-            # Every MCP tool/asset is therefore its own atomic group.
-            return f"{asset.connector_id}:{asset.id}"
-        return asset.connector_id
+        # Shared with the relationship explorer so both views agree on which
+        # assets can be joined (see asset_group_key's docstring).
+        return asset_group_key(asset, connectors_by_id)
 
     def source_label(asset: DataAsset) -> str:
         return connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
@@ -330,6 +303,57 @@ def semantic_graph(
                         continue
                     edges.append({"id": f"inferred:{left.id}:{right.id}:{column}", "source": left.id, "target": right.id, "left_column": column, "right_column": column, "join_type": "inner", "status": "suggested", "governed": False})
     return {"project_id": project.id, "nodes": nodes, "edges": edges, "governed_edge_count": sum(1 for edge in edges if edge["governed"]), "inferred_edge_count": sum(1 for edge in edges if not edge["governed"])}
+
+
+@router.get("/semantic/explorer")
+def semantic_explorer(
+    focus: str | None = Query(default=None, max_length=36),
+    depth: int = Query(default=2, ge=1, le=3),
+    scope: Literal["all", "source", "group"] = Query(default="all"),
+    connector_id: str | None = Query(default=None, max_length=36),
+    group: str | None = Query(default=None, max_length=80),
+    include_inferred: bool = Query(default=True),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Typed relationship graph for the explorer.
+
+    Without ``focus`` it is an overview of every asset in scope. With ``focus``
+    it is the bounded neighbourhood: lineage upstream/downstream up to
+    ``depth`` hops (``level`` < 0 / > 0) and join neighbours (``lane`` "join").
+    """
+    project = require_current_project(db, user)
+    require_permission(user, db, "semantic:read", "Project membership required")
+    from ..catalog_scope import queryable_asset_ids
+
+    try:
+        return explorer_graph(
+            db, project.id, focus=focus, depth=depth, scope=scope, connector_id=connector_id, group=group,
+            include_inferred=include_inferred, queryable=queryable_asset_ids(db, project.id),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/semantic/explorer/assets/{asset_id}")
+def semantic_explorer_asset(
+    asset_id: str,
+    include_inferred: bool = Query(default=True),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Everything that defines one asset's context: columns, joins, lineage, metrics,
+    and the exact catalog text SQL generation sends to the model for it."""
+    project = require_current_project(db, user)
+    require_permission(user, db, "semantic:read", "Project membership required")
+    from ..catalog_scope import queryable_asset_ids
+
+    try:
+        return explorer_asset_detail(db, project.id, asset_id, include_inferred=include_inferred, queryable=queryable_asset_ids(db, project.id))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/semantic/metrics")

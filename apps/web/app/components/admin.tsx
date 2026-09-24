@@ -25,7 +25,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api, SessionUser } from "../lib/api";
-import { scopes, useConnectors, useInvalidate, useModelProviders, useModelRouting, useModelUsage, useQueryErrorToast, useSchemaDrift } from "../lib/queries";
+import { scopes, useConnectors, useDebouncedValue, useFacets, useInvalidate, useModelProviders, useModelRouting, useModelUsage, usePagedQuery, usePagination, useQueryErrorToast, useSchemaDrift, type Facet, type PageParams } from "../lib/queries";
 import type {
   NavKey,
   Connector,
@@ -50,21 +50,23 @@ import {
   providerCapability,
   providerTypeOptions,
 } from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm, formatUsd } from "./shared";
+import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm, formatUsd, CollapsibleGroup, GroupBySelect, Pagination } from "./shared";
+import { AuditLogPanel } from "./AuditLog";
 
 
 export function AdminView({ currentUser, notify, setActive: setAppActive }: { currentUser: SessionUser; notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
-  const [tab, setTab] = useState<"users" | "projects" | "connectors" | "models" | "governance" | "auth">("connectors");
+  const [tab, setTab] = useState<"users" | "projects" | "connectors" | "models" | "governance" | "audit" | "auth">("connectors");
   return (
     <div className="view-stack">
       <div className="view-header"><div><h2>Administration</h2><p>Configure local access, data sources, model routing, and enterprise identity.</p></div><StatusPill value={currentUser.role} /></div>
-      <div className="tabs"><button className={tab === "connectors" ? "active" : ""} onClick={() => setTab("connectors")}><Server size={16} />Connectors</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Bot size={16} />Model providers</button><button className={tab === "governance" ? "active" : ""} onClick={() => setTab("governance")}><ShieldCheck size={16} />Governance</button><button className={tab === "projects" ? "active" : ""} onClick={() => setTab("projects")}><Layers3 size={16} />Projects</button><button className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}><Users size={16} />Users</button><button className={tab === "auth" ? "active" : ""} onClick={() => setTab("auth")}><KeyRound size={16} />Authentication</button></div>
-      <p className="admin-hint">Looking for the query-tool / external-gateway registry? It's under <strong>Tool registry</strong> in the main navigation — External data tools tab.</p>
+      <div className="tabs"><button className={tab === "connectors" ? "active" : ""} onClick={() => setTab("connectors")}><Server size={16} />Connectors</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Bot size={16} />Model providers</button><button className={tab === "governance" ? "active" : ""} onClick={() => setTab("governance")}><ShieldCheck size={16} />Governance</button><button className={tab === "projects" ? "active" : ""} onClick={() => setTab("projects")}><Layers3 size={16} />Projects</button><button className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}><Users size={16} />Users</button><button className={tab === "audit" ? "active" : ""} onClick={() => setTab("audit")}><Clock3 size={16} />Audit log</button><button className={tab === "auth" ? "active" : ""} onClick={() => setTab("auth")}><KeyRound size={16} />Authentication</button></div>
+      <p className="admin-hint">Looking for the query-tool / external-gateway registry or external agent call history? It's under <strong>Tool registry</strong> in the main navigation — External data tools and Invocation history tabs.</p>
       {tab === "connectors" && <ConnectorsAdmin notify={notify} />}
       {tab === "models" && <ModelsAdmin notify={notify} />}
       {tab === "governance" && <GovernanceAdmin notify={notify} setActive={setAppActive} />}
       {tab === "projects" && <ProjectsAdmin notify={notify} />}
       {tab === "users" && <UsersAdmin notify={notify} currentUser={currentUser} />}
+      {tab === "audit" && <AuditLogPanel notify={notify} />}
       {tab === "auth" && <AuthAdmin notify={notify} />}
     </div>
   );
@@ -72,7 +74,6 @@ export function AdminView({ currentUser, notify, setActive: setAppActive }: { cu
 
 export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const emptyTool = { name: "", description: "", purpose: "", data_source: "", line_of_business: "", owner: "", tags: "", connector_id: "", upstream_tool_name: "", sql_template: "SELECT * FROM staging.example WHERE id = :id", parameter_schema: '{"type":"object","required":["id"],"properties":{"id":{"type":"integer"}},"additionalProperties":false}', allowed_relations: "staging.example", row_limit: 200, timeout_seconds: 15 };
-  const [tools, setTools] = useState<QueryTool[]>([]);
   const [clients, setClients] = useState<ExternalClient[]>([]);
   const [connectors, setConnectors] = useState<Connector[]>([]);
   const [showTool, setShowTool] = useState(false);
@@ -91,7 +92,11 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
   const [testParameters, setTestParameters] = useState("{}");
   const [summary, setSummary] = useState<QueryToolRegistrySummary | null>(null);
   const [search, setSearch] = useState("");
-  const load = useCallback(async () => { const [toolData, clientData, connectorData, summaryData] = await Promise.all([api<QueryTool[]>("/query-tools"), api<ExternalClient[]>("/external-clients"), api<Connector[]>("/connectors"), api<QueryToolRegistrySummary>("/query-tools/summary")]); setTools(toolData); setClients(clientData); setConnectors(connectorData); setSummary(summaryData); }, []);
+  const [groupBy, setGroupBy] = useState<"none" | "data_source" | "line_of_business">("none");
+  const query = useDebouncedValue(search.trim());
+  const invalidate = useInvalidate();
+  const facets = useFacets<{ total: number; data_source: Facet[]; line_of_business: Facet[] }>(scopes.queryTools, groupBy === "none" ? null : "/query-tools/facets", { q: query });
+  const load = useCallback(async () => { const [clientData, connectorData, summaryData] = await Promise.all([api<ExternalClient[]>("/external-clients"), api<Connector[]>("/connectors"), api<QueryToolRegistrySummary>("/query-tools/summary"), invalidate(scopes.queryTools)]); setClients(clientData); setConnectors(connectorData); setSummary(summaryData); }, [invalidate]);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Gateway configuration unavailable", "error")); }, [load, notify]);
   function chooseGrantClient(clientId: string, known: QueryToolGrant[] = grants) { setGrantClient(clientId); const existing = known.find((item) => item.external_client_id === clientId); setGrantQuota(existing?.daily_quota ? String(existing.daily_quota) : ""); }
   async function loadGrants(tool: QueryTool) { try { const data = await api<QueryToolGrant[]>(`/query-tools/${tool.id}/grants`); setGrants(data); chooseGrantClient(clients[0]?.id || "", data); } catch { setGrants([]); } }
@@ -105,14 +110,13 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
   async function rotate(event: FormEvent) { event.preventDefault(); if (!rotating) return; const client = rotating; try { const updated = await api<ExternalClient>(`/external-clients/${client.id}/rotate`, { method: "POST", body: JSON.stringify(rotateExpiryDays.trim() ? { expires_in_days: Number(rotateExpiryDays) } : {}) }); setRotating(null); setRotateExpiryDays(""); setIssuedToken(updated.token || ""); setShowClient(true); await load(); notify("Client token rotated"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Token rotation failed", "error"); } }
   async function toggleClient(client: ExternalClient) { try { await api(`/external-clients/${client.id}`, { method: "PUT", body: JSON.stringify({ active: !client.active, scopes: client.scopes }) }); await load(); notify(`External client ${client.active ? "disabled" : "enabled"}`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Client update failed", "error"); } }
   const selectedConnector = connectors.find((item) => item.id === toolForm.connector_id);
-  const filteredTools = tools.filter((tool) => search ? [tool.name, tool.purpose, tool.owner, tool.line_of_business, tool.data_source, ...tool.tags].some((field) => field.toLowerCase().includes(search.toLowerCase())) : true);
   if (showWizard) return <QueryToolWizard notify={notify} onCancel={() => setShowWizard(false)} onUse={(draft) => { setSelected(null); setToolForm({ name: draft.name, description: draft.description, purpose: draft.purpose, data_source: draft.data_source, line_of_business: draft.line_of_business, owner: draft.owner, tags: draft.tags.join(", "), connector_id: draft.connector_id || "", upstream_tool_name: draft.upstream_tool_name || "", sql_template: draft.sql_template, parameter_schema: JSON.stringify(draft.parameter_schema, null, 2), allowed_relations: draft.allowed_relations.join(", "), row_limit: draft.row_limit, timeout_seconds: draft.timeout_seconds }); setTestParameters("{}"); setGrantClient(clients[0]?.id || ""); setShowWizard(false); setShowTool(true); }} />;
   return <div className="view-stack">
     <section className="surface admin-surface">
       <div className="section-heading"><div><span className="eyebrow">EXTERNAL AGENT ACCESS</span><h3>Governed query gateway</h3><p>Published parameterized tools are searchable by purpose, source, LOB, owner, and tags over REST and MCP.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search tools by name, owner, LOB, tag..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="secondary-button" onClick={() => setShowWizard(true)}><Database size={16} />Catalog wizard</button><button className="secondary-button" onClick={() => startFromTemplate("lookup")}><Database size={16} />Lookup template</button><button className="secondary-button" onClick={() => startFromTemplate("count")}><FlaskConical size={16} />Count template</button><button className="secondary-button" onClick={() => { setIssuedToken(""); setShowClient(true); }}><KeyRound size={16} />New client</button><button className="primary-button" onClick={() => openTool()}><Plus size={16} />New query tool</button></div></div>
       <div className="metric-grid three"><Metric label="Published" value={summary?.published ?? "-"} detail="Available to granted clients" icon={<Check size={18} />} tone="teal" /><Metric label="Invocations" value={summary?.tools.reduce((total, tool) => total + tool.invocation_count, 0) ?? "-"} detail="Audited external requests" icon={<Network size={18} />} tone="blue" /><Metric label="Never invoked" value={summary?.never_invoked ?? "-"} detail="Review for adoption or retirement" icon={<AlertCircle size={18} />} tone="amber" /></div>
-      {filteredTools.length ? <><div className="table-header gateway-tool-grid"><span>Tool</span><span>Connector</span><span>Version</span><span>Status</span><span /></div>
-      {filteredTools.map((tool) => <div className="data-row gateway-tool-grid" key={tool.id}><button className="metric-main" onClick={() => openTool(tool)}><strong>{tool.name}</strong><small>{tool.line_of_business} · {tool.purpose}</small></button><span>{connectors.find((item) => item.id === tool.connector_id)?.name || "Local PostgreSQL"}</span><span>v{tool.version}</span><StatusPill value={tool.status} /><button className="icon-button" title="Publish query tool" disabled={tool.status === "published"} onClick={() => publish(tool)}><Check size={16} /></button></div>)}</> : <div className="inline-empty">{search ? "No tools match your search." : "No query tools yet."}</div>}
+      <div className="list-toolbar"><GroupBySelect value={groupBy} onChange={setGroupBy} options={[{ value: "none", label: "None" }, { value: "data_source", label: "Data source" }, { value: "line_of_business", label: "Line of business" }]} /></div>
+      {groupBy === "none" ? <GatewayToolRows params={{ q: query }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} /> : facets.data ? (facets.data[groupBy].length ? facets.data[groupBy].map((facet) => <CollapsibleGroup key={facet.value} title={facet.value} count={facet.count} defaultOpen={facets.data!.total <= 20}><GatewayToolRows params={{ q: query, [groupBy]: facet.value }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} compact /></CollapsibleGroup>) : <div className="inline-empty">{query ? "No tools match your search." : "No query tools yet."}</div>) : <LoadingBlock label="Grouping tools" />}
     </section>
     <section className="surface admin-surface">
       <div className="section-heading compact"><div><span className="eyebrow">CLIENT CREDENTIALS</span><h3>External clients</h3></div><code>/mcp / external/v1/query-tools</code></div>
@@ -135,6 +139,18 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
     {rotating && <Modal title={`Rotate token: ${rotating.name}`} onClose={() => setRotating(null)}><form className="modal-form" onSubmit={rotate}><div className="policy-banner"><KeyRound size={18} /><span><strong>The current token stops working immediately</strong><small>{rotating.expires_at ? `${rotating.expired ? "Expired" : "Expires"} ${new Date(rotating.expires_at).toLocaleDateString()}` : "The current token never expires"}. Leave the field empty to keep the current expiry.</small></span></div><label>Expires in days<input type="number" min={1} max={365} placeholder="Keep current expiry" value={rotateExpiryDays} onChange={(event) => setRotateExpiryDays(event.target.value)} /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setRotating(null)}>Cancel</button><button className="primary-button"><RefreshCw size={16} />Rotate token</button></div></form></Modal>}
     {showClient && <Modal title="External client" onClose={() => setShowClient(false)}>{issuedToken ? <div className="modal-form"><div className="policy-banner"><KeyRound size={18} /><span><strong>One-time client token</strong><small>This value is not available again after this dialog closes.</small></span></div><label>Bearer token<textarea readOnly rows={4} value={issuedToken} onFocus={(event) => event.currentTarget.select()} /></label><div className="modal-actions"><button className="primary-button" onClick={() => setShowClient(false)}><Check size={16} />Done</button></div></div> : <form className="modal-form" onSubmit={createClient}><label>Client name<input value={clientName} onChange={(event) => setClientName(event.target.value)} required /></label><label>Expires in days<input type="number" min={1} max={365} placeholder="Never expires" value={clientExpiryDays} onChange={(event) => setClientExpiryDays(event.target.value)} /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowClient(false)}>Cancel</button><button className="primary-button"><KeyRound size={16} />Issue token</button></div></form>}</Modal>}
   </div>;
+}
+
+function GatewayToolRows({ params, connectors, searching, onOpen, onPublish, compact = false }: { params: PageParams; connectors: Connector[]; searching: boolean; onOpen: (tool: QueryTool) => void; onPublish: (tool: QueryTool) => void; compact?: boolean }) {
+  const pagination = usePagination(params, compact ? 25 : 50);
+  const page = usePagedQuery<QueryTool>(scopes.queryTools, "/query-tools", params, pagination);
+  const items = page.data?.items ?? [];
+  if (!items.length) return page.isPending ? <LoadingBlock label="Loading tools" /> : <div className="inline-empty">{searching ? "No tools match your search." : "No query tools yet."}</div>;
+  return <>
+    <div className="table-header gateway-tool-grid"><span>Tool</span><span>Connector</span><span>Version</span><span>Status</span><span /></div>
+    {items.map((tool) => <div className="data-row gateway-tool-grid" key={tool.id}><button className="metric-main" onClick={() => onOpen(tool)}><strong>{tool.name}</strong><small>{tool.line_of_business} · {tool.purpose}</small></button><span>{connectors.find((item) => item.id === tool.connector_id)?.name || "Local PostgreSQL"}</span><span>v{tool.version}</span><StatusPill value={tool.status} /><button className="icon-button" title="Publish query tool" disabled={tool.status === "published"} onClick={() => onPublish(tool)}><Check size={16} /></button></div>)}
+    <Pagination state={pagination} total={page.data?.total ?? 0} count={items.length} busy={page.isFetching} label="tools" compact={compact} />
+  </>;
 }
 
 export function QueryToolWizard({ notify, onCancel, onUse }: { notify: (message: string, tone?: "ok" | "error") => void; onCancel: () => void; onUse: (draft: QueryToolDraft) => void }) {
@@ -236,7 +252,30 @@ export function ProjectsAdmin({ notify }: { notify: (message: string, tone?: "ok
   useEffect(() => { load(); }, [load]);
   useEffect(() => { if (selectedId) api<Member[]>(`/projects/${selectedId}/members`).then(setMembers); }, [selectedId]);
   async function add(event: FormEvent) { event.preventDefault(); try { await api(`/projects/${selectedId}/members`, { method: "POST", body: JSON.stringify(form) }); setMembers(await api<Member[]>(`/projects/${selectedId}/members`)); notify("Project membership updated"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Membership update failed", "error"); } }
-  return <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">WORKSPACE ACCESS</span><h3>Projects and memberships</h3><p>Create projects from the sidebar switcher, then assign users and project roles here.</p></div><select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>{projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></div><div className="table-header project-member-grid"><span>User</span><span>Application role</span><span>Project role</span></div>{members.map((member) => <div className="data-row project-member-grid" key={member.id}><span><strong>{member.user.name}</strong><small>{member.user.email}</small></span><StatusPill value={member.user.role} /><StatusPill value={member.role} /></div>)}<form className="inline-admin-form" onSubmit={add}><select value={form.user_id} onChange={(event) => setForm({ ...form, user_id: event.target.value })} required><option value="">Select user</option>{users.map((user) => <option value={user.id} key={user.id}>{user.name} / {user.email}</option>)}</select><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="owner">Owner</option><option value="maintainer">Maintainer</option><option value="member">Member</option><option value="viewer">Viewer</option></select><button className="primary-button"><UserPlus size={16} />Assign</button></form></section>;
+  return <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">WORKSPACE ACCESS</span><h3>Projects and memberships</h3><p>Create projects from the sidebar switcher, then assign users and project roles here.</p></div><select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>{projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}</select></div><div className="table-header project-member-grid"><span>User</span><span>Application role</span><span>Project role</span></div>{members.map((member) => <div className="data-row project-member-grid" key={member.id}><span><strong>{member.user.name}</strong><small>{member.user.email}</small></span><StatusPill value={member.user.role} /><StatusPill value={member.role} /></div>)}<form className="inline-admin-form" onSubmit={add}><select value={form.user_id} onChange={(event) => setForm({ ...form, user_id: event.target.value })} required><option value="">Select user</option>{users.map((user) => <option value={user.id} key={user.id}>{user.name} / {user.email}</option>)}</select><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="owner">Owner</option><option value="maintainer">Maintainer</option><option value="member">Member</option><option value="viewer">Viewer</option></select><button className="primary-button"><UserPlus size={16} />Assign</button></form>{selectedId && <AutoApprovalPolicy projectId={selectedId} notify={notify} />}</section>;
+}
+
+type AutoApprovalPolicyState = { enabled: boolean; policy_version: number; auto_approvable_actions: string[]; manual_only: Record<string, string>; separation_of_duties: boolean };
+
+/** Per-project switch for the auto-approval policy agent (low-risk, read-only requests only; every decision audited). */
+function AutoApprovalPolicy({ projectId, notify }: { projectId: string; notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [policy, setPolicy] = useState<AutoApprovalPolicyState | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { setPolicy(null); api<AutoApprovalPolicyState>(`/projects/${projectId}/auto-approval`).then(setPolicy).catch(() => setPolicy(null)); }, [projectId]);
+  async function toggle() {
+    if (!policy) return;
+    setSaving(true);
+    try { setPolicy(await api<AutoApprovalPolicyState>(`/projects/${projectId}/auto-approval`, { method: "PUT", body: JSON.stringify({ enabled: !policy.enabled }) })); notify(`Auto-approval ${policy.enabled ? "disabled" : "enabled"} for this project`); }
+    catch (reason) { notify(reason instanceof Error ? reason.message : "Auto-approval setting could not be saved", "error"); }
+    finally { setSaving(false); }
+  }
+  if (!policy) return null;
+  return (
+    <div className="auth-config auto-approval-policy">
+      <div className="toggle-row"><span><strong>Auto-approval policy agent</strong><small>Approves only {policy.auto_approvable_actions.map((item) => item.replaceAll("_", " ")).join(", ")} requests whose SQL re-passes the read-only guard, touches only catalogued tables and no PII columns. Each decision is recorded with its checks in the audit log.{policy.separation_of_duties ? " Separation of duties is on, so self-requested high-impact actions still need a second person." : ""}</small></span><button type="button" className={`toggle ${policy.enabled ? "on" : ""}`} onClick={() => void toggle()} disabled={saving} aria-pressed={policy.enabled} aria-label="Auto-approval policy"><span /></button></div>
+      <p className="admin-hint">Always left for a person: {Object.entries(policy.manual_only).map(([action, reason]) => `${action.replaceAll("_", " ")} (${reason.toLowerCase()})`).join("; ")}.</p>
+    </div>
+  );
 }
 
 const NO_CONNECTORS: Connector[] = [];
@@ -363,15 +402,18 @@ export function ModelsAdmin({ notify }: { notify: (message: string, tone?: "ok" 
 }
 
 export function UsersAdmin({ notify, currentUser }: { notify: (message: string, tone?: "ok" | "error") => void; currentUser?: SessionUser }) {
-  const [users, setUsers] = useState<(SessionUser & { active: boolean; created_at: string })[]>([]);
-  const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
+  const query = useDebouncedValue(search.trim());
+  const pagination = usePagination(query, 50);
+  const usersPage = usePagedQuery<SessionUser & { active: boolean; created_at: string }>(scopes.users, "/admin/users", { q: query }, pagination);
+  useQueryErrorToast(usersPage.error, notify, "Users could not be loaded");
+  const users = usersPage.data?.items ?? [];
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: "", email: "", role: "analyst", temporary_password: "ChangeMe123!" });
   const [editingUser, setEditingUser] = useState<(typeof users)[number] | null>(null);
   const [editForm, setEditForm] = useState({ name: "", email: "" });
-  const load = useCallback(() => api<typeof users>("/admin/users").then(setUsers).finally(() => setLoading(false)), []);
-  useEffect(() => { load(); }, [load]);
+  const invalidate = useInvalidate();
+  const load = useCallback(() => invalidate(scopes.users), [invalidate]);
   async function create(event: FormEvent) { event.preventDefault(); try { await api("/admin/users", { method: "POST", body: JSON.stringify(form) }); setShowForm(false); await load(); notify("Local user added"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not add user", "error"); } }
   async function update(user: (typeof users)[number], patch: { role?: string; active?: boolean; name?: string; email?: string }) { try { await api(`/admin/users/${user.id}`, { method: "PUT", body: JSON.stringify(patch) }); await load(); notify("User access updated"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Could not update user", "error"); } }
   const [confirm, confirmDialog] = useConfirm();
@@ -386,13 +428,13 @@ export function UsersAdmin({ notify, currentUser }: { notify: (message: string, 
     await update(editingUser, { name: editForm.name.trim(), email: editForm.email.trim() });
     setEditingUser(null);
   }
-  const filtered = users.filter((user) => search ? user.name.toLowerCase().includes(search.toLowerCase()) || user.email.toLowerCase().includes(search.toLowerCase()) : true);
   return (
     <section className="surface admin-surface">
       <div className="section-heading"><div><span className="eyebrow">LOCAL ACCESS</span><h3>Users and roles</h3><p>Admin-managed accounts remain available before and after PingFederate is enabled. Deactivating revokes sign-in immediately; accounts are never hard-deleted so audit history stays intact.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search users..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="primary-button" onClick={() => setShowForm(true)}><UserPlus size={17} />Add user</button></div></div>
-      {loading ? <LoadingBlock label="Loading users" /> : filtered.length ? <>
+      {usersPage.isPending ? <LoadingBlock label="Loading users" /> : users.length ? <>
         <div className="table-header user-grid"><span>User</span><span>Role</span><span>Status</span><span>Created</span></div>
-        {filtered.map((user) => <div className="data-row user-grid" key={user.id}><span className="person-cell"><span className="user-avatar">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.email}</small></span></span><select className="table-select" value={user.role} onChange={(event) => update(user, { role: event.target.value })} aria-label={`Role for ${user.name}`}><option value="admin">Admin</option><option value="engineer">Engineer</option><option value="analyst">Analyst</option><option value="viewer">Viewer</option></select><span className="row-actions"><button className="icon-button" title="Edit name and email" onClick={() => openEdit(user)}><Edit2 size={15} /></button><button className="status-action" onClick={() => toggleActive(user)} title={user.active ? "Deactivate user" : "Activate user"} disabled={currentUser?.id === user.id && user.active}><StatusPill value={user.active ? "active" : "inactive"} /></button></span><span>{new Date(user.created_at).toLocaleDateString()}</span></div>)}
+        {users.map((user) => <div className="data-row user-grid" key={user.id}><span className="person-cell"><span className="user-avatar">{user.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</span><span><strong>{user.name}</strong><small>{user.email}</small></span></span><select className="table-select" value={user.role} onChange={(event) => update(user, { role: event.target.value })} aria-label={`Role for ${user.name}`}><option value="admin">Admin</option><option value="engineer">Engineer</option><option value="analyst">Analyst</option><option value="viewer">Viewer</option></select><span className="row-actions"><button className="icon-button" title="Edit name and email" onClick={() => openEdit(user)}><Edit2 size={15} /></button><button className="status-action" onClick={() => toggleActive(user)} title={user.active ? "Deactivate user" : "Activate user"} disabled={currentUser?.id === user.id && user.active}><StatusPill value={user.active ? "active" : "inactive"} /></button></span><span>{new Date(user.created_at).toLocaleDateString()}</span></div>)}
+        <Pagination state={pagination} total={usersPage.data?.total ?? 0} count={users.length} busy={usersPage.isFetching} label="users" />
       </> : <EmptyState icon={<UserPlus size={24} />} title={search ? "No matching users" : "No local users yet"} body={search ? "Try a different name or email." : "Add the first local account to get started."} />}
       {showForm && <Modal title="Add local user" onClose={() => setShowForm(false)}><form className="modal-form" onSubmit={create}><label>Full name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label><label>Email<input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} required /></label><div className="form-grid"><label>Role<select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })}><option value="admin">Admin</option><option value="engineer">Engineer</option><option value="analyst">Analyst</option><option value="viewer">Viewer</option></select></label><label>Temporary password<input type="password" value={form.temporary_password} onChange={(event) => setForm({ ...form, temporary_password: event.target.value })} minLength={10} required /></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowForm(false)}>Cancel</button><button className="primary-button">Create user</button></div></form></Modal>}
       {editingUser && <Modal title={`Edit ${editingUser.name}`} onClose={() => setEditingUser(null)}><form className="modal-form" onSubmit={saveEdit}><label>Full name<input value={editForm.name} onChange={(event) => setEditForm({ ...editForm, name: event.target.value })} required /></label><label>Email<input type="email" value={editForm.email} onChange={(event) => setEditForm({ ...editForm, email: event.target.value })} required /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setEditingUser(null)}>Cancel</button><button className="primary-button"><Check size={16} />Save</button></div></form></Modal>}

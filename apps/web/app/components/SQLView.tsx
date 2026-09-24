@@ -228,11 +228,11 @@ export function SQLView({ notify, seed, currentUser, onSeedConsumed }: { notify:
     if (!artifactId) return;
     setPublishing(true);
     try {
-      const request = await api<{ approval_id: string }>("/analytics/publish-sql", {
+      const request = await api<{ approval_id: string; status: string; auto_review?: { reason: string } }>("/analytics/publish-sql", {
         method: "POST",
         body: JSON.stringify({ artifact_id: artifactId, name: question.slice(0, 120) }),
       });
-      notify(`Superset publication is awaiting approval (${request.approval_id.slice(0, 8)}); "Open in Superset" appears here once an admin approves it`);
+      notify(request.status === "auto_approved" ? `Published to Superset: auto-approved by policy (${request.auto_review?.reason || "read-only, no PII"})` : `Superset publication is awaiting approval (${request.approval_id.slice(0, 8)}); "Open in Superset" appears here once an admin approves it`);
     } catch (reason) {
       notify(reason instanceof Error ? reason.message : "Superset publication could not be requested", "error");
     } finally { setPublishing(false); }

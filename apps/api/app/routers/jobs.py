@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, grouped_counts, page_params, paginate_query
 from starlette.concurrency import run_in_threadpool
 from ..temporal_activities import agent_runtime_evidence
 
@@ -198,22 +200,50 @@ from ..core import (
 router = APIRouter()
 
 
+def _job_statement(project_id: str, status: str | None, job_type: str, q: str):
+    statement = select(Job).where(Job.project_id == project_id)
+    if status:
+        statuses = [item.strip().upper() for item in status.split(",") if item.strip()]
+        statement = statement.where(Job.status.in_(statuses))
+    if job_type:
+        statement = statement.where(Job.job_type == job_type)
+    if q.strip():
+        statement = statement.where(func.lower(Job.title).like(contains(q), escape="\\") | func.lower(Job.job_type).like(contains(q), escape="\\"))
+    return statement
+
+
 @router.get("/jobs")
 def list_jobs(
+    response: Response,
+    page: Page = Depends(page_params),
     status: str | None = Query(default=None),
+    job_type: str = Query(default="", max_length=64),
+    q: str = Query(default="", max_length=200),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    statement = select(Job).where(Job.project_id == project.id).order_by(Job.created_at.desc())
-    if status:
-        statuses = [item.strip().upper() for item in status.split(",") if item.strip()]
-        statement = statement.where(Job.status.in_(statuses))
-    jobs = db.scalars(statement).all()
+    statement = _job_statement(project.id, status, job_type, q).order_by(Job.created_at.desc())
+    jobs = paginate_query(db, statement, response, page)
     return [
         as_dict(job, ["id", "title", "job_type", "status", "progress", "plan", "evidence", "logs", "outputs", "created_at", "updated_at"])
         for job in jobs
     ]
+
+
+@router.get("/jobs/facets")
+def job_facets(
+    status: str | None = Query(default=None),
+    q: str = Query(default="", max_length=200),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Job counts per job type and status for the filtered list (drives the grouped view)."""
+    project = require_current_project(db, user)
+    filtered = _job_statement(project.id, status, "", q).subquery()
+    by_type = db.execute(select(filtered.c.job_type, func.count()).group_by(filtered.c.job_type)).all()
+    by_status = db.execute(select(filtered.c.status, func.count()).group_by(filtered.c.status)).all()
+    return {"total": sum(count for _, count in by_type), "job_type": grouped_counts(by_type), "status": grouped_counts(by_status)}
 
 @router.get("/jobs/{job_id}")
 def get_job(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -318,9 +348,12 @@ def diagnose_job(job_id: str, user: User = Depends(get_current_user), db: Sessio
     return as_dict(incident, ["id", "project_id", "job_id", "title", "severity", "status", "root_cause", "evidence", "remediation", "retry_job_id", "created_by", "created_at", "resolved_at"])
 
 @router.get("/incidents")
-def list_incidents(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_incidents(response: Response, page: Page = Depends(page_params), job_id: str = Query(default="", max_length=36), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    incidents = db.scalars(select(Incident).where(Incident.project_id == project.id).order_by(Incident.created_at.desc())).all()
+    statement = select(Incident).where(Incident.project_id == project.id)
+    if job_id:
+        statement = statement.where(Incident.job_id == job_id)
+    incidents = paginate_query(db, statement.order_by(Incident.created_at.desc()), response, page)
     return [as_dict(item, ["id", "project_id", "job_id", "title", "severity", "status", "root_cause", "evidence", "remediation", "retry_job_id", "created_by", "created_at", "resolved_at"]) for item in incidents]
 
 @router.post("/incidents/{incident_id}/resolve")

@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, paginate_query
 
 from ..sql_guard import unknown_relations
 from .. import jev_client, learning
@@ -682,12 +684,15 @@ def explain_sql(
 
 @router.get("/sql/history")
 def list_query_history(
+    response: Response,
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    runs = db.scalars(select(QueryRun).where(QueryRun.project_id == project.id).order_by(QueryRun.created_at.desc()).limit(limit)).all()
+    statement = select(QueryRun).where(QueryRun.project_id == project.id).order_by(QueryRun.created_at.desc())
+    runs = paginate_query(db, statement, response, Page(limit=limit, offset=offset))
     return [as_dict(item, ["id", "project_id", "connector_id", "question", "sql", "dialect", "provider", "grounding", "result", "status", "cache_hit", "created_by", "created_at"]) for item in runs]
 
 @router.post("/sql/execute")

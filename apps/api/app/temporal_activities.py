@@ -430,12 +430,47 @@ def _eligible_step_tools(db, job: Job, tool_names: list[str], query_tool_names: 
     return eligible
 
 
+_STOPWORDS = frozenset("a an and any are as at be by for from how in into is it its of on or that the this to what which with".split())
+# Words a plan step uses for each built-in tool that its one-line registry description does not.
+_TOOL_HINTS = {
+    "catalog.search": "search find discover locate look catalog catalogue table asset metadata glossary term",
+    "dataset.profile": "profile schema column type null distinct statistic distribution describe",
+    "file.profile": "file upload csv parquet excel spreadsheet",
+    "lineage.query": "lineage upstream downstream dependency depend impact affected feed trace",
+    "job.inspect": "job run failed failure error log inspect debug diagnose",
+    "pipeline.stage": "stage staging load ingest materialize land",
+    "quality.run": "quality rule check validate test freshness duplicate completeness",
+    "schedule.run": "schedule ingestion trigger refresh",
+    "sql.generate": "generate draft write compose build sql query aggregate total sum count average group",
+    "sql.preview": "preview execute run sample result row show",
+}
+
+
+def _stem(word: str) -> str:
+    if len(word) <= 3:
+        return word
+    if word.endswith("ies"):
+        word = word[:-3] + "y"
+    elif word.endswith("s") and not word.endswith("ss"):
+        word = word[:-1]
+    for suffix in ("ing", "ued", "ed", "ue", "e"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _stems(text: str) -> set[str]:
+    return {_stem(word) for word in _WORD.findall(text.lower()) if word not in _STOPWORDS}
+
+
 def _local_tool_scores(text: str, options: dict[str, str]) -> dict[str, float]:
-    words = set(_WORD.findall(text.lower()))
+    """Stemmed overlap between the step and each tool's name (weighted x2), description and hint vocabulary."""
+    words = _stems(text)
     scores = {}
     for name, description in options.items():
-        terms = set(_WORD.findall(f"{name.replace('.', ' ').replace('_', ' ')} {description}".lower()))
-        scores[name] = len(words & terms) / max(1, len(terms)) ** 0.5
+        name_terms = _stems(name.replace(".", " ").replace("_", " "))
+        terms = name_terms | _stems(f"{description} {_TOOL_HINTS.get(name, '')}")
+        scores[name] = sum(2.0 if word in name_terms else 1.0 for word in words & terms) / max(1, len(terms)) ** 0.25
     total = sum(scores.values())
     return {name: (value / total if total else 1 / len(options)) for name, value in scores.items()}
 
@@ -1702,4 +1737,9 @@ async def execute_external_extraction(extraction_id: str, actor_id: str | None =
 
 @activity.defn(name="execute_metadata_scan")
 async def execute_metadata_scan_activity(connector_id: str, job_id: str, actor_id: str) -> dict:
-    return await asyncio.to_thread(execute_metadata_scan, connector_id, job_id, actor_id)
+    attempt, max_attempts = 1, 1
+    if activity.in_activity():
+        info = activity.info()
+        attempt = info.attempt
+        max_attempts = getattr(getattr(info, "retry_policy", None), "maximum_attempts", 0) or 1
+    return await asyncio.to_thread(execute_metadata_scan, connector_id, job_id, actor_id, attempt, max_attempts)

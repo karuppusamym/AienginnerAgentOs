@@ -339,7 +339,11 @@ def request_sql_publication(
     db.add(approval)
     audit(db, user, "analytics.publication_requested", "artifact", artifact.id, {"approval_id": approval.id, "version": latest.version})
     db.commit()
-    return {"approval_id": approval.id, "job_id": job.id, "status": "awaiting_approval"}
+    from .. import auto_approval
+
+    review = auto_approval.review_approval(db, project, approval, "on_create")
+    auto_approved = review["decision"] == "approved"
+    return {"approval_id": approval.id, "job_id": job.id, "status": "auto_approved" if auto_approved else "awaiting_approval", "auto_review": review}
 
 
 @router.get("/analytics/queries/{artifact_id}")
@@ -364,7 +368,8 @@ def get_query_analytics(
         )
     )
     if state is None:
-        return {"published": False, "artifact_id": artifact.id}
+        pending = _pending_publication(db, project.id, artifact.id)
+        return {"published": False, "artifact_id": artifact.id, "pending_approval_id": pending.id if pending else None}
     return {
         "published": True,
         "artifact_id": artifact.id,
@@ -552,3 +557,69 @@ def analytics_dataset_guest_token(asset_id: str, user: User = Depends(get_curren
         "chart_count": config.get("chart_count"),
         "access_mode": config.get("access_mode"),
     }
+
+
+class MessagePublishRequest(BaseModel):
+    message_id: str = Field(min_length=1, max_length=36)
+    name: str | None = Field(default=None, max_length=160)
+
+
+def _pending_publication(db: Session, project_id: str, artifact_id: str) -> Approval | None:
+    for approval in db.scalars(
+        select(Approval).where(Approval.project_id == project_id, Approval.action_type == "publish_superset_query", Approval.status == "pending")
+    ).all():
+        if str((approval.evidence or {}).get("artifact_id")) == artifact_id:
+            return approval
+    return None
+
+
+@router.post("/analytics/publish-message", status_code=202)
+def publish_answer_to_superset(
+    payload: MessagePublishRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """One click from a chat answer to Superset.
+
+    Saves the answer's SQL as an immutable SQL artifact version (the same
+    governed object SQL workspace users save by hand) and requests
+    publication, which still goes through the ``publish_superset_query``
+    approval. Idempotent per answer: a second click reports the pending
+    approval or the published dashboard instead of creating duplicates.
+    """
+    require_workspace_editor(user, db)
+    project = require_current_project(db, user)
+    message = db.get(ConversationMessage, payload.message_id)
+    conversation = db.get(Conversation, message.conversation_id) if message is not None else None
+    if message is None or conversation is None or conversation.project_id != project.id or message.role != "assistant":
+        raise HTTPException(status_code=404, detail="Answer not found in this project")
+    structured = dict(message.structured or {})
+    sql = str(structured.get("sql") or "").strip()
+    source = structured.get("source") or {}
+    if not sql or (structured.get("execution") or {}).get("error"):
+        raise HTTPException(status_code=422, detail="This answer has no successfully executed SQL to publish")
+    if structured.get("dialect", "postgres") != "postgres" or (source.get("connector_type") not in (None, "local_files")):
+        raise HTTPException(status_code=422, detail="Only answers from the local workspace can be published to Superset; stage connector data first")
+
+    artifact = db.get(Artifact, structured.get("superset_artifact_id")) if structured.get("superset_artifact_id") else None
+    if artifact is not None and artifact.project_id == project.id:
+        if db.scalar(select(SupersetQueryDashboard).where(SupersetQueryDashboard.project_id == project.id, SupersetQueryDashboard.artifact_id == artifact.id)):
+            return {"status": "published", "artifact_id": artifact.id}
+        pending = _pending_publication(db, project.id, artifact.id)
+        if pending is not None:
+            return {"status": "awaiting_approval", "artifact_id": artifact.id, "approval_id": pending.id, "job_id": pending.job_id}
+    else:
+        name = (payload.name or structured.get("question") or conversation.title or "Analysis result")[:160]
+        artifact = Artifact(project_id=project.id, name=name, artifact_type="sql", created_by=user.id)
+        db.add(artifact)
+        db.flush()
+        db.add(ArtifactVersion(
+            artifact_id=artifact.id, version=1, content=sql,
+            artifact_metadata={"dialect": "postgres", "source": "analysis_answer", "message_id": message.id, "conversation_id": conversation.id},
+            created_by=user.id,
+        ))
+        message.structured = {**structured, "superset_artifact_id": artifact.id}
+        audit(db, user, "artifact.version_saved", "artifact", artifact.id, {"version": 1, "artifact_type": "sql", "from_message": message.id})
+        db.flush()
+    result = request_sql_publication(SupersetPublishRequest(artifact_id=artifact.id, name=payload.name or artifact.name), user, db)
+    return {**result, "artifact_id": artifact.id}

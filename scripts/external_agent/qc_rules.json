@@ -1,0 +1,31 @@
+{
+  "_about": "Independent re-derivation paths used by qc_agent.py. For each tool the agent used, QC calls a DIFFERENTLY SHAPED governed tool and recomputes the figures. 'compare' maps an aggregate-side column to an aggregate over detail-side rows (count | sum:<column>). drilldown: the agent used the aggregate tool; QC fetches the detail rows per aggregate row (arguments_from_row) and recomputes each aggregate cell. rollup: the agent used the detail tool; QC fetches the aggregate tool and checks the detail rows add up to it.",
+  "banking.txn_totals_by_type": {
+    "mode": "drilldown",
+    "verify_with": "banking.txns_by_type",
+    "arguments_from_row": {"txn_type": "txn_type"},
+    "match_columns": ["txn_type"],
+    "compare": {"txn_count": "count", "total_amount": "sum:amount"}
+  },
+  "banking.txns_by_type": {
+    "mode": "rollup",
+    "verify_with": "banking.txn_totals_by_type",
+    "verify_arguments": {},
+    "match": {"txn_type": "$arg.txn_type"},
+    "compare": {"txn_count": "count", "total_amount": "sum:amount"}
+  },
+  "commerce.payments_summary": {
+    "mode": "drilldown",
+    "verify_with": "commerce.payments_by_status",
+    "arguments_from_row": {"status": "status"},
+    "match_columns": ["status", "method"],
+    "compare": {"payment_count": "count", "total_amount": "sum:amount"}
+  },
+  "commerce.payments_by_status": {
+    "mode": "rollup",
+    "verify_with": "commerce.payments_summary",
+    "verify_arguments": {},
+    "match": {"status": "$arg.status"},
+    "compare": {"payment_count": "count", "total_amount": "sum:amount"}
+  }
+}

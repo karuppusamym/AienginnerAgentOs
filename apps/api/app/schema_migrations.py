@@ -118,6 +118,12 @@ def _ensure_project_columns(connection: Connection) -> None:
         grant_columns = {column["name"] for column in inspector.get_columns("query_tool_grants")}
         if "daily_quota" not in grant_columns:
             connection.execute(text("ALTER TABLE query_tool_grants ADD COLUMN daily_quota INTEGER"))
+    if "external_invocations" in existing_tables:
+        invocation_columns = {column["name"] for column in inspector.get_columns("external_invocations")}
+        if "channel" not in invocation_columns:
+            connection.execute(text("ALTER TABLE external_invocations ADD COLUMN channel VARCHAR(16) NOT NULL DEFAULT 'rest'"))
+        if "row_count" not in invocation_columns:
+            connection.execute(text("ALTER TABLE external_invocations ADD COLUMN row_count INTEGER"))
     if "agent_definitions" in existing_tables:
         agent_columns = {column["name"] for column in inspector.get_columns("agent_definitions")}
         if "query_tool_names" not in agent_columns:
@@ -126,6 +132,8 @@ def _ensure_project_columns(connection: Connection) -> None:
         agent_version_columns = {column["name"] for column in inspector.get_columns("agent_versions")}
         if "query_tool_names" not in agent_version_columns:
             connection.execute(text("ALTER TABLE agent_versions ADD COLUMN query_tool_names JSON"))
+    if "projects" in existing_tables and "settings" not in {column["name"] for column in inspector.get_columns("projects")}:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN settings JSON"))
 
 
 GLOBAL_ALLOWED_TABLES = {"audit_events", "model_call_logs"}

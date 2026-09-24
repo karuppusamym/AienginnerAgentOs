@@ -144,6 +144,17 @@ class ExternalExtractionWorkflow:
         )
 
 
+# A scan against an unreachable host fails fast on DNS; three spaced attempts ride out a
+# container that is still starting without burying the job in retries.
+_METADATA_SCAN_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=5),
+    backoff_coefficient=3.0,
+    maximum_interval=timedelta(seconds=60),
+    maximum_attempts=3,
+    non_retryable_error_types=["ValueError"],
+)
+
+
 @workflow.defn(name="datapilot-metadata-scan")
 class MetadataScanWorkflow:
     @workflow.run
@@ -152,5 +163,5 @@ class MetadataScanWorkflow:
             "execute_metadata_scan",
             args=[connector_id, job_id, actor_id],
             start_to_close_timeout=timedelta(minutes=10),
-            retry_policy=_DEFAULT_RETRY_POLICY,
+            retry_policy=_METADATA_SCAN_RETRY_POLICY,
         )

@@ -1,0 +1,5 @@
+# Isolated venv for the Google ADK variant only (scripts/external_agent/.venv, gitignored).
+# Versions verified against DataPilot's /mcp on 2026-09-24.
+google-adk==2.9.2
+mcp==2.2.0
+httpx

@@ -214,6 +214,22 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertIn("/datapilot/editor-login?token=", payload["url"])
         self.assertEqual(payload["expires_in"], 30)
 
+    def test_chat_answer_publishes_to_superset_in_one_click_and_is_idempotent(self) -> None:
+        conversation = self.client.post("/conversations", headers=self.headers, json={"title": "Publish from chat"}).json()["id"]
+        answer = self.client.post(f"/conversations/{conversation}/messages", headers=self.headers, json={"content": "How many accounts by account type?", "dialect": "postgres"})
+        self.assertEqual(answer.status_code, 201, answer.text)
+        message_id = answer.json()["id"]
+        with patch("app.routers.analytics.superset_availability", return_value={"available": True, "reason": ""}):
+            first = self.client.post("/analytics/publish-message", headers=self.headers, json={"message_id": message_id})
+            second = self.client.post("/analytics/publish-message", headers=self.headers, json={"message_id": message_id})
+        self.assertEqual(first.status_code, 202, first.text)
+        self.assertEqual(first.json()["status"], "awaiting_approval")
+        self.assertEqual(second.json()["approval_id"], first.json()["approval_id"])  # no duplicate artifact or approval
+        self.assertEqual(second.json()["artifact_id"], first.json()["artifact_id"])
+        status = self.client.get(f"/analytics/queries/{first.json()['artifact_id']}", headers=self.headers).json()
+        self.assertEqual(status["pending_approval_id"], first.json()["approval_id"])
+        self.assertEqual(self.client.post("/analytics/publish-message", headers=self.headers, json={"message_id": "missing"}).status_code, 404)
+
     def test_saved_sql_and_notebook_can_be_approved_for_superset_publication(self) -> None:
         artifact = self.client.post(
             "/artifacts",

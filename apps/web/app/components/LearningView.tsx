@@ -35,14 +35,17 @@ import {
   useIndexRecommendations,
   usePromptOptimization,
   usePromptOptimizations,
+  useDebouncedValue,
+  usePagedQuery,
+  usePagination,
+  useProjectQuery,
   useQueryErrorToast,
-  useRouterDecisions,
-  useVerifiedQueries,
+  type Facet,
 } from "../lib/queries";
 import type { Notify } from "../lib/workspace";
 import { connectorDialectForType } from "../lib/constants";
 import type { IndexRecommendation, PromptCandidate, PromptOptimizationDetail, RouterDecisionRecord, VerifiedQuery } from "../types";
-import { EmptyState, EndpointUnavailable, LoadingBlock, Modal, StatusPill, formatScore, useConfirm } from "./shared";
+import { EmptyState, EndpointUnavailable, LoadingBlock, Modal, Pagination, StatusPill, formatScore, useConfirm } from "./shared";
 import { RouterEvaluationPanel } from "./admin";
 
 export type LearningTab = "verified" | "optimization" | "indexes" | "router";
@@ -104,11 +107,15 @@ type VerifiedFilter = (typeof VERIFIED_STATUS_FILTERS)[number];
 const EMPTY_VERIFIED_FORM = { question: "", sql: "", dialect: "postgres", connector_id: "" };
 
 function VerifiedQueriesPanel({ notify }: { notify: Notify }) {
-  const query = useVerifiedQueries();
   const connectors = useConnectors().data;
   const [confirm, confirmDialog] = useConfirm();
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<VerifiedFilter>("all");
+  const needle = useDebouncedValue(search.trim());
+  const filters = { status: status === "all" ? "" : status, q: needle };
+  const pagination = usePagination(filters, 50);
+  const query = usePagedQuery<VerifiedQuery>(scopes.verifiedQueries, "/verified-queries", filters, pagination);
+  const facets = useProjectQuery<{ total: number; status: Facet[] }>([...scopes.verifiedQueries, "facets"], "/verified-queries/facets");
   const [openId, setOpenId] = useState("");
   const [adding, setAdding] = useState(false);
   const [form, setForm] = useState(EMPTY_VERIFIED_FORM);
@@ -118,14 +125,12 @@ function VerifiedQueriesPanel({ notify }: { notify: Notify }) {
   const removeMutation = useApiMutation((id: string) => api(`/verified-queries/${id}`, { method: "DELETE" }), [scopes.verifiedQueries]);
   const createMutation = useApiMutation((body: { question: string; sql: string; dialect: string; connector_id?: string }) => api<VerifiedQuery>("/verified-queries", { method: "POST", body: JSON.stringify(body) }), [scopes.verifiedQueries]);
 
-  const items = useMemo(() => query.data ?? [], [query.data]);
+  const filtered = useMemo(() => query.data?.items ?? [], [query.data]);
   const counts = useMemo(() => {
-    const result: Record<string, number> = { all: items.length };
-    for (const item of items) result[item.status] = (result[item.status] || 0) + 1;
+    const result: Record<string, number> = { all: facets.data?.total ?? 0 };
+    for (const facet of facets.data?.status ?? []) result[facet.value] = facet.count;
     return result;
-  }, [items]);
-  const needle = search.trim().toLowerCase();
-  const filtered = items.filter((item) => (status === "all" || item.status === status) && (!needle || item.question.toLowerCase().includes(needle) || item.sql.toLowerCase().includes(needle)));
+  }, [facets.data]);
 
   async function changeStatus(item: VerifiedQuery, next: "active" | "retired") {
     try {
@@ -201,8 +206,9 @@ function VerifiedQueriesPanel({ notify }: { notify: Notify }) {
               </div>
             );
           })}
+          <Pagination state={pagination} total={query.data?.total ?? 0} count={filtered.length} busy={query.isFetching} label="verified queries" />
         </>
-      ) : <div className="inline-empty">{items.length ? "No verified queries match these filters." : "No verified queries yet. Helpful feedback and passing evaluation cases add them for review."}</div>}
+      ) : <div className="inline-empty">{counts.all ? "No verified queries match these filters." : "No verified queries yet. Helpful feedback and passing evaluation cases add them for review."}</div>}
       {adding && (
         <Modal title="Add verified query" onClose={() => setAdding(false)}>
           <form className="modal-form" onSubmit={submit}>
@@ -664,15 +670,19 @@ function backendName(backend: string) {
   return backend.startsWith("jev:") ? `jev (${backend.slice(4)})` : backend;
 }
 
+const ROUTER_BACKENDS = ["local", "llm", "jev"];
+
 function RouterDecisionsPanel({ notify }: { notify: Notify }) {
-  const query = useRouterDecisions(100);
   const [backend, setBackend] = useState("all");
   const [search, setSearch] = useState("");
+  const needle = useDebouncedValue(search.trim());
+  const filters = { backend: backend === "all" ? "" : backend, q: needle };
+  const pagination = usePagination(filters, 50);
+  const query = usePagedQuery<RouterDecisionRecord>(scopes.routerDecisions, "/router/decisions", filters, pagination);
   useQueryErrorToast(query.error, notify, "Router decisions could not be loaded", { ignoreUnavailable: true });
-  const items = useMemo(() => query.data ?? [], [query.data]);
-  const backends = useMemo(() => Array.from(new Set(items.map((item) => item.backend.split(":")[0]))).sort(), [items]);
-  const needle = search.trim().toLowerCase();
-  const filtered = items.filter((item) => (backend === "all" || item.backend.split(":")[0] === backend) && (!needle || item.question.toLowerCase().includes(needle)));
+  const filtered = useMemo(() => query.data?.items ?? [], [query.data]);
+  const backends = useMemo(() => Array.from(new Set([...ROUTER_BACKENDS, ...filtered.map((item) => item.backend.split(":")[0])])).sort(), [filtered]);
+  const total = query.data?.total ?? 0;
   const rated = filtered.filter((item) => item.outcome?.feedback);
   const helpful = rated.filter((item) => ["helpful", "positive"].includes(String(item.outcome?.feedback))).length;
 
@@ -680,14 +690,14 @@ function RouterDecisionsPanel({ notify }: { notify: Notify }) {
   return (
     <section className="surface admin-surface">
       <div className="section-heading">
-        <div><span className="eyebrow">DECISION ROUTER</span><h3>Recent decisions</h3><p>The last 100 routing decisions with backend, confidence and what the user said about the answer.</p></div>
+        <div><span className="eyebrow">DECISION ROUTER</span><h3>Recent decisions</h3><p>Routing decisions, newest first, with backend, confidence and what the user said about the answer.</p></div>
         <div className="row-actions">
           <div className="toolbar-search"><Search size={16} /><input placeholder="Search questions..." value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Search decisions" /></div>
           <select value={backend} onChange={(event) => setBackend(event.target.value)} aria-label="Filter by backend"><option value="all">All backends</option>{backends.map((name) => <option key={name} value={name}>{name}</option>)}</select>
           <button className="icon-button" title="Refresh" aria-label="Refresh decisions" onClick={() => void query.refetch()}><RefreshCw size={16} className={query.isFetching ? "spin" : undefined} /></button>
         </div>
       </div>
-      <p className="admin-hint learning-pad">{filtered.length} decision{filtered.length === 1 ? "" : "s"} · {rated.length} rated · {rated.length ? `${Math.round((helpful / rated.length) * 100)}% helpful` : "no feedback yet"}</p>
+      <p className="admin-hint learning-pad">{total.toLocaleString()} decision{total === 1 ? "" : "s"} · on this page {rated.length} rated · {rated.length ? `${Math.round((helpful / rated.length) * 100)}% helpful` : "no feedback yet"}</p>
       {query.isPending ? <LoadingBlock label="Loading decisions" /> : filtered.length ? (
         <>
           <div className="table-header decision-grid"><span>Question</span><span>Route</span><span>Backend</span><span>Confidence</span><span>Feedback</span></div>
@@ -700,16 +710,17 @@ function RouterDecisionsPanel({ notify }: { notify: Notify }) {
               {item.outcome?.feedback ? <StatusPill value={FEEDBACK_LABELS[String(item.outcome.feedback)] || String(item.outcome.feedback)} /> : <span className="caption">-</span>}
             </div>
           ))}
+          <Pagination state={pagination} total={total} count={filtered.length} busy={query.isFetching} label="decisions" />
         </>
-      ) : <div className="inline-empty">{items.length ? "No decisions match these filters." : "No routing decisions recorded for this project yet."}</div>}
+      ) : <div className="inline-empty">{needle || backend !== "all" ? "No decisions match these filters." : "No routing decisions recorded for this project yet."}</div>}
     </section>
   );
 }
 
 // ------------------------------------------------------------------ tool choice evaluation
 
-type ToolChoiceResult = { agent: string; step: string; expected: string; got: string | null; probability: number | null; backend: string; correct: boolean };
-type ToolChoiceReport = { cases: number; skipped: { agent: string; step: string; reason: string }[]; backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; results: ToolChoiceResult[] }> };
+type ToolChoiceResult = { agent: string; step: string; expected: string; got: string | null; probability: number | null; backend: string; correct: boolean; error?: string | null };
+type ToolChoiceReport = { cases: number; skipped: { agent: string; step: string; reason: string }[]; backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; errors?: number; results: ToolChoiceResult[] }> };
 
 const SAMPLE_TOOL_CASES = [
   "Metadata | Retrieve the lineage graph for staging.transactions, upstream and downstream | lineage.query",
@@ -747,13 +758,16 @@ function ToolChoiceEvaluationPanel({ notify }: { notify: Notify }) {
       </div>
       <div className="learning-pad">
         <label className="field-label" htmlFor="tool-choice-cases">Cases</label>
-        <textarea id="tool-choice-cases" className="code-input" rows={6} value={text} onChange={(event) => setText(event.target.value)} spellCheck={false} />
+        <textarea id="tool-choice-cases" className="code-input tool-cases" rows={8} value={text} onChange={(event) => setText(event.target.value)} spellCheck={false} />
       </div>
       {report && (
         <div className="learning-pad">
-          <div className="three-column compact-cards">
+          <div className="three-column compact-cards score-cards">
             {Object.entries(report.backends).map(([name, item]) => (
-              <div className="control-item" key={name}><span><strong>{name === "jev" ? "Jev" : "Local chooser"}</strong><small>{item.effective_backend || "-"}</small></span><span><strong>{item.accuracy != null ? `${Math.round(item.accuracy * 100)}%` : "-"}</strong><small>{item.avg_latency_ms != null ? `${Math.round(item.avg_latency_ms)} ms avg` : ""}</small></span></div>
+              <div className="control-item score-card" key={name}>
+                <span><strong>{name === "jev" ? "Jev" : "Local chooser"}</strong><small title={item.effective_backend || undefined}>{item.effective_backend || "-"}</small></span>
+                <span><strong>{item.accuracy != null ? `${Math.round(item.accuracy * 100)}%` : "-"}</strong><small>{item.avg_latency_ms != null ? `${Math.round(item.avg_latency_ms)} ms avg` : ""}{item.errors ? ` · ${item.errors} failed` : ""}</small></span>
+              </div>
             ))}
           </div>
           {report.skipped.length ? <p className="admin-hint">{report.skipped.length} case{report.skipped.length === 1 ? "" : "s"} skipped: {report.skipped.map((item) => `${item.agent} (${item.reason})`).join("; ")}</p> : null}
@@ -766,7 +780,7 @@ function ToolChoiceEvaluationPanel({ notify }: { notify: Notify }) {
                 <span><strong title={row.step}>{row.step}</strong><small>{row.agent}</small></span>
                 <span className="mono">{row.expected}</span>
                 <span className="mono">{local ? `${local.correct ? "✓" : "✗"} ${local.got || "-"}` : "-"}</span>
-                <span className="mono">{jev ? `${jev.correct ? "✓" : "✗"} ${jev.got || "-"}${jev.probability != null ? ` ${Math.round(jev.probability * 100)}%` : ""}` : "-"}</span>
+                <span className="mono">{jev?.error ? <span className="tool-choice-error" title={jev.error}>no answer<small>{jev.error}</small></span> : jev ? `${jev.correct ? "✓" : "✗"} ${jev.got || "-"}${jev.probability != null ? ` ${Math.round(jev.probability * 100)}%` : ""}` : "-"}</span>
                 <span></span>
               </div>
             );

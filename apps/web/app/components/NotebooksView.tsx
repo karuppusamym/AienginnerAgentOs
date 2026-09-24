@@ -82,9 +82,9 @@ export function NotebooksView({ notify }: { notify: (message: string, tone?: "ok
       // Save first so the approval always points at an immutable notebook
       // version, rather than the user's unsaved editor text.
       const saved = await api<{ id: string }>("/notebooks", { method: "POST", body: JSON.stringify({ notebook_id: selected.id, name: selected.name, cells: selected.cells }) });
-      const request = await api<{ approval_id: string }>("/analytics/publish-sql", { method: "POST", body: JSON.stringify({ notebook_id: saved.id, name: selected.name }) });
+      const request = await api<{ approval_id: string; status: string }>("/analytics/publish-sql", { method: "POST", body: JSON.stringify({ notebook_id: saved.id, name: selected.name }) });
       await load();
-      notify(`Notebook SQL publication is awaiting approval (${request.approval_id.slice(0, 8)}); "Open in Superset" appears here once an admin approves it`);
+      notify(request.status === "auto_approved" ? "Notebook SQL published to Superset: auto-approved by policy" : `Notebook SQL publication is awaiting approval (${request.approval_id.slice(0, 8)}); "Open in Superset" appears here once an admin approves it`);
     } catch (reason) { notify(reason instanceof Error ? reason.message : "Superset publication could not be requested", "error"); }
     finally { setPublishing(false); }
   }

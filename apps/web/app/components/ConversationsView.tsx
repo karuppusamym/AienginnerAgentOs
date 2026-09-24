@@ -9,6 +9,9 @@ import {
   CircleGauge,
   Copy,
   Download,
+  LayoutDashboard,
+  Maximize2,
+  Minimize2,
   Edit2,
   FileSpreadsheet,
   GitBranch,
@@ -31,11 +34,12 @@ import {
   ThumbsUp,
   XCircle,
 } from "lucide-react";
-import { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError, apiStream, SessionUser } from "../lib/api";
 import type { AnswerEnsemble, AnswerLearning, AnswerStage, ChartType, Connector, Conversation, ConversationMessage, JevDecision, RouteCandidate, RouteDecision, SQLExecutionResult } from "../types";
-import { projectKey, scopes, useConnectors, useConversationMessages, useConversations, useInvalidate, useQueryErrorToast, type MessagePages } from "../lib/queries";
+import { projectKey, scopes, useConnectors, useConversationMessages, useConversations, useInvalidate, useQueryErrorToast, useSupersetStatus, type MessagePages } from "../lib/queries";
+import dynamic from "next/dynamic";
 import { useWorkspace } from "../lib/workspace";
 import { connectorLabels, connectorDialectForType } from "../lib/constants";
 import { StatusPill, EmptyState, Modal, formatProbability, formatUsd } from "./shared";
@@ -52,6 +56,9 @@ type Dialog =
   | { kind: "feedback"; messageId: string; comment: string };
 
 const PANEL_STORAGE_KEY = "datapilot.analysis.panels";
+const WIDTH_STORAGE_KEY = "datapilot.analysis.widths";
+const DEFAULT_WIDTHS = { left: 250, right: 380 };
+const PublishedQueryAnalyticsModal = dynamic(() => import("./PublishedQueryAnalyticsModal").then((module) => module.PublishedQueryAnalyticsModal), { ssr: false });
 const NO_CONVERSATIONS: Conversation[] = [];
 const NO_CONNECTORS: Connector[] = [];
 const NO_MESSAGES: ConversationMessage[] = [];
@@ -184,6 +191,9 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   const [inspectId, setInspectId] = useState("");
   const [tab, setTab] = useState<InspectorTab>("result");
   const [panels, setPanels] = useState({ left: true, right: true });
+  // Panel widths in px, dragged via the separators; persisted per browser.
+  const [widths, setWidths] = useState(DEFAULT_WIDTHS);
+  const layoutRef = useRef<HTMLDivElement>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [feedback, setFeedback] = useState<Record<string, "positive" | "negative">>({});
   const [toolResults, setToolResults] = useState<Record<string, { tool: string; result: SQLExecutionResult }>>({});
@@ -227,7 +237,61 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   const inspected = results.find((message) => message.id === inspectId) || results[results.length - 1];
   const inspectedIndex = inspected ? results.indexOf(inspected) : -1;
 
-  useEffect(() => { setPanels(readPanels()); }, []);
+  useEffect(() => {
+    setPanels(readPanels());
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(WIDTH_STORAGE_KEY) || "{}");
+      setWidths({ left: Number(saved.left) || DEFAULT_WIDTHS.left, right: Number(saved.right) || DEFAULT_WIDTHS.right });
+    } catch { /* storage unavailable */ }
+  }, []);
+  const saveWidths = useCallback((next: typeof DEFAULT_WIDTHS) => {
+    setWidths(next);
+    try { window.localStorage.setItem(WIDTH_STORAGE_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ }
+  }, []);
+  /** Keep the answer column at least 360px wide; side panels between 200px and whatever is left. */
+  const clampWidth = useCallback((side: "left" | "right", value: number, current: typeof DEFAULT_WIDTHS) => {
+    const total = layoutRef.current?.clientWidth || 1400;
+    const other = side === "left" ? (panels.right ? current.right : 36) : (panels.left ? current.left : 36);
+    return Math.round(Math.max(200, Math.min(value, total - other - 360 - 24)));
+  }, [panels]);
+  const startResize = useCallback((side: "left" | "right", event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const start = widths;
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    document.body.classList.add("resizing-columns");
+    let latest = start;
+    const move = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const value = side === "left" ? start.left + delta : start.right - delta;
+      latest = { ...start, [side]: clampWidth(side, value, start) };
+      setWidths(latest);
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      document.body.classList.remove("resizing-columns");
+      saveWidths(latest);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  }, [widths, clampWidth, saveWidths]);
+  const keyResize = useCallback((side: "left" | "right", event: KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 80 : 20;
+    const grow = side === "left" ? event.key === "ArrowRight" : event.key === "ArrowLeft";
+    const shrink = side === "left" ? event.key === "ArrowLeft" : event.key === "ArrowRight";
+    if (!grow && !shrink) return;
+    event.preventDefault();
+    saveWidths({ ...widths, [side]: clampWidth(side, widths[side] + (grow ? step : -step), widths) });
+  }, [widths, clampWidth, saveWidths]);
+  const resetWidth = useCallback((side: "left" | "right") => saveWidths({ ...widths, [side]: DEFAULT_WIDTHS[side] }), [widths, saveWidths]);
+  const expandInspector = useCallback(() => {
+    const total = layoutRef.current?.clientWidth || 1400;
+    saveWidths({ ...widths, right: widths.right >= total * 0.5 ? DEFAULT_WIDTHS.right : clampWidth("right", total * 0.6, widths) });
+  }, [widths, clampWidth, saveWidths]);
   function togglePanel(side: "left" | "right") {
     setPanels((current) => {
       const next = { ...current, [side]: !current[side] };
@@ -565,9 +629,10 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
   const layoutClass = `analysis-layout${panels.left ? "" : " left-collapsed"}${panels.right ? "" : " right-collapsed"}`;
 
   return (
-    <div className={layoutClass}>
+    <div className={layoutClass} ref={layoutRef} style={{ "--analysis-left": `${widths.left}px`, "--analysis-right": `${widths.right}px` } as React.CSSProperties}>
       {panels.left ? (
         <aside className="surface conversation-list" aria-label="Analysis history">
+          <div className="column-resizer right-edge" role="separator" aria-orientation="vertical" aria-label="Resize history panel" aria-valuenow={widths.left} tabIndex={0} title="Drag to resize · double-click to reset" onPointerDown={(event) => startResize("left", event)} onKeyDown={(event) => keyResize("left", event)} onDoubleClick={() => resetWidth("left")} />
           <div className="panel-header">
             <div><span className="eyebrow">HISTORY</span><h3>Analyses</h3></div>
             <span className="row-actions">
@@ -693,11 +758,13 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
 
       {panels.right ? (
         <aside className="surface insight-panel" aria-label="Result inspector">
+          <div className="column-resizer left-edge" role="separator" aria-orientation="vertical" aria-label="Resize inspector" aria-valuenow={widths.right} tabIndex={0} title="Drag to resize · double-click to reset" onPointerDown={(event) => startResize("right", event)} onKeyDown={(event) => keyResize("right", event)} onDoubleClick={() => resetWidth("right")} />
           <div className="panel-header">
             <div><span className="eyebrow">INSPECTOR</span><h3>{inspected ? `Result ${inspectedIndex + 1} of ${results.length}` : "Results"}</h3></div>
             <span className="row-actions">
               <button className="icon-button" aria-label="Previous result" disabled={inspectedIndex <= 0} onClick={() => setInspectId(results[inspectedIndex - 1].id)}><ChevronLeft size={16} /></button>
               <button className="icon-button" aria-label="Next result" disabled={inspectedIndex < 0 || inspectedIndex >= results.length - 1} onClick={() => setInspectId(results[inspectedIndex + 1].id)}><ChevronRight size={16} /></button>
+              <button className="icon-button" title={widths.right >= (layoutRef.current?.clientWidth || 1400) * 0.5 ? "Restore inspector width" : "Widen inspector"} aria-label="Toggle wide inspector" onClick={expandInspector}>{widths.right >= (layoutRef.current?.clientWidth || 1400) * 0.5 ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
               <button className="icon-button" title="Collapse inspector" aria-label="Collapse inspector" onClick={() => togglePanel("right")}><PanelRightClose size={16} /></button>
             </span>
           </div>
@@ -811,7 +878,7 @@ function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, ca
                   </>
                 ) : <AnalysisChart chart={s.chart} />)}
                 <ResultTable result={execution} />
-                <div className="inspector-actions"><button className="secondary-button compact" onClick={() => onCsv(execution, s.question || "result")}><Download size={13} />CSV</button></div>
+                <div className="inspector-actions"><button className="secondary-button compact" onClick={() => onCsv(execution, s.question || "result")}><Download size={13} />CSV</button>{!toolResult && s.sql && <SupersetPublishButton message={message} canEdit={canEdit} />}</div>
               </>
             ) : <div className="chart-empty">This source was not executed from DataPilot. Open the SQL tab to run it through the governed connector path.</div>}
           </>
@@ -1028,5 +1095,62 @@ function EnsembleSection({ ensemble }: { ensemble?: AnswerEnsemble }) {
       ) : <p className="inspector-muted">No candidates were recorded.</p>}
       {candidates.filter((item) => !item.ok && item.error).map((item, index) => <p key={index} className="inspector-muted ensemble-error-line"><strong>{item.model}:</strong> {item.error}</p>)}
     </section>
+  );
+}
+
+type PublishState = { published: boolean; pending_approval_id?: string | null; dashboard_title?: string };
+
+/** One click from an answer to Superset: saves the SQL as a governed artifact and requests approval; then opens the dashboard. */
+function SupersetPublishButton({ message, canEdit }: { message: ConversationMessage; canEdit: boolean }) {
+  const { notify } = useWorkspace();
+  const invalidate = useInvalidate();
+  const superset = useSupersetStatus();
+  const s = message.structured;
+  const [artifactId, setArtifactId] = useState(s.superset_artifact_id || "");
+  const [state, setState] = useState<PublishState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  useEffect(() => { setArtifactId(s.superset_artifact_id || ""); setState(null); }, [message.id, s.superset_artifact_id]);
+  useEffect(() => {
+    if (!artifactId) return;
+    let active = true;
+    api<PublishState>(`/analytics/queries/${artifactId}`).then((result) => { if (active) setState(result); }).catch(() => undefined);
+    return () => { active = false; };
+  }, [artifactId]);
+  const local = (s.dialect || "postgres") === "postgres" && ["local_files", undefined, null, ""].includes(s.source?.connector_type as string | undefined);
+  const unavailable = superset.data && !superset.data.available;
+  const reason = !canEdit ? "Your role can't publish" : !local ? "Only local-workspace answers can be published; stage connector data first" : unavailable ? superset.data?.reason : "Save this answer's SQL and request a Superset dashboard (approval required)";
+
+  async function publish() {
+    setBusy(true);
+    try {
+      const result = await api<{ status: string; artifact_id: string; approval_id?: string }>("/analytics/publish-message", { method: "POST", body: JSON.stringify({ message_id: message.id }) });
+      setArtifactId(result.artifact_id);
+      setState(result.status === "published" ? { published: true } : { published: false, pending_approval_id: result.approval_id });
+      void invalidate(scopes.approvals, scopes.jobs);
+      notify(result.status === "published" ? "Already published: opening the dashboard" : "Saved as a SQL artifact and sent to Approvals for Superset publication");
+      if (result.status === "published") setOpen(true);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Could not publish to Superset", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (state?.published && artifactId) {
+    return (
+      <>
+        <button className="secondary-button compact" onClick={() => setOpen(true)} title="Open this answer's Superset dashboard"><LayoutDashboard size={13} />Open in Superset</button>
+        {open && <PublishedQueryAnalyticsModal artifactId={artifactId} title={state.dashboard_title || s.question || "Answer analytics"} onClose={() => setOpen(false)} />}
+      </>
+    );
+  }
+  if (state?.pending_approval_id) {
+    return <a className="secondary-button compact" href="/approvals" title="Publication is waiting for approval"><LayoutDashboard size={13} />Awaiting approval</a>;
+  }
+  return (
+    <button className="secondary-button compact" onClick={() => void publish()} disabled={busy || !canEdit || !local || !!unavailable} title={reason}>
+      {busy ? <RefreshCw size={13} className="spin" /> : <LayoutDashboard size={13} />}{busy ? "Publishing" : "Publish to Superset"}
+    </button>
   );
 }

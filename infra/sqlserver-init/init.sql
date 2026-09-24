@@ -112,3 +112,34 @@ BEGIN
         (1010, '2026-04-15', 'debit_card',  210.30,  'pending',  'TXN-JJ010');
 END
 GO
+
+-- ─────────────────────────────────────────
+-- VIEWS (a metadata scan records their definitions as base-table lineage)
+-- CREATE OR ALTER keeps this re-runnable; each must be alone in its batch.
+-- ─────────────────────────────────────────
+CREATE OR ALTER VIEW demo.customer_order_summary AS
+SELECT c.customer_id,
+       c.first_name,
+       c.last_name,
+       c.segment,
+       COUNT(o.order_id)                AS order_count,
+       COALESCE(SUM(o.total_amount), 0) AS lifetime_value,
+       MAX(o.order_date)                AS last_order_date
+FROM demo.customers c
+LEFT JOIN demo.orders o ON o.customer_id = c.customer_id
+GROUP BY c.customer_id, c.first_name, c.last_name, c.segment;
+GO
+
+CREATE OR ALTER VIEW demo.order_payment_status AS
+SELECT o.order_id,
+       o.customer_id,
+       o.order_date,
+       o.status       AS order_status,
+       o.total_amount,
+       p.payment_id,
+       p.method       AS payment_method,
+       p.amount       AS paid_amount,
+       p.status       AS payment_status
+FROM demo.orders o
+LEFT JOIN demo.payments p ON p.order_id = o.order_id;
+GO

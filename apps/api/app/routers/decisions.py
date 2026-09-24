@@ -14,11 +14,12 @@ from typing import Any
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..pagination import Page, contains, escape_like, paginate_query
 from ..auth import get_current_user
 from ..database import get_db
 from ..decision_router import active_policy, decide
@@ -60,14 +61,25 @@ def router_policy(_: User = Depends(get_current_user)) -> dict[str, Any]:
 
 @router.get("/router/decisions")
 def router_decisions(
+    response: Response,
     limit: int = Query(default=200, ge=1, le=2_000),
+    offset: int = Query(default=0, ge=0),
+    route: str = Query(default="", max_length=32),
+    backend: str = Query(default="", max_length=32),
+    q: str = Query(default="", max_length=200),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    rows = db.scalars(
-        select(RouteDecision).where(RouteDecision.project_id == project.id).order_by(RouteDecision.created_at.desc()).limit(limit)
-    ).all()
+    statement = select(RouteDecision).where(RouteDecision.project_id == project.id)
+    if route:
+        statement = statement.where(RouteDecision.route == route)
+    if backend:
+        # "jev" also matches "jev:<model>".
+        statement = statement.where((RouteDecision.backend == backend) | RouteDecision.backend.like(f"{escape_like(backend)}:%", escape="\\"))
+    if q.strip():
+        statement = statement.where(func.lower(RouteDecision.question).like(contains(q), escape="\\"))
+    rows = paginate_query(db, statement.order_by(RouteDecision.created_at.desc()), response, Page(limit=limit, offset=offset))
     feedback: dict[str, str] = {}
     ids = [row.message_id for row in rows if row.message_id]
     if ids:
@@ -155,6 +167,10 @@ def evaluate_router(payload: RouterEvaluationRequest, user: User = Depends(get_c
     return report
 
 
+# Evaluation is interactive and sequential; agent runs keep the short TYPESAFE_TIMEOUT_SECONDS default.
+EVALUATION_TIMEOUT_SECONDS = 15.0
+
+
 class ToolChoiceCase(BaseModel):
     agent: str = Field(min_length=1, max_length=120)
     step: str = Field(min_length=1, max_length=1_000)
@@ -212,8 +228,12 @@ def evaluate_tool_choice(payload: ToolChoiceEvaluationRequest, user: User = Depe
         results, latencies = [], []
         for case, menu in usable:
             started = time.perf_counter()
+            error = None
             if backend == "jev":
-                verdict = jev_client.choose_tools(db, chooser, case.step, case.objective or case.step, menu, project.id, user.id) if chooser is not None else None
+                if chooser is None:
+                    verdict, error = None, "No decision model is routed to tool selection"
+                else:
+                    verdict, error = jev_client.choose_tools_with_error(db, chooser, case.step, case.objective or case.step, menu, project.id, user.id, timeout=EVALUATION_TIMEOUT_SECONDS)
                 probabilities = (verdict or {}).get("probabilities") or {}
                 effective = f"jev:{verdict['model']}" if verdict else ("jev (not routed)" if chooser is None else "jev (unavailable)")
             else:
@@ -221,11 +241,13 @@ def evaluate_tool_choice(payload: ToolChoiceEvaluationRequest, user: User = Depe
                 effective = "local"
             latencies.append((time.perf_counter() - started) * 1000)
             got = max(probabilities, key=probabilities.get) if probabilities else None
-            results.append({"agent": case.agent, "step": case.step[:200], "expected": case.expected_tool, "got": got, "probability": round(probabilities.get(got, 0.0), 4) if got else None, "backend": effective, "correct": got == case.expected_tool})
+            results.append({"agent": case.agent, "step": case.step[:200], "expected": case.expected_tool, "got": got, "probability": round(probabilities.get(got, 0.0), 4) if got else None, "backend": effective, "correct": got == case.expected_tool, "error": error})
+        answered = [item for item in results if not item["error"]]
         report["backends"][backend] = {
             "accuracy": round(sum(item["correct"] for item in results) / len(results), 4) if results else None,
             "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
-            "effective_backend": results[0]["backend"] if results else None,
+            "effective_backend": next((item["backend"] for item in answered), results[0]["backend"] if results else None),
+            "errors": len(results) - len(answered),
             "results": results,
         }
     db.commit()  # keep Jev call logs in Model usage

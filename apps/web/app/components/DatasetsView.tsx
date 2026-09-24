@@ -9,30 +9,64 @@ import {
   Search,
   Sparkles,
 } from "lucide-react";
-import { ChangeEvent, useRef, useState } from "react";
+import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api";
-import { scopes, useDatasets, useInvalidate, useQueryErrorToast } from "../lib/queries";
+import { scopes, useDebouncedValue, useFacets, useInvalidate, usePagedQuery, usePagination, useProjectQuery, useQueryErrorToast, withParams, type Facet, type PageParams } from "../lib/queries";
 import type {
   Dataset,
 } from "../types";
 import {
   connectorLabels,
 } from "../lib/constants";
-import { LoadingBlock, Modal } from "./shared";
+import { CollapsibleGroup, GroupBySelect, LoadingBlock, Modal, Pagination } from "./shared";
 
 
 const NO_DATASETS: Dataset[] = [];
+type DatasetGroupBy = "none" | "source" | "category" | "schema";
+type DatasetFacets = { total: number; source: Facet[]; category: Facet[]; schema: Facet[] };
 
-export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL: (dataset: Dataset) => void; onStartAnalysis?: (dataset: Dataset) => void; notify?: (message: string, tone?: "ok" | "error") => void }) {
-  const datasetsQuery = useDatasets();
-  const datasets = datasetsQuery.data ?? NO_DATASETS;
-  useQueryErrorToast(datasetsQuery.error, notify, "Datasets could not be loaded");
+function DatasetRowList({ items, selectedId, onSelect }: { items: Dataset[]; selectedId?: string; onSelect: (dataset: Dataset) => void }) {
+  return <>{items.map((dataset) => (
+    <button className={`data-row dataset-grid ${selectedId === dataset.id ? "selected" : ""}`} key={dataset.id} onClick={() => onSelect(dataset)}>
+      <span className="dataset-name"><Database size={17} /><span><strong>{dataset.schema_name}.{dataset.table_name}{dataset.queryable === false && <span className="tag profile-only" title="Profiled only: stage this file (Files) before SQL can query it">profile only</span>}</strong><small>{dataset.source?.name || dataset.source_name} / {connectorLabels[dataset.source?.connector_type || ""] || dataset.source?.connector_type || "registered source"}</small></span></span>
+      <span className="mono">{dataset.row_count?.toLocaleString() || "-"}</span>
+      <span className="tag-list"><span className="tag">{dataset.category}</span>{dataset.tags.slice(0, 2).map((tag) => <span className="tag" key={tag}>{tag}</span>)}</span>
+      <ChevronRight size={16} />
+    </button>
+  ))}</>;
+}
+
+/** One collapsible group's own server-side page of datasets. */
+function DatasetGroupRows({ params, selectedId, onSelect }: { params: PageParams; selectedId?: string; onSelect: (dataset: Dataset) => void }) {
+  const pagination = usePagination(params, 25);
+  const page = usePagedQuery<Dataset>(scopes.datasets, "/datasets", params, pagination);
+  const items = page.data?.items ?? NO_DATASETS;
+  if (!items.length) return page.isPending ? <LoadingBlock label="Loading datasets" /> : <div className="list-empty">No datasets in this group.</div>;
+  return <><DatasetRowList items={items} selectedId={selectedId} onSelect={onSelect} /><Pagination state={pagination} total={page.data?.total ?? 0} count={items.length} busy={page.isFetching} label="datasets" compact /></>;
+}
+
+export function DatasetsView({ onOpenSQL, onStartAnalysis, notify, initialAssetId }: { onOpenSQL: (dataset: Dataset) => void; onStartAnalysis?: (dataset: Dataset) => void; notify?: (message: string, tone?: "ok" | "error") => void; initialAssetId?: string | null }) {
   const invalidate = useInvalidate();
   const [query, setQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = datasets.find((item) => item.id === selectedId) || datasets[0] || null;
+  const [groupBy, setGroupBy] = useState<DatasetGroupBy>("none");
+  const search = useDebouncedValue(query.trim());
+  const filters: PageParams = { q: search, source: sourceFilter === "all" ? "" : sourceFilter, category: categoryFilter === "all" ? "" : categoryFilter };
+  const pagination = usePagination(filters, 50);
+  const datasetsQuery = usePagedQuery<Dataset>(scopes.datasets, "/datasets", filters, pagination, { enabled: groupBy === "none" });
+  const datasets = datasetsQuery.data?.items ?? NO_DATASETS;
+  // Unfiltered facets feed the filter menus; filtered ones drive the grouped view.
+  const catalogFacets = useFacets<DatasetFacets>(scopes.datasets, "/datasets/facets");
+  const groupFacets = useFacets<DatasetFacets>(scopes.datasets, groupBy === "none" ? null : "/datasets/facets", filters);
+  useQueryErrorToast(datasetsQuery.error || catalogFacets.error, notify, "Datasets could not be loaded");
+  const [selectedId, setSelectedId] = useState<string | null>(initialAssetId || null);
+  useEffect(() => { if (initialAssetId) setSelectedId(initialAssetId); }, [initialAssetId]);
+  const [picked, setPicked] = useState<Dataset | null>(null);
+  const selectedQuery = useProjectQuery<Dataset[]>([...scopes.datasets, "one", selectedId], selectedId ? withParams("/datasets", { id: selectedId }) : null);
+  const selected = (selectedId ? selectedQuery.data?.[0] || (picked?.id === selectedId ? picked : null) : groupBy === "none" ? datasets[0] : null) || null;
+  const selectDataset = (dataset: Dataset) => { setPicked(dataset); setSelectedId(dataset.id); };
+  const catalogTotal = catalogFacets.data?.total ?? 0;
   const [editing, setEditing] = useState(false);
   const [editDescription, setEditDescription] = useState("");
   const [editTags, setEditTags] = useState("");
@@ -124,7 +158,14 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
     link.click();
     URL.revokeObjectURL(url);
   };
-  const exportCatalogCsv = () => {
+  const exportCatalogCsv = async () => {
+    let datasets: Dataset[];
+    try {
+      datasets = await api<Dataset[]>("/datasets");
+    } catch (error) {
+      notify?.(error instanceof ApiError ? error.message : "Could not export the catalog", "error");
+      return;
+    }
     const header = ["schema", "table", "column", "type", "business_name", "description", "tags", "owner", "sensitivity", "metadata_status"];
     const rows = datasets.flatMap((dataset) =>
       (dataset.columns.length ? dataset.columns : [{ name: "", type: "", business_name: "", description: "" }]).map((column) => [
@@ -172,15 +213,9 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
       setImporting(false);
     }
   };
-  const sources = Array.from(new Set(datasets.map((dataset) => dataset.source?.name || dataset.source_name))).sort();
-  const categories = Array.from(new Set(datasets.map((dataset) => dataset.category))).sort();
-  const filtered = datasets.filter((dataset) => {
-    const sourceName = dataset.source?.name || dataset.source_name;
-    const matchesText = `${dataset.schema_name}.${dataset.table_name} ${dataset.description} ${sourceName} ${dataset.category}`.toLowerCase().includes(query.toLowerCase());
-    const matchesSource = sourceFilter === "all" || sourceName === sourceFilter;
-    const matchesCategory = categoryFilter === "all" || dataset.category === categoryFilter;
-    return matchesText && matchesSource && matchesCategory;
-  });
+  const sources = (catalogFacets.data?.source ?? []).map((facet) => facet.value).sort();
+  const categories = (catalogFacets.data?.category ?? []).map((facet) => facet.value).sort();
+  const groups = groupBy === "none" ? [] : groupFacets.data?.[groupBy] ?? [];
   return (
     <div className="view-stack">
       <div className="view-header">
@@ -191,21 +226,23 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
           <div className="toolbar-search"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter datasets" /></div>
           <input ref={importInputRef} type="file" accept=".csv" hidden onChange={handleImportFile} />
           <button className="secondary-button" title="Import a schema_name,table_name,column_name catalog CSV without a live connection" disabled={importing} onClick={() => importInputRef.current?.click()}><FileUp size={16} />{importing ? "Importing…" : "Import catalog CSV"}</button>
-          <button className="secondary-button" title="Export the full catalog as CSV, one row per column" onClick={exportCatalogCsv} disabled={!datasets.length}><Download size={16} />Export CSV</button>
-          <button className="secondary-button" title="Export the full catalog as a Frictionless Data Package (JSON)" onClick={exportDataPackage} disabled={!datasets.length}><Download size={16} />Export data package</button>
+          <button className="secondary-button" title="Export the full catalog as CSV, one row per column" onClick={() => void exportCatalogCsv()} disabled={!catalogTotal}><Download size={16} />Export CSV</button>
+          <button className="secondary-button" title="Export the full catalog as a Frictionless Data Package (JSON)" onClick={exportDataPackage} disabled={!catalogTotal}><Download size={16} />Export data package</button>
         </div>
       </div>
       <div className="dataset-layout">
         <section className="surface dataset-list">
+          <div className="list-toolbar"><GroupBySelect value={groupBy} onChange={(value) => { if (!selectedId && selected) selectDataset(selected); setGroupBy(value); }} options={[{ value: "none", label: "None" }, { value: "source", label: "Source" }, { value: "category", label: "Category" }, { value: "schema", label: "Schema" }]} />{groupBy !== "none" && groupFacets.data && <small>{groups.length} group{groups.length === 1 ? "" : "s"} · {groupFacets.data.total.toLocaleString()} datasets</small>}</div>
           <div className="table-header dataset-grid"><span>Dataset</span><span>Rows</span><span>Category</span><span /></div>
-          {filtered.map((dataset) => (
-            <button className={`data-row dataset-grid ${selected?.id === dataset.id ? "selected" : ""}`} key={dataset.id} onClick={() => setSelectedId(dataset.id)}>
-              <span className="dataset-name"><Database size={17} /><span><strong>{dataset.schema_name}.{dataset.table_name}{dataset.queryable === false && <span className="tag profile-only" title="Profiled only: stage this file (Files) before SQL can query it">profile only</span>}</strong><small>{dataset.source?.name || dataset.source_name} / {connectorLabels[dataset.source?.connector_type || ""] || dataset.source?.connector_type || "registered source"}</small></span></span>
-              <span className="mono">{dataset.row_count?.toLocaleString() || "-"}</span>
-              <span className="tag-list"><span className="tag">{dataset.category}</span>{dataset.tags.slice(0, 2).map((tag) => <span className="tag" key={tag}>{tag}</span>)}</span>
-              <ChevronRight size={16} />
-            </button>
-          ))}
+          {groupBy === "none" ? <>
+            <DatasetRowList items={datasets} selectedId={selected?.id} onSelect={selectDataset} />
+            {!datasets.length && !datasetsQuery.isPending && <div className="list-empty">{search || sourceFilter !== "all" || categoryFilter !== "all" ? "No datasets match these filters." : "No datasets are catalogued in this project yet."}</div>}
+            <Pagination state={pagination} total={datasetsQuery.data?.total ?? 0} count={datasets.length} busy={datasetsQuery.isFetching} label="datasets" />
+          </> : !groupFacets.data ? <LoadingBlock label="Grouping datasets" /> : groups.length ? groups.map((facet) => (
+            <CollapsibleGroup key={`${groupBy}-${facet.value}`} title={facet.value} count={facet.count} defaultOpen={groups.length === 1}>
+              <DatasetGroupRows params={{ ...filters, [groupBy]: facet.value }} selectedId={selected?.id} onSelect={selectDataset} />
+            </CollapsibleGroup>
+          )) : <div className="list-empty">No datasets match these filters.</div>}
         </section>
         <aside className="surface detail-panel">
           {selected ? (
@@ -226,7 +263,7 @@ export function DatasetsView({ onOpenSQL, onStartAnalysis, notify }: { onOpenSQL
               <button className="secondary-button wide" onClick={() => onStartAnalysis?.(selected)}><MessageSquare size={17} />Start analysis</button>
               <button className="secondary-button wide" onClick={() => onOpenSQL(selected)}><Code2 size={17} />Open in SQL workspace</button>
             </>
-          ) : datasetsQuery.isPending ? <LoadingBlock label="Loading catalog" /> : <div className="inline-empty">No datasets are catalogued in this project yet.</div>}
+          ) : (selectedId && selectedQuery.isPending) || (groupBy === "none" && datasetsQuery.isPending) ? <LoadingBlock label="Loading catalog" /> : <div className="inline-empty">{groupBy === "none" && !catalogTotal ? "No datasets are catalogued in this project yet." : "Select a dataset to see its metadata."}</div>}
         </aside>
       </div>
       {editing && selected && (

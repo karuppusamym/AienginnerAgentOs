@@ -91,6 +91,8 @@ class Project(Base):
     default_model_provider_id: Mapped[str | None] = mapped_column(
         ForeignKey("model_providers.id"), nullable=True
     )
+    # Per-project switches, e.g. {"auto_approval": {"enabled": true}}; absent keys mean defaults.
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -782,8 +784,12 @@ class ExternalInvocation(Base):
     external_client_id: Mapped[str] = mapped_column(ForeignKey("external_clients.id"), index=True)
     query_tool_id: Mapped[str] = mapped_column(ForeignKey("query_tools.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="running")
+    # "rest" (/external/v1/.../invoke) or "mcp" (tools/call); Alembic 0007.
+    channel: Mapped[str] = mapped_column(String(16), default="rest", server_default="rest")
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Denormalised from result_metadata so history summaries can SUM it in SQL (Alembic 0007).
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

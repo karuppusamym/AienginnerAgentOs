@@ -25,6 +25,22 @@ import httpx
 
 DEFAULT_URL = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_MODEL = "typesafe/jev-1.13"  # pinned: aliases such as ~typesafe/jev-latest can shift verdicts
+CONNECT_TIMEOUT_SECONDS = 10.0
+
+_client: httpx.Client | None = None
+
+
+def _post(url: str, json: dict[str, Any], headers: dict[str, str], timeout: float) -> httpx.Response:
+    """POST through a pooled client: a fresh TLS handshake per call was the slow (and timing-out) part."""
+    global _client
+    if _client is None:
+        _client = httpx.Client(limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120))
+    request_timeout = httpx.Timeout(timeout, connect=max(timeout, CONNECT_TIMEOUT_SECONDS))
+    try:
+        return _client.post(url, json=json, headers=headers, timeout=request_timeout)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # Nothing reached the server, so one retry cannot double-execute anything.
+        return _client.post(url, json=json, headers=headers, timeout=request_timeout)
 
 
 def _endpoint(provider: Any | None) -> tuple[str, str | None, str]:
@@ -53,7 +69,7 @@ def ask(provider: Any | None, state: dict[str, Any], questions: dict[str, Any], 
         result["error"] = "No API key for the Jev decision model (OPENROUTER_API_KEY or the provider secret)"
         return result
     try:
-        response = httpx.post(
+        response = _post(
             url,
             json={"model": model, "state": state, "questions": questions},
             headers={"Authorization": f"Bearer {key}"},
@@ -132,24 +148,34 @@ def pick_candidate(db: Any, provider: Any | None, question: str, candidates: lis
     return {"by": "jev", "model": result["model"], "choice": answer["choice"], "probabilities": answer.get("probabilities") or {}, "latency_ms": result["latency_ms"], "cost_usd": result["cost_usd"]}
 
 
-def choose_tools(db: Any, provider: Any | None, step_action: str, objective: str, options: dict[str, str], project_id: str | None = None, user_id: str | None = None) -> dict[str, Any] | None:
+def choose_tools(db: Any, provider: Any | None, step_action: str, objective: str, options: dict[str, str], project_id: str | None = None, user_id: str | None = None, timeout: float | None = None) -> dict[str, Any] | None:
     """Which of an agent's eligible tools fits this plan step? Uses the step text and registry descriptions only."""
+    verdict, _ = choose_tools_with_error(db, provider, step_action, objective, options, project_id, user_id, timeout)
+    return verdict
+
+
+def choose_tools_with_error(db: Any, provider: Any | None, step_action: str, objective: str, options: dict[str, str], project_id: str | None = None, user_id: str | None = None, timeout: float | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """``choose_tools`` plus the reason when there is no verdict, so callers can show it instead of a bare dash."""
     if len(options) < 2:
-        return None
+        return None, "Fewer than two tools to choose between"
     result = ask(provider, {"step": step_action[:1_500], "objective": objective[:1_500]}, {
         "tool": {
             "type": "choice",
             "instructions": "Which tool should the agent call to carry out `step` (part of `objective`)? Pick the tool whose description fits the step best.",
             "criteria": {name[:80]: description[:400] for name, description in options.items()},
         },
-    })
+    }, timeout=timeout)
     log_call(db, provider, "tool_selection", result, project_id, user_id)
+    if not result["ok"]:
+        return None, result.get("error") or "Decision model call failed"
     answer = result["answers"].get("tool") or {}
     probabilities = answer.get("probabilities")
-    if not result["ok"] or not isinstance(probabilities, dict):
-        return None
+    if not isinstance(probabilities, dict):
+        return None, "Response had no tool probabilities"
     try:
         cleaned = {str(name): float(value) for name, value in probabilities.items() if name in options}
     except (TypeError, ValueError):
-        return None
-    return {"by": "jev", "model": result["model"], "probabilities": cleaned, "latency_ms": result["latency_ms"], "cost_usd": result["cost_usd"]} if cleaned else None
+        return None, "Response probabilities were not numeric"
+    if not cleaned:
+        return None, "Response named none of the offered tools"
+    return {"by": "jev", "model": result["model"], "probabilities": cleaned, "latency_ms": result["latency_ms"], "cost_usd": result["cost_usd"]}, None

@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from .. import core as main
 from ..core import (
@@ -197,9 +199,14 @@ router = APIRouter()
 
 
 @router.get("/pipelines")
-def list_pipelines(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_pipelines(response: Response, page: Page = Depends(page_params), q: str = Query(default="", max_length=200), status: str = Query(default="", max_length=32), user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    pipelines = db.scalars(select(PipelineDefinition).where(PipelineDefinition.project_id == project.id, PipelineDefinition.status != "deleted").order_by(PipelineDefinition.updated_at.desc())).all()
+    statement = select(PipelineDefinition).where(PipelineDefinition.project_id == project.id, PipelineDefinition.status != "deleted")
+    if status:
+        statement = statement.where(PipelineDefinition.status == status)
+    if q.strip():
+        statement = statement.where(func.lower(PipelineDefinition.name).like(contains(q), escape="\\") | func.lower(PipelineDefinition.objective).like(contains(q), escape="\\"))
+    pipelines = paginate_query(db, statement.order_by(PipelineDefinition.updated_at.desc()), response, page)
     return [pipeline_output(item, db) for item in pipelines]
 
 @router.post("/pipelines/generate", status_code=201)

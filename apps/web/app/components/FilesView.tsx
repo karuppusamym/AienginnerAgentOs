@@ -5,6 +5,7 @@ import {
   FileSpreadsheet,
   FileUp,
   RefreshCw,
+  Search,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api, SessionUser } from "../lib/api";
@@ -14,11 +15,20 @@ import type {
   LoadMode,
   IngestionMapping,
 } from "../types";
-import { StatusPill, EmptyState } from "./shared";
+import { scopes, useDebouncedValue, useInvalidate, usePagedQuery, usePagination, useQueryErrorToast } from "../lib/queries";
+import { StatusPill, EmptyState, LoadingBlock, Pagination } from "./shared";
+
+const NO_FILES: IngestedFile[] = [];
 
 
 export function FilesView({ notify, currentUser }: { notify: (message: string, tone?: "ok" | "error") => void; currentUser: SessionUser }) {
-  const [files, setFiles] = useState<IngestedFile[]>([]);
+  const [search, setSearch] = useState("");
+  const q = useDebouncedValue(search.trim());
+  const pagination = usePagination(q, 25);
+  const filesQuery = usePagedQuery<IngestedFile>(scopes.files, "/files", { q }, pagination, { staleTime: 0 });
+  useQueryErrorToast(filesQuery.error, notify, "Files could not be loaded");
+  const files = filesQuery.data?.items ?? NO_FILES;
+  const invalidate = useInvalidate();
   const [selected, setSelected] = useState<IngestedFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [staging, setStaging] = useState(false);
@@ -27,8 +37,7 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
   const [loadMode, setLoadMode] = useState<LoadMode>("versioned");
   const [keyColumn, setKeyColumn] = useState("");
   
-  const load = useCallback(() => api<IngestedFile[]>("/files").then((fileData) => setFiles(fileData)), []);
-  useEffect(() => { load(); }, [load]);
+  const load = useCallback(() => invalidate(scopes.files), [invalidate]);
   useEffect(() => {
     if (!selected || selected.profile.kind !== "structured") {
       setMappingColumns([]);
@@ -114,9 +123,9 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
 
       <div className="two-column file-columns">
         <section className="surface">
-          <div className="section-heading compact"><div><span className="eyebrow">INGESTED FILES</span><h3>Recent uploads</h3></div></div>
+          <div className="section-heading compact"><div><span className="eyebrow">INGESTED FILES</span><h3>Recent uploads</h3></div><div className="toolbar-search"><Search size={14} /><input placeholder="Search files..." value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Search files" /></div></div>
           {files.length === 0 ? (
-            <EmptyState icon={<FileSpreadsheet size={24} />} title="No local files yet" body="Upload CSV, Excel, Parquet, JSON, or PDF to create a profile." />
+            filesQuery.isPending ? <LoadingBlock label="Loading files" /> : q ? <EmptyState icon={<Search size={24} />} title="No matching files" body="Try a different file name." /> : <EmptyState icon={<FileSpreadsheet size={24} />} title="No local files yet" body="Upload CSV, Excel, Parquet, JSON, or PDF to create a profile." />
           ) : (
             <div className="file-list">
               {files.map((file) => (
@@ -129,6 +138,7 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
               ))}
             </div>
           )}
+          <Pagination state={pagination} total={filesQuery.data?.total ?? 0} count={files.length} busy={filesQuery.isFetching} label="files" />
         </section>
         <section className="surface profile-panel">
           {selected ? (

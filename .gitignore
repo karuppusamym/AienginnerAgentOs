@@ -10,3 +10,7 @@ apps/web/node_modules/
 apps/web/.wrangler/
 apps/web/.open-next/
 tmp/
+# External-agent demo: client token and the isolated ADK virtualenv
+scripts/external_agent/.client.env
+scripts/external_agent/.venv/
+scripts/external_agent/adk_agent/.env

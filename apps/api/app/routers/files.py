@@ -118,7 +118,9 @@ from ..extraction_runtime import run_external_extraction_now
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_external_extraction_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from .. import core as main
 from ..core import (
@@ -201,12 +203,19 @@ router = APIRouter()
 
 @router.get("/files")
 def list_files(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    status: str = Query(default="", max_length=32),
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    files = db.scalars(
-        select(IngestedFile).where(IngestedFile.project_id == project.id).order_by(IngestedFile.created_at.desc())
-    ).all()
+    statement = select(IngestedFile).where(IngestedFile.project_id == project.id)
+    if status:
+        statement = statement.where(IngestedFile.status == status)
+    if q.strip():
+        statement = statement.where(func.lower(IngestedFile.filename).like(contains(q), escape="\\"))
+    files = paginate_query(db, statement.order_by(IngestedFile.created_at.desc()), response, page)
     return [
         as_dict(
             item,

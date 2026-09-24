@@ -474,6 +474,12 @@ def _row_widths(row: list[dict[str, Any]]) -> list[int]:
     return [6, 6]
 
 
+# Superset grid units are 8px and include the chart header; 20 (160px) left bar charts with
+# overlapping y-axis ticks. 50 is Superset's own default for a new chart.
+DEFAULT_CHART_HEIGHT = 50
+CHART_HEIGHTS = {"big_number_total": 50, "table": 64}
+
+
 def _dashboard_positions(charts: list[dict[str, Any]]) -> dict[str, Any]:
     root = "ROOT_ID"
     grid = "GRID_ID"
@@ -499,7 +505,7 @@ def _dashboard_positions(charts: list[dict[str, Any]]) -> dict[str, Any]:
             "parents": [root, grid],
         }
         for chart, width in zip(row, _row_widths(row), strict=False):
-            height = 30 if chart["kind"] == "table" else 20
+            height = CHART_HEIGHTS.get(chart["kind"], DEFAULT_CHART_HEIGHT)
             positions[f"CHART-{chart['id']}"] = {
                 "id": f"CHART-{chart['id']}",
                 "type": "CHART",

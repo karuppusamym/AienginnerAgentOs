@@ -5,6 +5,8 @@ the Jev decision model makes each choice. It also shows how to demo that live an
 every improvement. Code references are relative to `apps/api/app/`.
 
 - **Live proof:** [`demo/`](demo/) holds the latest report from `scripts/demo_jev_agents.py`.
+- **External agents:** [section 6](#6-demo-an-external-agent-on-the-tool-registry-with-qaqc) and the
+  runbook in [`scripts/external_agent/`](../scripts/external_agent/README.md).
 - **Related:** [Learning loop](LEARNING_LOOP.md), [Analytics embedding](ANALYTICS_EMBEDDING.md),
   [Architecture review](ARCHITECTURE_REVIEW_2026-09.md).
 
@@ -182,3 +184,28 @@ full backend suite passes (211 passed, 1 skipped).
 - MCP streamable HTTP (GET/SSE).
 - A timed-out built-in tool's thread is stopped only at the database level, then left to finish on its own.
 - `AgentVersion.input_schema` and `config` are not used at run time.
+
+## 6. Demo: an external agent on the tool registry, with QA/QC
+
+Runbook: [`scripts/external_agent/README.md`](../scripts/external_agent/README.md).
+
+An agent built outside DataPilot needs only the `/mcp` URL and a client token. It discovers the
+published tools it was granted (`tools/list`), lets its LLM choose tools and arguments from their
+JSON schemas, and runs them (`tools/call`). Every call passes the gateway controls in section 5:
+scopes, expiry, grants, quotas, rate limit, argument validation, read-only SQL and PII masking.
+Each call also lands in the external-invocation history and the audit log.
+
+| Piece | What it shows |
+|---|---|
+| `setup_demo_gateway.py` | The tool lifecycle through the public API (draft, then test/`tested`, then publish, plus approvals), an external client, grants with daily quotas |
+| `mcp_agent.py` | A plain-Python MCP client (`httpx` only) with an LLM planner and composer. The answer cites tools and invocation ids |
+| `qc_agent.py` + `qc_rules.json` | QA/QC by going back to the data: grounding of each figure, re-derivation through a differently shaped tool (aggregate ↔ detail), and reproduction. `--inject-error` shows a FAIL |
+| `golden_set.json` | Golden questions scored end to end: answer accuracy, tool-choice accuracy, QC pass rate |
+| `adk_agent/` | Google ADK agent with DataPilot attached as an `McpToolset` (Gemini) |
+| `watch_invocations.py` | The DataPilot side: calls arriving live |
+
+**MCP compatibility.** The official MCP Python SDK (used by ADK's `McpToolset`) works unchanged
+with DataPilot's POST-only `/mcp`. The SDK accepts `application/json` responses. It opens no GET
+stream, because DataPilot issues no `Mcp-Session-Id`. So the missing GET/SSE support (under
+"Still open by design" above) does not block standard MCP clients.
+

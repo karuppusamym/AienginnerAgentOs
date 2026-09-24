@@ -121,6 +121,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from ..governance import record_governance_event
+from ..pagination import Page, contains, facet_counts, page_params, paginate_items, paginate_query
 from ..schemas import ExternalClientRotate
 from ..services.query_tools import enforce_external_rate_limit
 
@@ -354,11 +355,49 @@ def rotate_external_client(client_id: str, payload: ExternalClientRotate | None 
     db.commit()
     return {**_external_client_view(client), "token": f"{client.client_id}.{secret}"}
 
+def _registry_tools(db: Session, project_id: str, q: str, data_source: str, line_of_business: str, status: str) -> list[QueryTool]:
+    """Admin registry filters: text search as in external discovery; source/LOB/status match exactly (grouped views)."""
+    statement = select(QueryTool).where(QueryTool.project_id == project_id)
+    if status:
+        statement = statement.where(QueryTool.status == status)
+    tools = _filter_registry_tools(db.scalars(statement.order_by(QueryTool.updated_at.desc())).all(), q)
+    return [
+        tool for tool in tools
+        if (not data_source or ((tool.data_source or "").strip() or "Unassigned") == data_source)
+        and (not line_of_business or ((tool.line_of_business or "").strip() or "Unassigned") == line_of_business)
+    ]
+
+
 @router.get("/query-tools")
-def list_query_tools(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_query_tools(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    data_source: str = Query(default="", max_length=160),
+    line_of_business: str = Query(default="", max_length=160),
+    status: str = Query(default="", max_length=32),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    tools = db.scalars(select(QueryTool).where(QueryTool.project_id == project.id).order_by(QueryTool.updated_at.desc())).all()
-    return [query_tool_output(tool) for tool in tools]
+    tools = _registry_tools(db, project.id, q, data_source, line_of_business, status)
+    return [query_tool_output(tool) for tool in paginate_items(tools, response, page)]
+
+
+@router.get("/query-tools/facets")
+def query_tool_facets(
+    q: str = Query(default="", max_length=200),
+    status: str = Query(default="", max_length=32),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Tool counts per data source, line of business and status (drives the grouped registry)."""
+    project = require_current_project(db, user)
+    tools = _registry_tools(db, project.id, q, "", "", status)
+    return {
+        "total": len(tools),
+        "data_source": facet_counts(tool.data_source for tool in tools),
+        "line_of_business": facet_counts(tool.line_of_business for tool in tools),
+        "status": facet_counts(tool.status for tool in tools),
+    }
 
 @router.get("/query-tools/summary")
 def query_tool_registry_summary(
@@ -537,11 +576,155 @@ def retire_query_tool(tool_id: str, admin: User = Depends(require_admin), db: Se
     db.commit()
     return query_tool_output(tool)
 
+_SECRET_PARAMETER = re.compile(r"password|passwd|secret|token|api[_-]?key|credential|authorization|(^|_)ssn($|_)|card_?number|cvv", re.I)
+_PARAMETER_PREVIEW_CHARS = 200
+
+
+def _redacted_parameters(value: Any, key: str = "") -> Any:
+    """Parameters as shown in history: secret-looking keys masked, long values clipped."""
+    if key and _SECRET_PARAMETER.search(key):
+        return "***"
+    if isinstance(value, dict):
+        return {str(name): _redacted_parameters(item, str(name)) for name, item in list(value.items())[:50]}
+    if isinstance(value, list):
+        return [_redacted_parameters(item) for item in value[:20]] + (["…"] if len(value) > 20 else [])
+    if isinstance(value, str) and len(value) > _PARAMETER_PREVIEW_CHARS:
+        return value[:_PARAMETER_PREVIEW_CHARS] + "…"
+    return value
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    if moment is None:
+        return None
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+
+
+def _invocation_output(item: ExternalInvocation, clients: dict[str, ExternalClient], tools: dict[str, QueryTool]) -> dict[str, Any]:
+    client = clients.get(item.external_client_id)
+    tool = tools.get(item.query_tool_id)
+    metadata = item.result_metadata or {}
+    return {
+        **as_dict(item, ["id", "project_id", "external_client_id", "query_tool_id", "status", "result_metadata", "error", "duration_ms", "created_at"]),
+        "channel": item.channel or "rest",
+        "parameters": _redacted_parameters(item.parameters or {}),
+        "row_count": item.row_count if item.row_count is not None else metadata.get("row_count"),
+        "client_name": client.name if client else "Unknown client",
+        "client_id": client.client_id if client else None,
+        "tool_name": tool.name if tool else "Deleted tool",
+    }
+
+
+def _invocation_lookups(db: Session, items: list[ExternalInvocation]) -> tuple[dict[str, ExternalClient], dict[str, QueryTool]]:
+    client_ids = {item.external_client_id for item in items}
+    tool_ids = {item.query_tool_id for item in items}
+    clients = {client.id: client for client in db.scalars(select(ExternalClient).where(ExternalClient.id.in_(client_ids))).all()} if client_ids else {}
+    tools = {tool.id: tool for tool in db.scalars(select(QueryTool).where(QueryTool.id.in_(tool_ids))).all()} if tool_ids else {}
+    return clients, tools
+
+
 @router.get("/external-invocations")
-def list_external_invocations(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_external_invocations(
+    response: Response,
+    page: Page = Depends(page_params),
+    client_id: str = Query(default="", max_length=36),
+    tool_id: str = Query(default="", max_length=36),
+    tool: str = Query(default="", max_length=160),
+    status: str = Query(default="", max_length=32),
+    channel: str = Query(default="", max_length=16),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Gateway call history, newest first. ``client_id``/``tool_id`` are row ids; ``tool`` matches the tool name."""
     project = require_current_project(db, admin)
-    invocations = db.scalars(select(ExternalInvocation).where(ExternalInvocation.project_id == project.id).order_by(ExternalInvocation.created_at.desc()).limit(200)).all()
-    return [as_dict(item, ["id", "project_id", "external_client_id", "query_tool_id", "status", "parameters", "result_metadata", "error", "duration_ms", "created_at"]) for item in invocations]
+    statement = select(ExternalInvocation).where(ExternalInvocation.project_id == project.id)
+    if client_id:
+        statement = statement.where(ExternalInvocation.external_client_id == client_id)
+    if tool_id:
+        statement = statement.where(ExternalInvocation.query_tool_id == tool_id)
+    if tool.strip():
+        named = select(QueryTool.id).where(QueryTool.project_id == project.id, func.lower(QueryTool.name).like(contains(tool), escape="\\"))
+        statement = statement.where(ExternalInvocation.query_tool_id.in_(named))
+    if status:
+        statement = statement.where(ExternalInvocation.status == status)
+    if channel:
+        statement = statement.where(ExternalInvocation.channel == channel)
+    if since is not None:
+        statement = statement.where(ExternalInvocation.created_at >= _aware(since))
+    if until is not None:
+        statement = statement.where(ExternalInvocation.created_at < _aware(until))
+    items = list(paginate_query(db, statement.order_by(ExternalInvocation.created_at.desc()), response, page, default_limit=200))
+    clients, tools = _invocation_lookups(db, items)
+    return [_invocation_output(item, clients, tools) for item in items]
+
+
+def _invocation_window(db: Session, project_id: str, since: datetime, clients: dict[str, ExternalClient], tools: dict[str, QueryTool]) -> dict[str, Any]:
+    rows = db.execute(
+        select(
+            ExternalInvocation.external_client_id, ExternalInvocation.query_tool_id, ExternalInvocation.status, ExternalInvocation.channel,
+            func.count(), func.sum(ExternalInvocation.duration_ms), func.count(ExternalInvocation.duration_ms), func.sum(ExternalInvocation.row_count),
+        )
+        .where(ExternalInvocation.project_id == project_id, ExternalInvocation.created_at >= since)
+        .group_by(ExternalInvocation.external_client_id, ExternalInvocation.query_tool_id, ExternalInvocation.status, ExternalInvocation.channel)
+    ).all()
+    total = sum(row[4] for row in rows)
+    succeeded = sum(row[4] for row in rows if row[2] == "succeeded")
+    failed = sum(row[4] for row in rows if row[2] == "failed")
+    timed = sum(row[6] or 0 for row in rows)
+
+    def breakdown(index: int, label: Any) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            bucket = buckets.setdefault(row[index] or "", {"id": row[index], "name": label(row[index]), "count": 0, "failed": 0})
+            bucket["count"] += row[4]
+            bucket["failed"] += row[4] if row[2] == "failed" else 0
+        return sorted(buckets.values(), key=lambda item: (-item["count"], str(item["name"]).lower()))
+
+    return {
+        "since": since,
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "success_rate": round(100 * succeeded / total, 2) if total else None,
+        "avg_latency_ms": round(sum(row[5] or 0 for row in rows) / timed, 1) if timed else None,
+        "rows_returned": int(sum(row[7] or 0 for row in rows if row[2] == "succeeded")),
+        "by_client": breakdown(0, lambda key: clients[key].name if key in clients else "Unknown client"),
+        "by_tool": breakdown(1, lambda key: tools[key].name if key in tools else "Deleted tool"),
+        "by_status": breakdown(2, lambda key: key or "unknown"),
+        "by_channel": breakdown(3, lambda key: key or "rest"),
+    }
+
+
+@router.get("/external-invocations/summary")
+def external_invocation_summary(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Counts by client / tool / status / channel for the last 24 hours and 7 days."""
+    project = require_current_project(db, admin)
+    now = datetime.now(timezone.utc)
+    clients = {client.id: client for client in db.scalars(select(ExternalClient).where(ExternalClient.default_project_id == project.id)).all()}
+    tools = {tool.id: tool for tool in db.scalars(select(QueryTool).where(QueryTool.project_id == project.id)).all()}
+    return {
+        "generated_at": now,
+        "windows": {
+            "24h": _invocation_window(db, project.id, now - timedelta(hours=24), clients, tools),
+            "7d": _invocation_window(db, project.id, now - timedelta(days=7), clients, tools),
+        },
+    }
+
+
+@router.get("/external-invocations/{invocation_id}")
+def get_external_invocation(invocation_id: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = require_current_project(db, admin)
+    item = db.get(ExternalInvocation, invocation_id)
+    if item is None or item.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Invocation not found")
+    clients, tools = _invocation_lookups(db, [item])
+    tool = tools.get(item.query_tool_id)
+    client = clients.get(item.external_client_id)
+    return {
+        **_invocation_output(item, clients, tools),
+        "tool": {**_registry_metadata(tool), "id": tool.id, "name": tool.name, "status": tool.status, "row_limit": tool.row_limit} if tool else None,
+        "client": {"id": client.id, "name": client.name, "client_id": client.client_id, "active": client.active, "scopes": client.scopes} if client else None,
+    }
 
 @router.get("/external/v1/query-tools")
 def search_external_query_tools(
@@ -666,7 +849,7 @@ def _mcp_dispatch(message: Any, authorization: str | None, db: Session) -> dict[
             arguments = payload.params.get("arguments", {})
             if not isinstance(arguments, dict):
                 return _mcp_error(payload.id, -32602, "Invalid params: arguments must be an object")
-            invoked = _invoke_external_query_tool(db, client, tool, arguments)
+            invoked = _invoke_external_query_tool(db, client, tool, arguments, channel="mcp")
             result = {"content": [{"type": "text", "text": json.dumps(invoked, default=str)}], "structuredContent": invoked, "isError": False}
         else:
             return _mcp_error(payload.id, -32601, "Method not found")

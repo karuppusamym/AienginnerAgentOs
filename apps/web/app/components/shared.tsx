@@ -1,11 +1,14 @@
 import {
   AlertCircle,
+  ChevronDown,
+  ChevronLeft,
   ChevronRight,
   RefreshCw,
   X,
 } from "lucide-react";
 import { ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { statusTone } from "../lib/constants";
+import "./pagination.css";
 import type {
   SecurityCategoryKey,
   SecurityOverview,
@@ -379,6 +382,79 @@ export function EndpointUnavailable({ feature, endpoint }: { feature: string; en
     <div className="endpoint-unavailable" role="note">
       <AlertCircle size={16} />
       <span><strong>{feature} is not available from this API yet.</strong><small><code>{endpoint}</code> returned 404. The view will work once the API version that provides it is deployed.</small></span>
+    </div>
+  );
+}
+
+type PagerState = { offset: number; limit: number; setOffset: (offset: number) => void; setLimit: (limit: number) => void };
+
+/**
+ * Server-side pagination footer: "Showing 1–50 of 312", page size, prev/next.
+ * `total`/`count` come from the page (`X-Total-Count`, items returned).
+ */
+export function Pagination({ state, total, count, busy = false, label = "items", sizes = [25, 50, 100, 200], compact = false }: { state: PagerState; total: number; count: number; busy?: boolean; label?: string; sizes?: number[]; compact?: boolean }) {
+  const { offset, limit, setOffset, setLimit } = state;
+  if (!total && !offset) return null;
+  if (compact && total <= limit && !offset) return null;
+  const from = count ? offset + 1 : 0;
+  const to = offset + count;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const pageNumber = Math.floor(offset / limit) + 1;
+  return (
+    <nav className={`pager${compact ? " compact" : ""}`} aria-label={`${label} pages`}>
+      <span className="pager-summary" aria-live="polite">{busy && <RefreshCw size={12} className="spin" />}Showing <strong>{from.toLocaleString()}–{to.toLocaleString()}</strong> of <strong>{total.toLocaleString()}</strong> {label}</span>
+      <span className="pager-controls">
+        {!compact && <label className="pager-size">Per page<select value={limit} onChange={(event) => setLimit(Number(event.target.value))}>{Array.from(new Set([...sizes, limit])).sort((a, b) => a - b).map((size) => <option key={size} value={size}>{size}</option>)}</select></label>}
+        <button type="button" className="icon-button" aria-label="Previous page" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - limit))}><ChevronLeft size={15} /></button>
+        <span className="pager-page">{pageNumber} / {pages}</span>
+        <button type="button" className="icon-button" aria-label="Next page" disabled={to >= total} onClick={() => setOffset(offset + limit)}><ChevronRight size={15} /></button>
+      </span>
+    </nav>
+  );
+}
+
+/** "Group by" segmented control; the first option should be the ungrouped view. */
+export function GroupBySelect<T extends string>({ value, options, onChange, label = "Group by" }: { value: T; options: { value: T; label: string }[]; onChange: (value: T) => void; label?: string }) {
+  return (
+    <div className="group-by" role="group" aria-label={label}>
+      <span>{label}</span>
+      <div className="segmented">{options.map((option) => <button type="button" key={option.value} className={value === option.value ? "active" : ""} aria-pressed={value === option.value} onClick={() => onChange(option.value)}>{option.label}</button>)}</div>
+    </div>
+  );
+}
+
+/** Collapsible list group; children render (and so fetch) only while it is open. */
+export function CollapsibleGroup({ title, count, defaultOpen = false, children }: { title: ReactNode; count: number; defaultOpen?: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const bodyId = useId();
+  return (
+    <section className={`list-group${open ? " open" : ""}`}>
+      <button type="button" className="list-group-header" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
+        {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        <strong>{title}</strong>
+        <span className="list-group-count">{count.toLocaleString()}</span>
+      </button>
+      {open && <div id={bodyId} className="list-group-body">{children}</div>}
+    </section>
+  );
+}
+
+/** Right-hand detail drawer over the page (Esc / backdrop closes it). */
+export function Drawer({ title, subtitle, onClose, children }: { title: ReactNode; subtitle?: ReactNode; onClose: () => void; children: ReactNode }) {
+  const titleId = useId();
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape" && !modalStack.length) onCloseRef.current(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+  return (
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <div className="drawer-header"><div><h3 id={titleId}>{title}</h3>{subtitle && <small>{subtitle}</small>}</div><button type="button" className="icon-button" onClick={onClose} aria-label="Close" autoFocus><X size={18} /></button></div>
+        <div className="drawer-body">{children}</div>
+      </aside>
     </div>
   );
 }

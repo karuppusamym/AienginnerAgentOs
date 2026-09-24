@@ -115,7 +115,9 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+
+from ..pagination import Page, contains, page_params, paginate_query
 
 from .. import core as main
 from ..core import (
@@ -198,10 +200,19 @@ router = APIRouter()
 
 @router.get("/artifacts")
 def list_artifacts(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    artifact_type: str = Query(default="", max_length=64),
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    artifacts = db.scalars(select(Artifact).where(Artifact.project_id == project.id).order_by(Artifact.updated_at.desc())).all()
+    statement = select(Artifact).where(Artifact.project_id == project.id)
+    if artifact_type:
+        statement = statement.where(Artifact.artifact_type == artifact_type)
+    if q.strip():
+        statement = statement.where(func.lower(Artifact.name).like(contains(q), escape="\\") | func.lower(Artifact.artifact_type).like(contains(q), escape="\\"))
+    artifacts = paginate_query(db, statement.order_by(Artifact.updated_at.desc()), response, page)
     output = []
     for artifact in artifacts:
         latest = db.scalar(

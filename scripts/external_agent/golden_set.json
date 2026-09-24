@@ -1,0 +1,47 @@
+{
+  "_about": "Golden questions for the external agent. 'value' + 'tolerance' (absolute) is matched against the agent's key_figures; 'text_contains' against the answer text (case-insensitive). 'expect_tools_any' scores tool choice. Expected values were read from the demo data on 2026-09-24; update them if the demo data is re-seeded.",
+  "cases": [
+    {
+      "id": "deposits-total",
+      "question": "What is the total amount of deposit transactions?",
+      "expect": {"value": 12920.5, "tolerance": 0.01},
+      "expect_tools_any": ["banking.txn_totals_by_type", "banking.txns_by_type"]
+    },
+    {
+      "id": "debit-count",
+      "question": "How many debit transactions are there?",
+      "expect": {"value": 3, "tolerance": 0},
+      "expect_tools_any": ["banking.txn_totals_by_type", "banking.txns_by_type"]
+    },
+    {
+      "id": "net-transactions",
+      "question": "What is the net total of all staged transactions across every type?",
+      "expect": {"value": 12377.54, "tolerance": 0.01},
+      "expect_tools_any": ["banking.txn_totals_by_type"]
+    },
+    {
+      "id": "settled-payments-total",
+      "question": "What is the total amount of settled payments?",
+      "expect": {"value": 13329.25, "tolerance": 0.01},
+      "expect_tools_any": ["commerce.payments_summary", "commerce.payments_by_status"]
+    },
+    {
+      "id": "pending-payments-count",
+      "question": "How many payments are still pending?",
+      "expect": {"value": 3, "tolerance": 0},
+      "expect_tools_any": ["commerce.payments_summary", "commerce.payments_by_status"]
+    },
+    {
+      "id": "customer-2-orders",
+      "question": "What is the total value of the orders placed by customer 2?",
+      "expect": {"value": 1890.5, "tolerance": 0.01},
+      "expect_tools_any": ["commerce.customer_orders"]
+    },
+    {
+      "id": "account-50122",
+      "question": "What type of account is 50122 and is it active?",
+      "expect": {"text_contains": ["savings", "active"]},
+      "expect_tools_any": ["banking.account_lookup"]
+    }
+  ]
+}
