@@ -4,6 +4,7 @@ import {
   Check,
   Download,
   FileCode2,
+  LocateFixed,
   Network,
   Plus,
   Search,
@@ -12,7 +13,11 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { drag as d3drag } from "d3-drag";
+import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type Simulation, type SimulationNodeDatum } from "d3-force";
+import { select } from "d3-selection";
+import { zoom as d3zoom, zoomIdentity, type ZoomTransform } from "d3-zoom";
 import { api } from "../lib/api";
 import type {
   Dataset,
@@ -56,91 +61,186 @@ type SemanticGraphData = { project_id: string; nodes: SemanticGraphNode[]; edges
 // -- this coloring is what makes that boundary visible instead of implicit.
 const GRAPH_GROUP_COLORS = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2", "#be185d", "#4d7c0f"];
 
+type SimNode = SemanticGraphNode & SimulationNodeDatum;
+type SimLink = { id: string; source: string | SimNode; target: string | SimNode; left_column: string; right_column: string; join_type: string; status: string; governed: boolean; cross_connector?: boolean };
+
+const resolvedNode = (value: string | SimNode): SimNode | null => (typeof value === "object" ? value : null);
+// A node's collision radius has to account for its label, not just the dot --
+// otherwise two nodes can sit far enough apart to not overlap themselves while
+// their labels (rendered outside the dot, in a direction the collision force
+// knows nothing about) still overlap each other. This is an approximation
+// (no DOM text measurement), not exact glyph metrics, but is generous enough
+// that residual label overlap becomes rare instead of the norm.
+const nodeCollisionRadius = (node: SimNode) => 12 + Math.min(node.relation.length, 26) * 2.7;
+
 export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const [graph, setGraph] = useState<SemanticGraphData | null>(null);
   const [includeInferred, setIncludeInferred] = useState(true);
   const [hovered, setHovered] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
-  const [zoom, setZoom] = useState(1);
+  const [, setRenderTick] = useState(0);
+  const bump = useCallback(() => setRenderTick((tick) => tick + 1), []);
   const svgRef = useRef<SVGSVGElement>(null);
+  const nodeElRefs = useRef(new Map<string, SVGGElement>());
+  const simulationRef = useRef<Simulation<SimNode, SimLink> | null>(null);
+  const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<SVGSVGElement, unknown>> | null>(null);
+  const zoomTransformRef = useRef<ZoomTransform>(zoomIdentity);
+  // Positions survive a graph reload (e.g. toggling "Show inferred") so the
+  // layout resumes from roughly where it settled instead of re-scattering
+  // from scratch every time the data refreshes.
+  const previousPositionsRef = useRef(new Map<string, { x: number; y: number; fx?: number | null; fy?: number | null }>());
   const load = useCallback(() => api<SemanticGraphData>(`/semantic/graph?include_inferred=${includeInferred}`).then(setGraph), [includeInferred]);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Relationship graph unavailable", "error")); }, [load, notify]);
 
-  const nodes = graph?.nodes || [];
-  // Fixed 900x460 overlapped every label once there were more than a
-  // handful of nodes: angular spacing per node shrank but the canvas and
-  // label offset never grew to compensate. Scale both with node count.
-  const radius = Math.max(160, Math.min(420, 90 + nodes.length * 9));
-  const height = radius * 2 + 180;
-  const width = height + 320;
-  const cx = width / 2, cy = height / 2;
-
-  // Cluster nodes by source group instead of scattering every asset from
-  // every connector around one flat ring: each group gets its own
-  // contiguous arc (sized to its member count) with a visible gap before
-  // the next group, so "these datasets share a source" reads at a glance
-  // without needing to hover every node.
-  const groupOrder: string[] = [];
-  const groupMembers = new Map<string, SemanticGraphNode[]>();
-  nodes.forEach((node) => {
-    if (!groupMembers.has(node.group)) { groupOrder.push(node.group); groupMembers.set(node.group, []); }
-    groupMembers.get(node.group)!.push(node);
-  });
-  // An MCP-backed connector's tools each land in their own `group` (see
-  // group_key() in routers/semantic.py -- MCP execution invokes exactly one
-  // tool per call, so two tools are never joinable even under the same
-  // connector), but a person reading the graph still thinks of them as "one
-  // source". Keep the fine-grained groups for arc/join boundaries, but sort
-  // so groups sharing a source_label sit next to each other on the ring,
-  // and color/legend by source_label so a 6-tool MCP toolbox reads as one
-  // color with six small arcs instead of six unrelated-looking colors.
-  const labelFirstIndex = new Map<string, number>();
-  groupOrder.forEach((group, index) => {
-    const label = groupMembers.get(group)![0].source_label;
-    if (!labelFirstIndex.has(label)) labelFirstIndex.set(label, index);
-  });
-  groupOrder.sort((a, b) => {
-    const la = labelFirstIndex.get(groupMembers.get(a)![0].source_label)!;
-    const lb = labelFirstIndex.get(groupMembers.get(b)![0].source_label)!;
-    return la !== lb ? la - lb : a.localeCompare(b);
-  });
-  const sourceLabelOrder: string[] = [];
-  groupOrder.forEach((group) => {
-    const label = groupMembers.get(group)![0].source_label;
-    if (!sourceLabelOrder.includes(label)) sourceLabelOrder.push(label);
-  });
-  const sourceColor = new Map<string, string>(sourceLabelOrder.map((label, index) => [label, GRAPH_GROUP_COLORS[index % GRAPH_GROUP_COLORS.length]]));
-  const groupColor = new Map<string, string>(groupOrder.map((group) => [group, sourceColor.get(groupMembers.get(group)![0].source_label)!]));
-  const gap = groupOrder.length > 1 ? 0.16 : 0;
-  const totalGap = gap * groupOrder.length;
-  const positions = new Map<string, { x: number; y: number }>();
-  // Labels sit at a fixed offset from their node, so two nodes placed close
-  // together on the ring (dense arcs, many groups) get labels that collide.
-  // Nodes are visited here in increasing angle order already (each group's
-  // arc starts where the previous one ended) -- track the last label placed
-  // per side and, once a new one would land within one line-height of it,
-  // push it out to the next offset step instead of always using 14px.
-  const OFFSET_STEPS = [14, 30, 46];
-  const labelOffsets = new Map<string, number>();
-  const lastBySide: Record<"left" | "right", { y: number; step: number } | null> = { left: null, right: null };
-  let cursor = -Math.PI / 2;
-  groupOrder.forEach((group) => {
-    const members = groupMembers.get(group)!;
-    const span = nodes.length <= 1 ? 0 : (2 * Math.PI - totalGap) * (members.length / nodes.length);
-    members.forEach((node, index) => {
-      const angle = members.length <= 1 ? cursor + span / 2 : cursor + (span * index) / (members.length - 1 || 1);
-      const x = cx + radius * Math.cos(angle);
-      const y = cy + radius * Math.sin(angle);
-      positions.set(node.id, { x, y });
-      const side: "left" | "right" = x >= cx ? "right" : "left";
-      const previous = lastBySide[side];
-      const step = previous && Math.abs(y - previous.y) < 13 ? (previous.step + 1) % OFFSET_STEPS.length : 0;
-      lastBySide[side] = { y, step };
-      labelOffsets.set(node.id, OFFSET_STEPS[step]);
+  // Cluster nodes by source group (colors/legend), and give each group an
+  // anchor point the force layout gently pulls its members toward -- this is
+  // what keeps "these datasets share a source" readable under real physics
+  // instead of everything settling into one undifferentiated blob.
+  const { nodes, links, groupOrder, groupMembers, sourceColor, groupColor, sourceLabelOrder, groupAnchors, width, height } = useMemo(() => {
+    const graphNodes = graph?.nodes || [];
+    const width = Math.max(760, 640 + graphNodes.length * 11);
+    const height = Math.max(520, 440 + graphNodes.length * 9);
+    const groupOrder: string[] = [];
+    const groupMembers = new Map<string, SemanticGraphNode[]>();
+    graphNodes.forEach((node) => {
+      if (!groupMembers.has(node.group)) { groupOrder.push(node.group); groupMembers.set(node.group, []); }
+      groupMembers.get(node.group)!.push(node);
     });
-    cursor += span + gap;
-  });
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    // An MCP-backed connector's tools each land in their own `group` (see
+    // group_key() in routers/semantic.py), but a person reading the graph
+    // still thinks of them as "one source" -- color/legend by source_label
+    // so a 6-tool MCP toolbox reads as one color, while each tool still gets
+    // its own anchor (arc placement stays per-group, non-joinable tools
+    // never get pulled into the same cluster).
+    const labelFirstIndex = new Map<string, number>();
+    groupOrder.forEach((group, index) => {
+      const label = groupMembers.get(group)![0].source_label;
+      if (!labelFirstIndex.has(label)) labelFirstIndex.set(label, index);
+    });
+    groupOrder.sort((a, b) => {
+      const la = labelFirstIndex.get(groupMembers.get(a)![0].source_label)!;
+      const lb = labelFirstIndex.get(groupMembers.get(b)![0].source_label)!;
+      return la !== lb ? la - lb : a.localeCompare(b);
+    });
+    const sourceLabelOrder: string[] = [];
+    groupOrder.forEach((group) => {
+      const label = groupMembers.get(group)![0].source_label;
+      if (!sourceLabelOrder.includes(label)) sourceLabelOrder.push(label);
+    });
+    const sourceColor = new Map<string, string>(sourceLabelOrder.map((label, index) => [label, GRAPH_GROUP_COLORS[index % GRAPH_GROUP_COLORS.length]]));
+    const groupColor = new Map<string, string>(groupOrder.map((group) => [group, sourceColor.get(groupMembers.get(group)![0].source_label)!]));
+    const cx = width / 2, cy = height / 2;
+    const anchorRadius = Math.min(width, height) * 0.32;
+    const groupAnchors = new Map<string, { x: number; y: number }>();
+    groupOrder.forEach((group, index) => {
+      const angle = (index / Math.max(groupOrder.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      groupAnchors.set(group, { x: cx + anchorRadius * Math.cos(angle), y: cy + anchorRadius * Math.sin(angle) });
+    });
+    const nodes: SimNode[] = graphNodes.map((node) => {
+      const previous = previousPositionsRef.current.get(node.id);
+      const anchor = groupAnchors.get(node.group) || { x: cx, y: cy };
+      return {
+        ...node,
+        x: previous?.x ?? anchor.x + (Math.random() - 0.5) * 30,
+        y: previous?.y ?? anchor.y + (Math.random() - 0.5) * 30,
+        fx: previous?.fx ?? null,
+        fy: previous?.fy ?? null,
+      };
+    });
+    const links: SimLink[] = (graph?.edges || []).map((edge) => ({ ...edge, source: edge.source, target: edge.target }));
+    return { nodes, links, groupOrder, groupMembers, sourceColor, groupColor, sourceLabelOrder, groupAnchors, width, height };
+  }, [graph]);
+
+  // Run the physics simulation. Node/link objects are mutated in place by
+  // d3-force on every tick (that's how it works) -- bump renderTick so React
+  // actually re-reads the mutated x/y instead of assuming nothing changed.
+  useEffect(() => {
+    if (!nodes.length) return;
+    const cx = width / 2, cy = height / 2;
+    const simulation = forceSimulation(nodes)
+      .force("charge", forceManyBody().strength(-260))
+      .force("collide", forceCollide<SimNode>((node) => nodeCollisionRadius(node)).strength(0.9))
+      .force("link", forceLink<SimNode, SimLink>(links).id((node) => node.id).distance((link) => (link.governed ? 60 : 110)).strength((link) => (link.governed ? 0.55 : 0.1)))
+      .force("x", forceX<SimNode>((node) => groupAnchors.get(node.group)?.x ?? cx).strength(0.05))
+      .force("y", forceY<SimNode>((node) => groupAnchors.get(node.group)?.y ?? cy).strength(0.05))
+      .alphaDecay(0.025)
+      .on("tick", () => {
+        nodes.forEach((node) => previousPositionsRef.current.set(node.id, { x: node.x ?? cx, y: node.y ?? cy, fx: node.fx, fy: node.fy }));
+        bump();
+      });
+    // Fast-forward to a near-settled layout synchronously instead of only
+    // relying on the simulation's own requestAnimationFrame-driven ticks --
+    // some browsers throttle or fully suspend rAF for a backgrounded/hidden
+    // tab, which would otherwise leave the graph stuck at its initial
+    // random-jitter seed until the tab regains focus. This also means the
+    // graph looks correctly arranged on the very first paint rather than
+    // visibly flying in from scratch.
+    for (let warm = 0; warm < 200; warm += 1) simulation.tick();
+    simulationRef.current = simulation;
+    bump();
+    return () => { simulation.stop(); };
+  }, [nodes, links, groupAnchors, width, height, bump]);
+
+  // Draggable nodes: bound once per graph load, directly on the rendered
+  // <g> elements -- not recreated every render/tick, which would otherwise
+  // thrash the drag behavior mid-gesture.
+  useEffect(() => {
+    nodes.forEach((node) => {
+      const element = nodeElRefs.current.get(node.id);
+      if (!element) return;
+      select(element).call(
+        d3drag<SVGGElement, unknown>()
+          .on("start", () => simulationRef.current?.alphaTarget(0.25).restart())
+          .on("drag", (event) => {
+            const scale = zoomTransformRef.current.k;
+            node.fx = (node.fx ?? node.x ?? 0) + event.dx / scale;
+            node.fy = (node.fy ?? node.y ?? 0) + event.dy / scale;
+            // In case rAF is throttled (backgrounded tab), advance the
+            // simulation a little synchronously too so dragging still
+            // visibly moves the node and its neighbors right away.
+            for (let warm = 0; warm < 3; warm += 1) simulationRef.current?.tick();
+            bump();
+          })
+          .on("end", () => simulationRef.current?.alphaTarget(0)),
+      );
+    });
+  }, [nodes, bump]);
+
+  // Pan (drag the background) and zoom (wheel or the buttons below), kept
+  // off individual nodes via .filter() so dragging a node never also pans.
+  // The <svg> only exists once `nodes.length` is truthy (it's behind a
+  // loading/empty-state branch until the graph loads), so this must
+  // re-attempt binding whenever that flips -- depending on `bump` alone
+  // meant this ran exactly once, before the <svg> existed, and silently
+  // never bound anything for the rest of the session.
+  useEffect(() => {
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+    const behavior = d3zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.35, 3])
+      .filter((event: Event) => !(event.target instanceof Element && event.target.closest(".graph-node")))
+      .on("zoom", (event) => { zoomTransformRef.current = event.transform; bump(); });
+    const selection = select(svgEl);
+    selection.call(behavior);
+    selection.call(behavior.transform, zoomTransformRef.current);
+    zoomBehaviorRef.current = behavior;
+    return () => { selection.on(".zoom", null); };
+  }, [bump, nodes.length > 0]);
+
+  const zoomBy = (factor: number) => {
+    if (!svgRef.current || !zoomBehaviorRef.current) return;
+    select(svgRef.current).call(zoomBehaviorRef.current.scaleBy, factor);
+  };
+  const resetLayout = () => {
+    nodes.forEach((node) => { node.fx = null; node.fy = null; });
+    previousPositionsRef.current.clear();
+    simulationRef.current?.alpha(1).restart();
+    for (let warm = 0; warm < 200; warm += 1) simulationRef.current?.tick();
+    bump();
+    if (svgRef.current && zoomBehaviorRef.current) {
+      select(svgRef.current).call(zoomBehaviorRef.current.transform, zoomIdentity);
+    }
+  };
   const needle = filter.trim().toLowerCase();
   const nodeMatches = (node: SemanticGraphNode) =>
     !needle || node.relation.toLowerCase().includes(needle) || node.source_label.toLowerCase().includes(needle) || node.columns.some((column) => column.toLowerCase().includes(needle));
@@ -158,8 +258,9 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
     if (!svgRef.current) return;
     // The exported file loses the app's stylesheet (.graph-node-dot,
     // .graph-edge, etc. live in globals.css, not inlined here), so nodes/edges
-    // render unstyled outside the app -- a quick visual snapshot, not a
-    // portable diagram. Use "Export graph data (JSON)" to get the real data.
+    // render unstyled outside the app -- a quick visual snapshot at the
+    // current pan/zoom, not a portable diagram. Use "Export graph data
+    // (JSON)" to get the real data.
     const clone = svgRef.current.cloneNode(true) as SVGSVGElement;
     clone.removeAttribute("style");
     clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
@@ -176,13 +277,14 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
   return (
     <section className="surface graph-panel">
       <div className="section-heading compact">
-        <div><span className="eyebrow">CATALOG RELATIONSHIPS</span><h3>Table &amp; join graph</h3><p>Nodes are catalog datasets, clustered and colored by source; solid edges are approved join policies, dashed edges are column-name-inferred suggestions within the same queryable group, never used automatically. Datasets that can&apos;t actually be queried together in one call are never linked here — that includes assets from two different connectors, and (for MCP-backed connectors) two different MCP tools, since each MCP call can only invoke one tool.</p></div>
+        <div><span className="eyebrow">CATALOG RELATIONSHIPS</span><h3>Table &amp; join graph</h3><p>Nodes are catalog datasets, clustered and colored by source; solid edges are approved join policies, dashed edges are column-name-inferred suggestions within the same queryable group, never used automatically. Datasets that can&apos;t actually be queried together in one call are never linked here — that includes assets from two different connectors, and (for MCP-backed connectors) two different MCP tools, since each MCP call can only invoke one tool. Drag a node to pin it where you want it, scroll or use the zoom buttons to get closer, and drag the background to pan.</p></div>
         <div className="row-actions">
           <div className="toolbar-search"><Search size={14} /><input placeholder="Filter nodes..." value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter graph nodes" /></div>
           <label className="toggle-inline"><input type="checkbox" checked={includeInferred} onChange={(event) => setIncludeInferred(event.target.checked)} />Show inferred</label>
           {graph && <StatusPill value={`${graph.governed_edge_count} governed / ${graph.inferred_edge_count} inferred`} />}
-          <button className="icon-button" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.6, Math.round((value - 0.2) * 10) / 10))}><ZoomOut size={16} /></button>
-          <button className="icon-button" title="Zoom in" onClick={() => setZoom((value) => Math.min(2, Math.round((value + 0.2) * 10) / 10))}><ZoomIn size={16} /></button>
+          <button className="icon-button" title="Zoom out" onClick={() => zoomBy(1 / 1.3)}><ZoomOut size={16} /></button>
+          <button className="icon-button" title="Zoom in" onClick={() => zoomBy(1.3)}><ZoomIn size={16} /></button>
+          <button className="icon-button" title="Reset layout and view" onClick={resetLayout} disabled={!nodes.length}><LocateFixed size={16} /></button>
           <button className="icon-button" title="Export graph data as JSON" onClick={exportGraphJson} disabled={!graph}><Download size={16} /></button>
           <button className="icon-button" title="Export graph as an SVG image" onClick={exportGraphSvg} disabled={!graph}><FileCode2 size={16} /></button>
         </div>
@@ -204,36 +306,44 @@ export function SemanticGraphPanel({ notify }: { notify: (message: string, tone?
             </div>
           )}
           <div className="graph-scroll">
-            <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} className="semantic-graph-svg" style={{ transform: `scale(${zoom})` }} role="img" aria-label="Catalog table and join relationship graph, clustered by source">
-              {graph!.edges.map((edge) => {
-                const source = positions.get(edge.source);
-                const target = positions.get(edge.target);
-                if (!source || !target) return null;
-                const active = hovered === edge.source || hovered === edge.target;
-                const dimmed = Boolean(needle) && !(nodeMatches(nodeById.get(edge.source)!) && nodeMatches(nodeById.get(edge.target)!));
-                return (
-                  <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${edge.governed ? "governed" : "inferred"} ${edge.cross_connector ? "cross-connector" : ""} ${active ? "active" : ""} ${dimmed ? "dimmed" : ""}`}>
-                    <title>{edge.cross_connector
-                      ? `⚠ ${edge.left_column} = ${edge.right_column} — approved policy references two datasets that can't actually be queried together in a single call (different connectors, or different MCP tools) and cannot be executed as written. Edit or remove this policy.`
-                      : `${edge.left_column} = ${edge.right_column} — ${edge.governed ? `${edge.status} join policy` : "inferred suggestion, not governed"}`}</title>
-                  </line>
-                );
-              })}
-              {nodes.map((node) => {
-                const pos = positions.get(node.id)!;
-                const rightSide = pos.x >= cx;
-                const label = node.relation.length > 24 ? `${node.relation.slice(0, 22)}…` : node.relation;
-                const color = groupColor.get(node.group);
-                const offset = labelOffsets.get(node.id) ?? 14;
-                const dimmed = Boolean(needle) && !nodeMatches(node);
-                return (
-                  <g key={node.id} transform={`translate(${pos.x}, ${pos.y})`} className={`graph-node ${hovered === node.id ? "active" : ""} ${dimmed ? "dimmed" : ""}`} onMouseEnter={() => setHovered(node.id)} onMouseLeave={() => setHovered(null)}>
-                    <circle r={9} className="graph-node-dot" style={color ? { stroke: color } : undefined} />
-                    <title>{`${node.relation}\nSource: ${node.source_label}\n${node.columns.join(", ")}`}</title>
-                    <text x={rightSide ? offset : -offset} y={4} textAnchor={rightSide ? "start" : "end"}>{label}</text>
-                  </g>
-                );
-              })}
+            <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} className="semantic-graph-svg force" role="img" aria-label="Catalog table and join relationship graph, clustered by source; drag nodes, scroll to zoom, drag the background to pan">
+              <g transform={zoomTransformRef.current.toString()}>
+                {links.map((link) => {
+                  const source = resolvedNode(link.source);
+                  const target = resolvedNode(link.target);
+                  if (!source || !target) return null;
+                  const active = hovered === source.id || hovered === target.id;
+                  const dimmed = Boolean(needle) && !(nodeMatches(source) && nodeMatches(target));
+                  return (
+                    <line key={link.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} className={`graph-edge ${link.governed ? "governed" : "inferred"} ${link.cross_connector ? "cross-connector" : ""} ${active ? "active" : ""} ${dimmed ? "dimmed" : ""}`}>
+                      <title>{link.cross_connector
+                        ? `⚠ ${link.left_column} = ${link.right_column} — approved policy references two datasets that can't actually be queried together in a single call (different connectors, or different MCP tools) and cannot be executed as written. Edit or remove this policy.`
+                        : `${link.left_column} = ${link.right_column} — ${link.governed ? `${link.status} join policy` : "inferred suggestion, not governed"}`}</title>
+                    </line>
+                  );
+                })}
+                {nodes.map((node) => {
+                  const rightSide = (node.x ?? 0) >= width / 2;
+                  const label = node.relation.length > 24 ? `${node.relation.slice(0, 22)}…` : node.relation;
+                  const color = groupColor.get(node.group);
+                  const dimmed = Boolean(needle) && !nodeMatches(node);
+                  const pinned = node.fx != null && node.fy != null;
+                  return (
+                    <g
+                      key={node.id}
+                      ref={(element) => { if (element) nodeElRefs.current.set(node.id, element); else nodeElRefs.current.delete(node.id); }}
+                      transform={`translate(${node.x ?? 0}, ${node.y ?? 0})`}
+                      className={`graph-node ${hovered === node.id ? "active" : ""} ${dimmed ? "dimmed" : ""} ${pinned ? "pinned" : ""}`}
+                      onMouseEnter={() => setHovered(node.id)}
+                      onMouseLeave={() => setHovered(null)}
+                    >
+                      <circle r={9} className="graph-node-dot" style={color ? { stroke: color } : undefined} />
+                      <title>{`${node.relation}\nSource: ${node.source_label}\n${node.columns.join(", ")}`}</title>
+                      <text x={rightSide ? 14 : -14} y={4} textAnchor={rightSide ? "start" : "end"}>{label}</text>
+                    </g>
+                  );
+                })}
+              </g>
             </svg>
           </div>
         </>

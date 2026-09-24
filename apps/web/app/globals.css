@@ -2426,6 +2426,15 @@ a {
   transform-origin: 0 0;
 }
 
+.semantic-graph-svg.force {
+  cursor: grab;
+  touch-action: none;
+}
+
+.semantic-graph-svg.force:active {
+  cursor: grabbing;
+}
+
 .graph-scroll {
   overflow: auto;
   max-width: 100%;
@@ -2500,6 +2509,19 @@ a {
   font-size: 11px;
   fill: var(--ink);
   font-family: inherit;
+}
+
+.graph-node {
+  cursor: grab;
+  touch-action: none;
+}
+
+.graph-node:active {
+  cursor: grabbing;
+}
+
+.graph-node.pinned .graph-node-dot {
+  stroke-dasharray: 2.5 2;
 }
 
 .graph-node.active .graph-node-dot {
