@@ -6,7 +6,10 @@ import {
   ChevronRight,
   Copy,
   Database,
+  FlaskConical,
+  Gauge,
   GitCompare,
+  Lightbulb,
   ListChecks,
   Network,
   Play,
@@ -20,9 +23,10 @@ import {
   Trash2,
   TrendingUp,
   XCircle,
+  Zap,
 } from "lucide-react";
 import Link from "next/link";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../lib/api";
 import {
   isEndpointUnavailable,
@@ -42,20 +46,39 @@ import {
   useQueryErrorToast,
   type Facet,
 } from "../lib/queries";
-import type { Notify } from "../lib/workspace";
+import { useWorkspace, type Notify } from "../lib/workspace";
 import { connectorDialectForType } from "../lib/constants";
-import type { IndexRecommendation, PromptCandidate, PromptOptimizationDetail, RouterDecisionRecord, VerifiedQuery } from "../types";
+import type { IndexRecommendation, LearningSuggestion, NavKey, PromptCandidate, PromptOptimizationDetail, RouterDecisionRecord, SlowQuery, SqlTuningDetail, SqlTuningRun, VerifiedQuery } from "../types";
 import { EmptyState, EndpointUnavailable, LoadingBlock, Modal, Pagination, StatusPill, formatScore, useConfirm } from "./shared";
-import { RouterEvaluationPanel } from "./admin";
+import { EvaluationsView } from "./EvaluationsView";
 
-export type LearningTab = "verified" | "optimization" | "indexes" | "router";
+export type LearningTab = "verified" | "optimization" | "indexes" | "router" | "suggestions" | "evaluations";
+
+export const LEARNING_TABS: LearningTab[] = ["verified", "optimization", "indexes", "router", "suggestions", "evaluations"];
 
 const TABS: { key: LearningTab; label: string; icon: typeof Check }[] = [
   { key: "verified", label: "Verified queries", icon: ListChecks },
   { key: "optimization", label: "Prompt optimization", icon: Sparkles },
   { key: "indexes", label: "Performance & DDL suggestions", icon: Database },
-  { key: "router", label: "Router", icon: Route },
+  { key: "router", label: "Router & tool choice", icon: Route },
+  { key: "suggestions", label: "Suggestions", icon: Lightbulb },
+  { key: "evaluations", label: "Evaluations", icon: FlaskConical },
 ];
+
+/**
+ * Tabs a role may open. Learning owns every feedback loop (docs/UX_CONSOLIDATION.md §4.2):
+ * suggestion review stays admin-only (as the API enforces), the curation tabs are
+ * admin/engineer, and Evaluations (the former /evaluations page) stays open to every role.
+ */
+export function learningTabsFor(role: string, hidden: string[] = []): LearningTab[] {
+  return learningTabsForRole(role).filter((tab) => !hidden.includes(`learning:${tab}`));
+}
+
+function learningTabsForRole(role: string): LearningTab[] {
+  if (role === "admin") return LEARNING_TABS;
+  if (role === "engineer") return LEARNING_TABS.filter((tab) => tab !== "suggestions");
+  return ["evaluations"];
+}
 
 const when = (value?: string | null) => (value ? new Date(value).toLocaleString() : "-");
 const shortId = (value?: string | null) => (value ? value.slice(0, 8) : "-");
@@ -65,23 +88,26 @@ const shortId = (value?: string | null) => (value ? value.slice(0, 8) : "-");
  * examples, optimised prompts (GEPA), index DDL suggestions (advice for a DBA, never
  * executed automatically) and router policy — every runtime change goes through Approvals.
  */
-export function LearningView({ notify, tab, onTab, runId, onRun }: {
+export function LearningView({ notify, tab, onTab, runId, onRun, role = "admin" }: {
   notify: Notify;
   tab: LearningTab;
   onTab: (tab: LearningTab) => void;
   runId: string;
   onRun: (id: string) => void;
+  role?: string;
 }) {
+  const { user } = useWorkspace();
+  const allowed = learningTabsFor(role, user.hidden_screens || []);
   return (
     <div className="view-stack">
       <div className="view-header">
         <div>
           <h2>Learning and quality</h2>
-          <p>Curate verified queries, optimise the SQL-generation prompt against evaluation cases, review performance (index DDL) suggestions and routing decisions. Changes that alter runtime behaviour are sent to Approvals; index DDL is only ever a suggestion for a DBA.</p>
+          <p>Curate verified queries, optimise the SQL-generation prompt against evaluation cases, review performance (index DDL) suggestions, routing decisions, feedback-derived suggestions and evaluation sets. Changes that alter runtime behaviour are sent to Approvals; index DDL is only ever a suggestion for a DBA.</p>
         </div>
       </div>
       <div className="tabs" role="tablist" aria-label="Learning sections">
-        {TABS.map((item) => {
+        {TABS.filter((item) => allowed.includes(item.key)).map((item) => {
           const Icon = item.icon;
           return <button key={item.key} role="tab" aria-selected={tab === item.key} className={tab === item.key ? "active" : ""} onClick={() => onTab(item.key)}><Icon size={16} />{item.label}</button>;
         })}
@@ -96,6 +122,8 @@ export function LearningView({ notify, tab, onTab, runId, onRun }: {
           <ToolChoiceEvaluationPanel notify={notify} />
         </>
       )}
+      {tab === "suggestions" && <LearningSuggestionsPanel notify={notify} />}
+      {tab === "evaluations" && <EvaluationsView notify={notify} embedded />}
     </div>
   );
 }
@@ -633,6 +661,8 @@ function PerformancePanel({ notify }: { notify: Notify }) {
         )}
       </section>
 
+      <SlowQueriesSection notify={notify} includeFast={includeFast} />
+
       <section className="surface admin-surface">
         <div className="section-heading compact"><div><span className="eyebrow">FOR DBA REVIEW</span><h3>Saved DDL suggestions</h3><p>Hand these statements to the database owner; DataPilot does not execute them.</p></div>{saved.isFetching && <RefreshCw size={14} className="spin" aria-label="Refreshing" />}</div>
         {isEndpointUnavailable(saved.error) ? <EndpointUnavailable feature="Saved DDL suggestions" endpoint="GET /api/sql/ddl-suggestions" /> : saved.isPending ? <LoadingBlock label="Loading saved suggestions" /> : savedItems.length ? (
@@ -659,6 +689,201 @@ function PerformancePanel({ notify }: { notify: Notify }) {
         ) : <div className="inline-empty">No saved DDL suggestions yet. Use "Save suggestion" on a recommendation to keep it for DBA review.</div>}
       </section>
     </>
+  );
+}
+
+// ------------------------------------------------------------------ SQL tuning (equivalent faster rewrites)
+
+const tuningIsActive = (status?: string | null) => status === "QUEUED" || status === "RUNNING";
+const sqlKey = (sql: string) => sql.replace(/\s+/g, " ").trim().toLowerCase();
+const oneLine = (sql: string, max = 140) => { const flat = sql.replace(/\s+/g, " ").trim(); return flat.length > max ? `${flat.slice(0, max)}…` : flat; };
+
+/**
+ * Slow queries and plan-guided tuning: a model proposes rewrites, each is executed and kept only
+ * when it returns exactly the original result and is measurably faster. Nothing changes until the
+ * winning SQL is approved as the verified query for its question.
+ */
+function SlowQueriesSection({ notify, includeFast }: { notify: Notify; includeFast: boolean }) {
+  const slow = useProjectQuery<SlowQuery[]>(["sql-slow-queries", includeFast], `/sql/slow-queries${includeFast ? "?min_ms=0" : ""}`);
+  const runs = useProjectQuery<SqlTuningRun[]>(["sql-tuning"], "/sql/tune", {
+    refetchInterval: (query) => ((query.state.data || []).some((run) => tuningIsActive(run.status)) ? 2500 : false),
+  });
+  const [selectedRun, setSelectedRun] = useState("");
+  useQueryErrorToast(slow.error, notify, "Slow queries could not be loaded", { ignoreUnavailable: true });
+  const start = useApiMutation((item: SlowQuery) => api<SqlTuningRun>("/sql/tune", { method: "POST", body: JSON.stringify({ query_run_id: item.query_run_id, iterations: 6 }) }), [["sql-tuning"]]);
+  const runList = useMemo(() => runs.data ?? [], [runs.data]);
+  const anyActive = runList.some((run) => tuningIsActive(run.status));
+  const latestBySql = useMemo(() => {
+    const map = new Map<string, SqlTuningRun>();
+    for (const run of runList) if (!map.has(sqlKey(run.sql))) map.set(sqlKey(run.sql), run);
+    return map;
+  }, [runList]);
+
+  async function tune(item: SlowQuery) {
+    try {
+      const run = await start.mutateAsync(item);
+      setSelectedRun(run.id);
+      notify("Tuning started: rewrites are verified against the original result before they count");
+    } catch (reason) { notify(reason instanceof Error ? reason.message : "Tuning could not be started", "error"); }
+  }
+
+  if (isEndpointUnavailable(slow.error)) return <section className="surface admin-surface"><EndpointUnavailable feature="Slow queries and SQL tuning" endpoint="GET /api/sql/slow-queries" /></section>;
+  const items = slow.data ?? [];
+  return (
+    <>
+      <section className="surface admin-surface">
+        <div className="section-heading compact">
+          <div>
+            <span className="eyebrow"><Gauge size={12} /> QUERY TUNING</span>
+            <h3>Slow queries</h3>
+            <p>Tune asks the model routed to SQL tuning for rewrites guided by the execution plan. A rewrite counts only when it returns exactly the same result and runs faster; no indexes or schema changes are made.</p>
+          </div>
+          <button className="secondary-button" onClick={() => { void slow.refetch(); void runs.refetch(); }} disabled={slow.isFetching}><RefreshCw size={16} className={slow.isFetching ? "spin" : undefined} />Refresh</button>
+        </div>
+        {slow.isPending ? <LoadingBlock label="Loading slow queries" /> : items.length ? (
+          <>
+            <div className="table-header tune-grid"><span>Query</span><span>Source</span><span>Timing</span><span>Last tuning</span><span /></div>
+            {items.map((item) => {
+              const last = latestBySql.get(sqlKey(item.sql));
+              return (
+                <div key={item.query_run_id} className="data-row tune-grid">
+                  <span><strong className="mono" title={item.sql}>{oneLine(item.sql)}</strong>{item.question && <small>{item.question}</small>}</span>
+                  <span className="mono">{item.connector_id ? "connector" : "workspace"} · {item.dialect}</span>
+                  <span className="perf-evidence"><strong>avg <b className={item.avg_ms > item.threshold_ms ? "perf-over" : undefined}>{formatMs(item.avg_ms)}</b></strong><small>max {formatMs(item.max_ms)} · {item.count.toLocaleString()} run{item.count === 1 ? "" : "s"}</small></span>
+                  <span>{last ? <button type="button" className="text-button" onClick={() => setSelectedRun(last.id)} title="Open this tuning run">{last.speedup_pct != null && last.result === "improved" ? `${last.speedup_pct}% faster` : (last.result || last.status).replaceAll("_", " ").toLowerCase()}</button> : <small className="caption">never tuned</small>}</span>
+                  <span className="row-actions">
+                    <button type="button" className="secondary-button compact" disabled={anyActive || start.isPending} title={anyActive ? "A tuning run is already in progress" : "Search for a faster rewrite with the same result"} onClick={() => void tune(item)}>
+                      {start.isPending && start.variables?.query_run_id === item.query_run_id ? <RefreshCw size={14} className="spin" /> : <Zap size={14} />}Tune
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
+          </>
+        ) : <div className="inline-empty">{includeFast ? "No executed queries in the recent workload yet." : "No slow queries in the recent workload. Turn on \"Include fast queries\" to tune any recent query."}</div>}
+        {!!runList.length && (
+          <>
+            <div className="subheading"><h4>Tuning runs</h4><span>most recent first</span></div>
+            {runList.slice(0, 8).map((run) => (
+              <button key={run.id} type="button" className={`data-row tune-run-grid${run.id === selectedRun ? " selected" : ""}`} onClick={() => setSelectedRun(run.id === selectedRun ? "" : run.id)} aria-pressed={run.id === selectedRun}>
+                <span><strong className="mono">{oneLine(run.sql, 110)}</strong><small>{when(run.created_at)}{run.question ? ` · ${run.question}` : ""}</small></span>
+                <span className="mono">{formatMs(run.baseline_ms)} → {formatMs(run.best_ms)}</span>
+                <span className={run.result === "improved" ? "tune-speedup" : undefined}>{run.result === "improved" && run.speedup_pct != null ? `-${run.speedup_pct}%` : "-"}</span>
+                <span className="row-actions">{tuningIsActive(run.status) && <RefreshCw size={14} className="spin" aria-label="Running" />}<StatusPill value={run.result && !tuningIsActive(run.status) ? run.result : run.status.toLowerCase()} /></span>
+              </button>
+            ))}
+          </>
+        )}
+      </section>
+      {selectedRun && <SqlTuningRunView id={selectedRun} notify={notify} />}
+    </>
+  );
+}
+
+function SqlTuningRunView({ id, notify }: { id: string; notify: Notify }) {
+  const detail = useProjectQuery<SqlTuningDetail>(["sql-tuning", id], `/sql/tune/${id}`, {
+    refetchInterval: (query) => (tuningIsActive(query.state.data?.status) ? 2000 : false),
+  });
+  const [openAttempt, setOpenAttempt] = useState<number | null>(null);
+  const [question, setQuestion] = useState("");
+  const [applied, setApplied] = useState<{ approval_id: string } | null>(null);
+  useQueryErrorToast(detail.error, notify, "Tuning run could not be loaded", { ignoreUnavailable: true });
+  const apply = useApiMutation((payload: { question?: string }) => api<{ approval_id: string }>(`/sql/tune/${id}/apply`, { method: "POST", body: JSON.stringify(payload) }), [scopes.approvals, ["sql-tuning"]]);
+
+  if (detail.isPending) return <section className="surface admin-surface"><LoadingBlock label="Loading tuning run" /></section>;
+  const run = detail.data;
+  if (!run) return <section className="surface admin-surface"><div className="inline-empty">This tuning run could not be loaded.</div></section>;
+  const report = run.report;
+  const attempts = report?.attempts ?? [];
+  const active = tuningIsActive(run.status);
+  const improved = report?.status === "improved" && !!report.winning_sql;
+  const needsQuestion = improved && !report?.question;
+  const pendingApproval = applied || (run.approval?.status === "pending" ? { approval_id: run.approval.id } : null);
+  const lastLog = run.logs[run.logs.length - 1];
+
+  async function requestApproval() {
+    try {
+      const result = await apply.mutateAsync(needsQuestion ? { question: question.trim() } : {});
+      setApplied(result);
+      notify("Tuned SQL sent to Approvals; the verified query changes only after approval");
+    } catch (reason) { notify(reason instanceof Error ? reason.message : "Rewrite could not be applied", "error"); }
+  }
+
+  return (
+    <section className="surface admin-surface">
+      <div className="section-heading compact">
+        <div><span className="eyebrow">TUNING RUN {shortId(run.id)}</span><h3>{run.question || "Query tuning"}</h3><p>Started {when(run.created_at)}{report?.model ? ` · model ${report.model}` : ""}{report?.engine ? ` · ${report.engine} (${(report.plan_support || "no plan").replaceAll("_", " ")})` : ""}</p></div>
+        <span className="row-actions">{active && <RefreshCw size={14} className="spin" aria-label="Running" />}<StatusPill value={active ? run.status.toLowerCase() : report?.status || run.status.toLowerCase()} /></span>
+      </div>
+      {active && <p className="caption learning-pad">{run.progress}% · {lastLog?.message || "Queued"}</p>}
+      {(report?.error || run.error) && <p className="form-error learning-pad" role="alert">{report?.error || run.error}</p>}
+      {report?.baseline && (
+        <dl className="fact-grid learning-facts">
+          <div><dt>Baseline (median)</dt><dd>{formatMs(report.baseline_ms)}</dd></div>
+          <div><dt>Best equivalent</dt><dd>{formatMs(report.best_ms)}</dd></div>
+          <div><dt>Speedup</dt><dd className={improved ? "tune-speedup" : undefined}>{improved && report.speedup_pct != null ? `${report.speedup_pct}% faster` : "none found"}</dd></div>
+          <div><dt>Attempts</dt><dd>{attempts.length} / {report.settings?.iterations ?? "-"}</dd></div>
+          <div><dt>Reference result</dt><dd>{report.baseline.row_count.toLocaleString()} rows · {report.baseline.columns.length} cols{report.order_sensitive ? " · ordered" : ""}</dd></div>
+          <div><dt>Stopped</dt><dd>{report.stopped_reason || (active ? "running" : "-")}</dd></div>
+        </dl>
+      )}
+      {!!report?.baseline?.plan_summary?.flags?.length && (
+        <div className="learning-pad"><small className="caption">Plan warnings: {report.baseline.plan_summary.flags.join(" · ")}</small></div>
+      )}
+      {attempts.length ? (
+        <>
+          <div className="subheading"><h4>Attempts</h4><span>each candidate is executed and compared with the original result before it is timed</span></div>
+          <div className="table-header attempt-grid"><span>#</span><span>Time</span><span>Same result</span><span>Outcome</span></div>
+          {attempts.map((attempt) => {
+            const open = openAttempt === attempt.attempt;
+            return (
+              <div key={attempt.attempt}>
+                <div className={`data-row attempt-grid${open ? " selected" : ""}${attempt.improved ? " attempt-best" : ""}`}>
+                  <span><button type="button" className="row-toggle" aria-expanded={open} onClick={() => setOpenAttempt(open ? null : attempt.attempt)} title={open ? "Hide SQL" : "Show SQL"}>{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}<strong>{attempt.attempt}</strong></button></span>
+                  <span className="mono">{formatMs(attempt.ms)}</span>
+                  <span className={attempt.equivalent ? "tune-ok" : "tune-bad"} aria-label={attempt.equivalent ? "equivalent" : "not equivalent"}>{attempt.equivalent ? <><Check size={14} /> same</> : <><XCircle size={14} /> {attempt.rejected_reason?.startsWith("not equivalent") ? "differs" : "not run"}</>}</span>
+                  <span><strong>{attempt.improved ? (report?.winning_attempt === attempt.attempt ? "Winner" : "Improved") : attempt.rejected_reason || "-"}</strong>{attempt.notes && <small>{attempt.notes}</small>}</span>
+                </div>
+                {open && (
+                  <div className="row-detail">
+                    <pre className="inspector-sql">{attempt.sql || "(no SQL returned)"}</pre>
+                    {!!attempt.runs?.length && <small className="caption">Runs: {attempt.runs.map((ms) => formatMs(ms)).join(", ")}</small>}
+                    {!!attempt.plan_summary?.flags?.length && <small className="caption">Plan: {attempt.plan_summary.flags.join(" · ")}</small>}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </>
+      ) : !report?.error && <div className="inline-empty">{active ? "Attempts appear as the tuner proposes and verifies rewrites." : "No attempts were recorded."}</div>}
+      {report?.original_sql && improved && (
+        <>
+          <div className="subheading"><h4><GitCompare size={13} /> Original vs winning SQL</h4><span>{formatMs(report.baseline_ms)} → {formatMs(report.best_ms)}</span></div>
+          <div className="sql-compare">
+            <div><small>Original</small><pre className="inspector-sql">{report.original_sql}</pre></div>
+            <div><small>Winning rewrite (attempt {report.winning_attempt})</small><pre className="inspector-sql">{report.winning_sql}</pre></div>
+          </div>
+          {!!report.plan_diff?.length && <ul className="plan-diff">{report.plan_diff.map((line) => <li key={line}>{line}</li>)}</ul>}
+        </>
+      )}
+      {improved && (
+        <div className="apply-bar">
+          <span><strong>Use the faster SQL</strong><small>Becomes the verified query for this question only after approval; nothing is changed automatically.</small></span>
+          {pendingApproval ? (
+            <span className="caption"><ShieldCheck size={13} /> Awaiting approval · <Link className="text-button" href="/approvals">Open Approvals</Link></span>
+          ) : run.approval?.status === "approved" ? (
+            <span className="caption"><Check size={13} /> Approved and active</span>
+          ) : (
+            <span className="row-actions">
+              {needsQuestion && <input aria-label="Question this SQL answers" placeholder="Question this SQL answers" value={question} onChange={(event) => setQuestion(event.target.value)} />}
+              <button className="primary-button" disabled={apply.isPending || (needsQuestion && question.trim().length < 3)} onClick={() => void requestApproval()}>
+                {apply.isPending ? <RefreshCw size={16} className="spin" /> : <ShieldCheck size={16} />}Apply via approval
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -789,4 +1014,150 @@ function ToolChoiceEvaluationPanel({ notify }: { notify: Notify }) {
       )}
     </section>
   );
+}
+
+// ------------------------------------------------------------------ router evaluation (moved from Admin -> Governance)
+
+type RouterEvaluation = {
+  cases: number;
+  backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; results: { question: string; expected: string; got: string; confidence: number; backend: string; correct: boolean }[] }>;
+};
+const ROUTE_EVAL_BACKENDS = ["local", "llm", "jev"] as const;
+const ROUTER_SAMPLE_CASES = "How many orders were placed per month? | sql_analysis\nRun the monthly revenue reconciliation agent | agent_run\nWhat does it mean? | clarify";
+
+const BACKEND_KIND_LABELS: Record<string, string> = { llm: "LLM", jev: "Jev", local: "Local" };
+
+/**
+ * The backend that actually answered: "llm:gemini-3.6-flash" / "jev:typesafe/jev-1.13-…" show
+ * the kind and model; only "local (…)" — e.g. "local (jev unavailable)" — is a fallback.
+ */
+function EffectiveBackend({ value }: { value: string | null }) {
+  if (!value) return <span>-</span>;
+  if (value.startsWith("local (")) {
+    const reason = value.slice("local (".length).replace(/\)$/, "");
+    return <span className="effective-backend"><strong>Local</strong><span className="chip fallback-chip" title={`Fell back to local rules: ${reason}`}>fallback</span><small>{reason}</small></span>;
+  }
+  const separator = value.indexOf(":");
+  if (separator > 0) {
+    const kind = value.slice(0, separator);
+    const model = value.slice(separator + 1);
+    return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[kind] || kind}</strong><small className="mono">{model}</small></span>;
+  }
+  return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[value] || value}</strong></span>;
+}
+
+/** Replays labelled questions through each decision-router backend (POST /router/evaluate). */
+export function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
+  const [casesText, setCasesText] = useState(ROUTER_SAMPLE_CASES);
+  const [backends, setBackends] = useState<Record<string, boolean>>({ local: true, llm: true, jev: true });
+  const [includeFeedback, setIncludeFeedback] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<RouterEvaluation | null>(null);
+  const [openBackend, setOpenBackend] = useState("");
+  async function run(event: FormEvent) {
+    event.preventDefault();
+    const cases = casesText.split("\n").map((line) => line.split("|").map((part) => part.trim())).filter(([question, route]) => question && route).map(([question, route]) => ({ question, expected_route: route }));
+    const selected = ROUTE_EVAL_BACKENDS.filter((name) => backends[name]);
+    if (!selected.length) { notify("Choose at least one backend", "error"); return; }
+    if (!cases.length && !includeFeedback) { notify("Add at least one labelled case (question | expected_route) or include feedback", "error"); return; }
+    setRunning(true);
+    try {
+      setReport(await api<RouterEvaluation>("/router/evaluate", { method: "POST", body: JSON.stringify({ backends: selected, cases, include_feedback: includeFeedback }) }));
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Router evaluation failed", "error");
+    } finally {
+      setRunning(false);
+    }
+  }
+  const rows = report ? Object.entries(report.backends) : [];
+  // Best = highest accuracy; ties go to the lowest average latency.
+  const best = rows.filter(([, item]) => item.accuracy != null).sort(([, a], [, b]) => (b.accuracy! - a.accuracy!) || ((a.avg_latency_ms ?? Infinity) - (b.avg_latency_ms ?? Infinity)))[0]?.[0] || "";
+  const openItem = openBackend ? report?.backends[openBackend] : undefined;
+  return (
+    <section className="surface admin-surface">
+      <div className="section-heading"><div><span className="eyebrow">DECISION ROUTER</span><h3>Router evaluation</h3><p>Replay labelled questions, plus answers users rated, through each routing backend. Enable a backend only if it wins on your own data.</p></div></div>
+      <form className="modal-form router-eval-form" onSubmit={run}>
+        <label>Labelled cases (one per line: question | expected_route)<textarea rows={4} value={casesText} onChange={(event) => setCasesText(event.target.value)} placeholder="How many orders per month? | sql_analysis" /></label>
+        <div className="router-eval-options">
+          {ROUTE_EVAL_BACKENDS.map((name) => <label key={name} className="check-option"><input type="checkbox" checked={!!backends[name]} onChange={(event) => setBackends((current) => ({ ...current, [name]: event.target.checked }))} />{name}</label>)}
+          <label className="check-option"><input type="checkbox" checked={includeFeedback} onChange={(event) => setIncludeFeedback(event.target.checked)} />Include rated answers</label>
+          <button className="primary-button" disabled={running}>{running ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run evaluation</button>
+        </div>
+      </form>
+      {report && <>
+        <div className="subheading"><h4>Results</h4><span>{report.cases} case{report.cases === 1 ? "" : "s"}</span></div>
+        <div className="table-header router-eval-grid"><span>Backend</span><span>Effective</span><span>Accuracy</span><span>Avg latency</span><span /></div>
+        {rows.map(([name, item]) => (
+          <div key={name} className={`data-row router-eval-grid${name === best ? " best" : ""}${openBackend === name ? " selected" : ""}`}>
+            <span><strong>{name}</strong>{name === best && <span className="chip best-chip" title="Highest accuracy (ties: lowest latency)">best</span>}</span>
+            <EffectiveBackend value={item.effective_backend} />
+            <span className="mono">{item.accuracy == null ? "-" : `${Math.round(item.accuracy * 100)}%`}</span>
+            <span className="mono">{item.avg_latency_ms == null ? "-" : `${Math.round(item.avg_latency_ms)} ms`}</span>
+            <button type="button" className="text-button" onClick={() => setOpenBackend(openBackend === name ? "" : name)} aria-expanded={openBackend === name} aria-controls="router-eval-cases">{openBackend === name ? "Hide cases" : "Cases"}</button>
+          </div>
+        ))}
+        {openItem && (
+          <div className="router-eval-case-panel" id="router-eval-cases">
+            <div className="subheading"><h4>Cases for {openBackend}</h4><span>{openItem.results.filter((result) => result.correct).length} of {openItem.results.length} correct</span></div>
+            <div className="router-eval-cases">{openItem.results.map((result, index) => <div key={index} className={result.correct ? "" : "miss"}>{result.correct ? <Check size={13} aria-label="correct" /> : <XCircle size={13} aria-label="wrong" />}<span><strong>{result.question}</strong><small>expected {result.expected} · got {result.got} ({Math.round(result.confidence * 100)}%)</small></span></div>)}</div>
+          </div>
+        )}
+      </>}
+    </section>
+  );
+}
+
+// ------------------------------------------------------------------ learning-loop suggestions (moved from Admin -> Governance)
+
+// Maps a learning suggestion's proposed_change.review_target (the
+// FeedbackCreate.context_type it originated from — sql/agent_run/dataset/
+// notebook/artifact) to the nav section where a human would actually go to
+// make the versioned change the suggestion is asking for review of. This is
+// UI-only wayfinding: it does not touch any prompt, tool, or policy, and
+// nothing about it violates the "no automatic runtime change" governance
+// posture documented in ARCHITECTURE_DECISIONS.md §2 — it just removes the
+// friction of a reviewer having to remember which screen owns which area.
+const REVIEW_TARGET_NAV: Record<string, { key: NavKey; label: string }> = {
+  sql: { key: "sql", label: "Open SQL workspace" },
+  agent_run: { key: "agents", label: "Open agent registry" },
+  dataset: { key: "datasets", label: "Open dataset catalog" },
+  notebook: { key: "notebooks", label: "Open notebooks" },
+  artifact: { key: "artifacts", label: "Open artifacts" },
+};
+
+/** Feedback-derived suggestions (admin-only on the API). Reviewing records a decision; it never changes runtime behaviour. */
+function LearningSuggestionsPanel({ notify }: { notify: Notify }) {
+  const { navigate } = useWorkspace();
+  const [suggestions, setSuggestions] = useState<LearningSuggestion[]>([]);
+  const [suggestionFilter, setSuggestionFilter] = useState<"open" | "accepted" | "dismissed">("open");
+  const [reviewingSuggestion, setReviewingSuggestion] = useState<LearningSuggestion | null>(null);
+  const [reviewNote, setReviewNote] = useState("");
+  const loadSuggestions = useCallback(async (status: "open" | "accepted" | "dismissed") => { try { setSuggestions(await api<LearningSuggestion[]>(`/learning-suggestions?status=${status}`)); } catch (reason) { notify(reason instanceof Error ? reason.message : "Learning suggestions unavailable", "error"); } }, [notify]);
+  useEffect(() => { void loadSuggestions(suggestionFilter); }, [loadSuggestions, suggestionFilter]);
+  function openReview(suggestion: LearningSuggestion) { setReviewingSuggestion(suggestion); setReviewNote(""); }
+  async function submitReview(status: "accepted" | "dismissed") {
+    if (!reviewingSuggestion) return;
+    try {
+      await api(`/learning-suggestions/${reviewingSuggestion.id}`, { method: "PUT", body: JSON.stringify({ status, note: reviewNote || null }) });
+      notify(status === "accepted" ? "Suggestion accepted — apply the change as a versioned update yourself" : "Suggestion dismissed");
+      setReviewingSuggestion(null);
+      await loadSuggestions(suggestionFilter);
+    } catch (reason) { notify(reason instanceof Error ? reason.message : "Review could not be saved", "error"); }
+  }
+  return <>
+    <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">LEARNING LOOP</span><h3>Feedback-derived suggestions</h3><p>Repeated not-helpful feedback in the same area is grouped into one suggestion with escalating severity. Nothing here changes runtime behavior automatically — review and apply changes yourself.</p></div><select value={suggestionFilter} onChange={(event) => setSuggestionFilter(event.target.value as typeof suggestionFilter)} aria-label="Filter suggestions by status"><option value="open">Open</option><option value="accepted">Accepted</option><option value="dismissed">Dismissed</option></select></div>{suggestions.length ? <div className="table-header suggestion-grid"><span>Signal</span><span>Category</span><span>Occurrences</span><span>Severity</span><span /></div> : <div className="inline-empty">No {suggestionFilter} suggestions for this project.</div>}{suggestions.map((suggestion) => <div className="data-row suggestion-grid" key={suggestion.id}><span><strong>{suggestion.title}</strong><small>{suggestion.rationale}</small></span><span>{suggestion.category.replaceAll("_", " ")}</span><span className="mono">{suggestion.occurrence_count}</span><StatusPill value={suggestion.severity} />{suggestion.status === "open" ? <button className="secondary-button" onClick={() => openReview(suggestion)}><Check size={15} />Review</button> : <span className="caption">{suggestion.status} {suggestion.review_note ? `— ${suggestion.review_note}` : ""}</span>}</div>)}</section>
+    {reviewingSuggestion && <Modal title={reviewingSuggestion.title} onClose={() => setReviewingSuggestion(null)}><p className="modal-description">{reviewingSuggestion.rationale}</p><div className="policy-details"><div><span>Category</span><strong>{reviewingSuggestion.category.replaceAll("_", " ")}</strong></div><div><span>Occurrences</span><strong>{reviewingSuggestion.occurrence_count}</strong></div><div><span>Severity</span><strong>{reviewingSuggestion.severity}</strong></div></div>{reviewingSuggestion.proposed_change.recent_signals?.length ? <div className="tool-list">{reviewingSuggestion.proposed_change.recent_signals.map((signal, index) => <div key={signal.feedback_id || index}><span><small>{signal.comment || "No comment provided"}</small></span></div>)}</div> : null}
+{reviewingSuggestion.proposed_change.review_target && REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target] && (
+  <div className="modal-note">
+    <ShieldCheck size={16} />
+    <span>
+      Accepting only records your decision — it never changes a prompt, tool, or policy by itself. To make the actual fix, go review it yourself.
+      <button type="button" className="link-button" onClick={() => navigate(REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target!].key)}>
+        {REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target!].label} →
+      </button>
+    </span>
+  </div>
+)}
+<label>Review note<textarea rows={4} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="What you decided and why, for the audit trail" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => submitReview("dismissed")}><XCircle size={16} />Dismiss</button><button className="primary-button" onClick={() => submitReview("accepted")}><Check size={16} />Accept</button></div></Modal>}
+  </>;
 }

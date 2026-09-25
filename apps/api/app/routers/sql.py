@@ -746,3 +746,360 @@ def execute_sql(
     )
     db.commit()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Paste & run: any-length pasted SQL through the governed read-only path, with
+# timing, precise error locations and on-demand plan analysis (app/query_tuner.py).
+# ---------------------------------------------------------------------------
+from .. import query_tuner as _query_tuner
+from ..index_advisor import slow_query_threshold_ms as _slow_query_threshold_ms
+from ..sql_guard import check_read_only as _check_read_only
+
+PASTED_SQL_MAX_CHARS = 400_000
+SQLDialect = Literal["postgres", "sqlserver", "oracle", "teradata", "bigquery"]
+
+
+class SQLRunRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=PASTED_SQL_MAX_CHARS)
+    dialect: SQLDialect = "postgres"
+    connector_id: str | None = None
+    limit: int = Field(default=500, ge=1, le=5_000)
+    timeout_seconds: int = Field(default=30, ge=1, le=300)
+
+
+class SQLAnalyzeRequest(BaseModel):
+    sql: str = Field(min_length=1, max_length=PASTED_SQL_MAX_CHARS)
+    dialect: SQLDialect = "postgres"
+    connector_id: str | None = None
+    analyze: bool = True  # PostgreSQL: EXPLAIN ANALYZE (runs the query read-only under the statement timeout)
+    duration_ms: float | None = Field(default=None, ge=0)
+
+
+def _pasted_scope(db: Session, user: User, connector_id: str | None, requested_dialect: str) -> tuple[Any, Connector | None, str, str]:
+    main.require_any_permission(user, db, main.QUERY_RUNNERS, "Your role can read results but cannot execute SQL")
+    project = require_current_project(db, user)
+    connector = require_project_resource(db.get(Connector, connector_id), project, "Connector") if connector_id else None
+    dialect = connector_dialect(connector, requested_dialect)
+    local = connector is None or connector.connector_type == "local_files"
+    # Local sources are always queried in PostgreSQL syntax (SQLite gets sqlite_compat rewrites).
+    return project, connector, dialect, "postgres" if local else dialect
+
+
+@router.post("/sql/run")
+def run_pasted_sql(payload: SQLRunRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Execute pasted SQL of any length read-only on the selected source.
+
+    Same guard as every other path (single read-only SELECT, catalogued relations
+    only, PII masking on local results) plus a row limit and a statement timeout.
+    Execution failures are returned as ``status: "error"`` with the failing
+    line/column when the driver or parser reports it, so the editor can point at it.
+    """
+    project, connector, dialect, guard_dialect = _pasted_scope(db, user, payload.connector_id, payload.dialect)
+    sql = payload.sql
+    executable = _query_tuner.mask_sql_comments(sql).strip().rstrip(";").strip()
+    lines = sql.count("\n") + 1
+    threshold = _slow_query_threshold_ms()
+    base = {"sql": sql, "dialect": dialect, "source": analysis_source_output(connector, dialect), "lines": lines, "chars": len(sql),
+            "limit": payload.limit, "timeout_seconds": payload.timeout_seconds, "slow_threshold_ms": threshold}
+
+    def failure(error: Any, stage: str) -> dict[str, Any]:
+        located = _query_tuner.locate_sql_error(sql, error, guard_dialect)
+        audit(db, user, "sql.pasted_run_failed", "query", None, {"dialect": dialect, "connector_id": connector.id if connector else None, "stage": stage, "lines": lines})
+        db.commit()
+        return {**base, "status": "error", "stage": stage, "error": located, "columns": [], "rows": [], "row_count": 0, "truncated": False, "duration_ms": None, "slow": False}
+
+    if not executable:
+        return failure("The statement is empty (only comments?)", "guard")
+    verdict = _check_read_only(executable, guard_dialect)
+    if not verdict.ok:
+        main.record_governance_event("sql_guardrail", "read_only_sql", "blocked", project_id=project.id, user_id=user.id, session_id=request_id.get() or None,
+                                     feature="sql_guardrail", risk_level="high", rule="read_only_sql", error_type="GuardRejected")
+        return failure(verdict.reason, "guard")
+    allowed = {f"{asset.schema_name}.{asset.table_name}".lower() for asset in _query_tuner.catalog_for(db, project.id, connector)}
+    outside = unknown_relations(executable, guard_dialect, allowed)
+    if outside:
+        return failure(f"SQL references tables outside the catalog: {', '.join(outside)}", "catalog")
+    started = time.perf_counter()
+    try:
+        if connector is not None and connector.connector_type != "local_files":
+            result = main.execute_connector_query(connector, executable, {}, payload.limit, payload.timeout_seconds, user_id=user.id,
+                                                  session_id=request_id.get() or None, feature="sql_pasted_run")
+        else:
+            result = execute_parameterized_read_only(engine, executable, {}, payload.limit, payload.timeout_seconds)
+    except Exception as exc:
+        return failure(exc, "execution")
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    audit(db, user, "sql.pasted_run", "query", None, {"dialect": dialect, "connector_id": connector.id if connector else None, "lines": lines,
+                                                      "row_count": result.get("row_count"), "truncated": result.get("truncated"), "duration_ms": duration_ms})
+    db.commit()
+    return {**base, **result, "status": "ok", "error": None, "duration_ms": duration_ms, "slow": duration_ms >= threshold}
+
+
+@router.post("/sql/analyze")
+def analyze_pasted_sql(payload: SQLAnalyzeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Execution-plan analysis of pasted SQL: costliest operators, plain-language issues and index advice (nothing is applied)."""
+    project, connector, _dialect, guard_dialect = _pasted_scope(db, user, payload.connector_id, payload.dialect)
+    target: Any = connector if connector is not None and connector.connector_type != "local_files" else engine
+    try:
+        report = _query_tuner.analyze_performance(db, target, payload.sql, guard_dialect, project_id=project.id, user_id=user.id,
+                                                  analyze=payload.analyze, duration_ms=payload.duration_ms)
+    except _query_tuner.TuningError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, user, "sql.pasted_analyzed", "query", None, {"connector_id": connector.id if connector else None, "issues": len(report["issues"]), "lines": report["lines"]})
+    db.commit()
+    return report
+
+
+# ---------------------------------------------------------------------------
+# SQL program composition: very large SQL built from business logic step by
+# step (see app/sql_composer.py). Plan -> (user edits) -> background build job.
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+from .. import sql_composer
+from ..request_context import active_project_id as _active_project_id
+
+ComposeDialect = Literal["postgres", "sqlserver", "oracle", "teradata", "bigquery"]
+
+
+class ComposePlanRequest(BaseModel):
+    spec: str = Field(min_length=10, max_length=sql_composer.MAX_SPEC_CHARS)
+    dialect: ComposeDialect = "postgres"
+    connector_id: str | None = None
+
+
+class ComposeBuildRequest(BaseModel):
+    plan: dict[str, Any]
+    dialect: ComposeDialect = "postgres"
+    connector_id: str | None = None
+    spec: str | None = Field(default=None, max_length=sql_composer.MAX_SPEC_CHARS)
+
+
+def _composition_scope(db: Session, user: User, connector_id: str | None, requested_dialect: str) -> dict[str, Any]:
+    """Project, source and the catalogued relations a composed program may read (same rules as generate_sql)."""
+    main.require_any_permission(user, db, main.QUERY_RUNNERS, "Your role can read results but cannot generate SQL")
+    project = require_current_project(db, user)
+    connector = require_project_resource(db.get(Connector, connector_id), project, "Connector") if connector_id else None
+    dialect = connector_dialect(connector, requested_dialect)
+    executable_local_source = connector is None or connector.connector_type == "local_files"
+    project_assets = db.scalars(
+        select(DataAsset).where(DataAsset.project_id == project.id).order_by(DataAsset.schema_name, DataAsset.table_name)
+    ).all()
+    if executable_local_source:
+        allowed_asset_ids = {asset.id for asset in project_assets if asset.connector_id in {None, connector.id if connector else None}}
+    else:
+        allowed_asset_ids = {asset.id for asset in project_assets if asset.connector_id == connector.id}
+    from ..catalog_scope import queryable_asset_ids
+
+    allowed_asset_ids &= queryable_asset_ids(db, project.id, project_assets)
+    assets = [asset for asset in project_assets if asset.id in allowed_asset_ids]
+    catalog = {
+        f"{asset.schema_name}.{asset.table_name}".lower(): {
+            "columns": [
+                {"name": str(column.get("name")), "type": column.get("type", "unknown"), "meaning": column.get("business_name") or column.get("description") or ""}
+                for column in asset.columns or [] if column.get("name")
+            ],
+            "description": asset.description or "",
+        }
+        for asset in assets
+    }
+    return {
+        "project": project,
+        "connector": connector,
+        "dialect": dialect,
+        "executable": dialect == "postgres" and executable_local_source,
+        "source": analysis_source_output(connector, dialect),
+        "catalog": catalog,
+        "allowed_asset_ids": allowed_asset_ids,
+    }
+
+
+def _composition_provider(db: Session, user: User) -> ModelProvider:
+    provider = selected_model_provider(db, user, "sql_composition")
+    if provider is None or provider.provider_type == "local_mock":
+        raise HTTPException(status_code=409, detail="SQL composition needs a real text model: route one to 'sql_composition' (or set the project default) in Admin > Model routing")
+    return provider
+
+
+def _bounded_local_execution(sql: str) -> dict[str, Any]:
+    try:
+        return execute_read_only(engine, sql, sql_composer.PREVIEW_ROWS)
+    except Exception as exc:
+        return {"error": str(exc), "columns": [], "rows": [], "row_count": 0, "truncated": False, "limit": sql_composer.PREVIEW_ROWS}
+
+
+@router.post("/sql/compose/plan")
+def compose_sql_plan(payload: ComposePlanRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Ask the composition model for a step plan (JSON), validate it, and repair it once if needed."""
+    scope = _composition_scope(db, user, payload.connector_id, payload.dialect)
+    project = scope["project"]
+    if not scope["catalog"]:
+        raise HTTPException(status_code=409, detail="No queryable catalogued tables for this source: stage or scan data first")
+    provider = _composition_provider(db, user)
+    grounding = grounding_context(db, project.id, payload.spec[:4_000], limit=8, allowed_asset_ids=scope["allowed_asset_ids"])
+    # Relevant tables first so the plan prompt's catalog cap never drops them.
+    prioritized = [item["relation"].lower() for item in grounding.get("catalog_matches", []) if str(item.get("relation", "")).lower() in scope["catalog"]]
+    catalog = {name: scope["catalog"][name] for name in [*dict.fromkeys(prioritized), *scope["catalog"]]}
+
+    def ask(system: str, prompt: str) -> Any:
+        return generate_text(provider, system, prompt, sql_composer.PLAN_TOKENS, governance_feature="sql_composition_plan",
+                             governance_business_id=project.id, governance_session_id=request_id.get() or None, governance_user_id=user.id)
+
+    started = time.perf_counter()
+    repaired = False
+    try:
+        raw_text = ask(sql_composer.PLAN_SYSTEM, sql_composer.plan_user_prompt(payload.spec, scope["dialect"], catalog, grounding_prompt_text(grounding))).content
+        try:
+            plan, errors = sql_composer.normalize_plan(sql_composer.extract_json(raw_text), catalog)
+        except sql_composer.PlanError as exc:
+            plan, errors = {"title": "", "steps": [], "final": {}}, exc.errors
+        if errors:
+            repaired = True
+            raw_text = ask(sql_composer.PLAN_REPAIR_SYSTEM, sql_composer.plan_repair_prompt(raw_text, errors, catalog)).content
+            try:
+                plan, errors = sql_composer.normalize_plan(sql_composer.extract_json(raw_text), catalog)
+            except sql_composer.PlanError as exc:
+                errors = exc.errors
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.add(ModelCallLog(project_id=project.id, provider_id=provider.id, model=provider.default_model, purpose="sql_composition", status="failed", error=str(exc)[:1000], created_by=user.id))
+        db.commit()
+        raise HTTPException(status_code=422, detail=f"Model planning failed: {str(exc)[:500]}") from exc
+    latency_ms = round((time.perf_counter() - started) * 1000)
+    input_tokens = max(1, (len(payload.spec) + len(sql_composer.catalog_text(catalog))) // 4)
+    output_tokens = max(1, len(raw_text) // 4)
+    db.add(ModelCallLog(project_id=project.id, provider_id=provider.id, model=provider.default_model, purpose="sql_composition", status="healthy", latency_ms=latency_ms,
+                        input_tokens=input_tokens, output_tokens=output_tokens, estimated_cost_usd=estimated_model_cost(input_tokens, output_tokens), created_by=user.id))
+    audit(db, user, "sql.composition_planned", "sql_composition", None, {"dialect": scope["dialect"], "steps": len(plan.get("steps", [])), "valid": not errors, "repaired": repaired})
+    db.commit()
+    return {
+        "plan": plan,
+        "valid": not errors,
+        "errors": errors,
+        "dialect": scope["dialect"],
+        "source": scope["source"],
+        "executable": scope["executable"],
+        "catalog_relations": sorted(scope["catalog"]),
+        "provider": {"id": provider.id, "name": provider.name, "model": provider.default_model, "mode": "plan_repaired" if repaired else "plan", "latency_ms": latency_ms},
+    }
+
+
+def _composition_output(job: Job) -> dict[str, Any]:
+    output = (job.outputs or [{}])[0] if job.outputs else {}
+    return {
+        "id": job.id,
+        "title": job.title,
+        "status": job.status,
+        "progress": job.progress,
+        "plan": (job.evidence or [{}])[0].get("plan") if job.evidence else None,
+        "result": output.get("result") if output.get("type") == "sql_composition_result" else None,
+        "progress_detail": output.get("progress") if output.get("type") == "sql_composition_progress" else None,
+        "logs": job.logs or [],
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    }
+
+
+def _composition_log(job: Job, message: str, level: str = "info") -> None:
+    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": level, "message": message[:1_000]}]
+
+
+def _composition_trace(job: Job, steps: list[dict[str, Any]]) -> None:
+    """Mirror step status onto Job.plan so the Jobs run trace shows the build too."""
+    status = {"ok": "complete", "repaired": "complete", "failed": "failed", "skipped": "skipped", "running": "running", "pending": "waiting"}
+    by_name = {step["name"]: step for step in steps}
+    job.plan = [{**item, "status": status.get(by_name.get(item.get("agent"), {}).get("status", "pending"), "waiting")} for item in job.plan or []]
+
+
+def _run_composition(job_id: str, plan: dict[str, Any], config: dict[str, Any]) -> None:
+    """Background build: per-step generation/validation/execution with progress on the Job row."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+        token = _active_project_id.set(job.project_id)
+        user = db.get(User, job.created_by)
+        provider = db.get(ModelProvider, config["provider_id"])
+        try:
+            job.status = "RUNNING"
+            _composition_log(job, f"Building {len(plan['steps'])} steps with {provider.name}")
+            db.commit()
+
+            def generate(system: str, prompt: str, max_tokens: int) -> str:
+                return generate_text(provider, system, prompt, max_tokens, governance_feature="sql_composition",
+                                     governance_business_id=job.project_id, governance_user_id=job.created_by).content
+
+            def on_progress(snapshot: dict[str, Any]) -> None:
+                job.outputs = [{"type": "sql_composition_progress", "title": f"Building steps ({snapshot['done']}/{snapshot['total']})", "summary": snapshot["phase"], "progress": snapshot}]
+                _composition_trace(job, snapshot["steps"])
+                job.progress = min(95, round(100 * snapshot["done"] / max(1, snapshot["total"])))
+                db.commit()
+
+            ctx = sql_composer.ComposeContext(
+                dialect=config["dialect"], catalog=config["catalog"], generate=generate,
+                execute=_bounded_local_execution if config["executable"] else None, on_progress=on_progress, title=plan.get("title", ""),
+            )
+            result = sql_composer.build_program(plan, ctx)
+            result["source"] = config["source"]
+            result["provider"] = {"id": provider.id, "name": provider.name, "model": provider.default_model, "mode": "composed", "latency_ms": result["stats"]["duration_ms"]}
+            summary = f"{result['status']}: {result['lines']} lines, {result['stats']['steps']} steps, {result['stats']['model_calls']} model calls, {result['stats']['repairs']} repairs"
+            job.outputs = [{"type": "sql_composition_result", "title": "Composed SQL program", "summary": summary, "result": json.loads(json.dumps(result, default=str))}]
+            _composition_trace(job, result["steps"])
+            job.status = "SUCCEEDED" if result["status"] == "completed" else "FAILED"
+            job.progress = 100
+            _composition_log(job, summary, "info" if result["status"] == "completed" else "error")
+            output_tokens = max(1, len(result.get("sql") or "") // 4)
+            input_tokens = max(1, result["stats"]["model_calls"] * 600)
+            db.add(ModelCallLog(project_id=job.project_id, provider_id=provider.id, model=provider.default_model, purpose="sql_composition", status="healthy" if result["status"] == "completed" else "failed",
+                                latency_ms=result["stats"]["duration_ms"], input_tokens=input_tokens, output_tokens=output_tokens, estimated_cost_usd=estimated_model_cost(input_tokens, output_tokens), created_by=job.created_by))
+            audit(db, user, "sql.composed", "job", job.id, {"status": result["status"], "steps": result["stats"]["steps"], "lines": result["lines"], "dialect": config["dialect"]})
+            db.commit()
+        except Exception as exc:  # never leave the job RUNNING
+            db.rollback()
+            job = db.get(Job, job_id)
+            job.status = "FAILED"
+            job.progress = 100
+            _composition_log(job, f"Build failed: {str(exc)[:500]}", "error")
+            db.commit()
+        finally:
+            _active_project_id.reset(token)
+
+
+@router.post("/sql/compose/build", status_code=202)
+def compose_sql_build(payload: ComposeBuildRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Validate the (possibly user-edited) plan and start the background build job."""
+    scope = _composition_scope(db, user, payload.connector_id, payload.dialect)
+    plan, errors = sql_composer.normalize_plan(payload.plan, scope["catalog"])
+    if errors:
+        raise HTTPException(status_code=422, detail={"message": "The plan is not valid: " + "; ".join(errors[:5]) + (f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""), "errors": errors})
+    provider = _composition_provider(db, user)
+    project = scope["project"]
+    job = Job(
+        project_id=project.id,
+        title=f"Compose SQL: {plan['title']}"[:200],
+        job_type="sql_composition",
+        status="QUEUED",
+        progress=0,
+        plan=[{"agent": step["name"], "action": step["purpose"][:300] or "Composition step", "status": "waiting"} for step in plan["steps"]],
+        evidence=[{"type": "composition", "label": f"{len(plan['steps'])} steps / {scope['dialect']}", "plan": plan, "spec": (payload.spec or "")[:4_000]}],
+        outputs=[],
+        created_by=user.id,
+    )
+    db.add(job)
+    db.flush()
+    audit(db, user, "sql.composition_started", "job", job.id, {"steps": len(plan["steps"]), "dialect": scope["dialect"], "connector_id": payload.connector_id})
+    db.commit()
+    config = {"provider_id": provider.id, "dialect": scope["dialect"], "catalog": scope["catalog"], "executable": scope["executable"], "source": scope["source"]}
+    _threading.Thread(target=_run_composition, args=(job.id, plan, config), name=f"compose-{job.id[:8]}", daemon=True).start()
+    return _composition_output(job)
+
+
+@router.get("/sql/compose/{job_id}")
+def get_sql_composition(job_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = require_current_project(db, user)
+    job = require_project_resource(db.get(Job, job_id), project, "Composition")
+    if job.job_type != "sql_composition":
+        raise HTTPException(status_code=404, detail="Composition not found")
+    return _composition_output(job)

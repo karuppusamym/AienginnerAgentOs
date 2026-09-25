@@ -1847,6 +1847,22 @@ class DataPilotApiTests(unittest.TestCase):
         self.assertEqual(first.json()["loaded_rows"], 2)
         self.assertEqual(second.json()["loaded_rows"], 0)
         self.assertEqual(first.json()["last_watermark"], "2026-01-02T00:00:00")
+        # Disable stops runs; re-enabling needs a fresh approval (one pending request at a time).
+        schedule_id = scheduled.json()["id"]
+        disabled = self.client.post(f"/schedules/{schedule_id}/disable", headers=self.headers)
+        self.assertFalse(disabled.json()["enabled"])
+        self.assertEqual(self.client.post(f"/schedules/{schedule_id}/run", headers=self.headers).status_code, 409)
+        requested = self.client.post(f"/schedules/{schedule_id}/enable", headers=self.headers)
+        self.assertEqual(requested.status_code, 202)
+        self.assertFalse(requested.json()["enabled"])
+        self.assertEqual(self.client.post(f"/schedules/{schedule_id}/enable", headers=self.headers).status_code, 409)
+        reapproved = self.client.post(
+            f"/approvals/{requested.json()['approval_id']}/decision",
+            headers=self.headers,
+            json={"decision": "approved", "note": "Re-enable after maintenance"},
+        )
+        self.assertTrue(reapproved.json()["schedule_enabled"])
+        self.assertEqual(self.client.post(f"/schedules/{schedule_id}/enable", headers=self.headers).status_code, 409)
 
     def test_artifact_review_comments_and_diff(self) -> None:
         first = self.client.post(

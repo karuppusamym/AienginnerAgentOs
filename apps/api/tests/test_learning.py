@@ -195,6 +195,24 @@ class LearningApiTests(unittest.TestCase):
         self.assertEqual(f"{asset.schema_name}.{asset.table_name}", "core.accounts")
         self.assertEqual(how, "from earlier in this conversation")
 
+    def test_router_only_suggests_query_tools_for_the_selected_source(self) -> None:
+        from app.decision_router import decide
+        from app.models import QueryTool
+        with SessionLocal() as db:
+            project_id = next(item for item in self.client.get("/projects", headers=self.headers).json() if item["is_current"])["id"]
+            tools = {tool.id: tool.connector_id for tool in db.scalars(select(QueryTool).where(QueryTool.project_id == project_id)).all()}
+            other = decide(db, project_id, "customer lookup by id and transaction totals by type", None, backend_override="local", connector_id="some-other-connector")
+            offered = [item["target"]["id"] for item in other["candidates"] if item["route"] == "query_tool"]
+        self.assertTrue(all(tools.get(tool_id) == "some-other-connector" for tool_id in offered), offered)
+
+    def test_admin_can_hide_screens_for_a_project_but_not_admin(self) -> None:
+        saved = self.client.put("/ui/screens", headers=self.headers, json={"hidden": ["evaluations", "notebooks", "artifacts", "notebooks"]})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["hidden"], ["evaluations", "notebooks", "artifacts"])
+        self.assertEqual(self.client.get("/auth/me", headers=self.headers).json()["hidden_screens"], ["evaluations", "notebooks", "artifacts"])
+        self.assertEqual(self.client.put("/ui/screens", headers=self.headers, json={"hidden": ["admin"]}).status_code, 422)
+        self.assertEqual(self.client.put("/ui/screens", headers=self.headers, json={"hidden": []}).json()["hidden"], [])
+
     def test_manual_verified_query_is_validated(self) -> None:
         bad = self.client.post("/verified-queries", headers=self.headers, json={"question": "leak", "sql": "select email from users"})
         self.assertEqual(bad.status_code, 422)

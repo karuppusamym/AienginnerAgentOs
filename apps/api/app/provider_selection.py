@@ -52,10 +52,15 @@ MODEL_PURPOSES: dict[str, str] = {
     "sql_candidate_judge": "SQL candidate tie-breaker",
     "tool_selection": "Tool choice for each agent step",
     "metadata_generation": "Catalog metadata auto-description",
+    "sql_composition": "Large SQL composition from business logic (plan + per-step build)",
+    "answer_review": "Automatic chat answer reviewer",
+    "agent_design": "Agent and query-tool designer (Draft with AI)",
+    "sql_tuning": "Plan-guided SQL tuning (equivalent faster rewrites)",
 }
 # generation: needs a text model; decision: needs a decision model (Jev); either: both work.
 PURPOSE_KIND: dict[str, str] = {purpose: "generation" for purpose in MODEL_PURPOSES}
 PURPOSE_KIND.update({"decision_routing": "either", "risk_check": "decision", "sql_candidate_judge": "decision", "tool_selection": "decision"})
+PURPOSE_KIND["answer_review"] = "either"
 DECISION_PROVIDER_TYPES = {"jev"}
 
 

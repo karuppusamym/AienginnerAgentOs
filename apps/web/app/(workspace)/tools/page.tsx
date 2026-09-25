@@ -1,9 +1,9 @@
 "use client";
 
-import { ToolsView } from "../../components/ToolsView";
-import { useWorkspace } from "../../lib/workspace";
+import { RouteRedirect } from "../../components/RouteRedirect";
+import { NAV_REDIRECTS } from "../../lib/routes";
 
+/** The tool registry is a tab of Agents & tools; old /tools links land on it. */
 export default function ToolsPage() {
-  const { notify } = useWorkspace();
-  return <ToolsView notify={notify} />;
+  return <RouteRedirect to={NAV_REDIRECTS.tools || "/agents?tab=tools"} label="Opening Agents & tools" />;
 }

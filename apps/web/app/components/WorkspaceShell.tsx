@@ -17,6 +17,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  SlidersHorizontal,
   Sun,
   X,
 } from "lucide-react";
@@ -24,9 +25,9 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { FormEvent, MouseEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, clearLegacyToken, getActiveProject, logout, onUnauthorized, SessionUser, setActiveProject } from "../lib/api";
+import { api, clearLegacyToken, getActiveProject, logout, onUnauthorized, SessionUser, setActiveProject, SESSION_REFRESH_EVENT } from "../lib/api";
 import type { NavKey, Project, SearchResult } from "../types";
-import { navItems, navGroups, roleLanding, TOUR_STORAGE_KEY, defaultTourSteps } from "../lib/constants";
+import { isPrimaryNav, navItems, navGroups, NAV_ADVANCED_STORAGE_KEY, roleLanding, TOUR_STORAGE_KEY, defaultTourSteps } from "../lib/constants";
 import { canView, legacyViewTarget, NAV_PATHS, navKeyForPath } from "../lib/routes";
 import { useWorkspace, WorkspaceContext, type AnalysisSeed, type NavigateOptions, type Notify, type SqlSeed, type WorkspaceContextValue } from "../lib/workspace";
 import { scopes, useApprovals, useInvalidate, useModelProviders, useProjects, useQueryErrorToast } from "../lib/queries";
@@ -109,6 +110,9 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
       .then((me) => { setActiveProject(me.current_project_id); setUser(me); })
       .catch(() => setUser(null))
       .finally(() => setAuthChecked(true));
+    const refresh = () => { api<SessionUser>("/auth/me").then((me) => setUser(me)).catch(() => undefined); };
+    window.addEventListener(SESSION_REFRESH_EVENT, refresh);
+    return () => window.removeEventListener(SESSION_REFRESH_EVENT, refresh);
   }, []);
 
   useEffect(() => { roleRef.current = user?.role || ""; hadUserRef.current = !!user; }, [user]);
@@ -194,7 +198,10 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
   const [passwordDialog, setPasswordDialog] = useState(false);
   const [projectDialog, setProjectDialog] = useState(false);
   const [projectForm, setProjectForm] = useState({ name: "", description: "", environment: "local" });
-  const [openNavGroups, setOpenNavGroups] = useState<Record<string, boolean>>({ overview: true, data: true, delivery: true, governance: false, administration: false });
+  // Role-filtered sections are short, so every section starts open.
+  const [openNavGroups, setOpenNavGroups] = useState<Record<string, boolean>>(() => Object.fromEntries(navGroups.map((group) => [group.key, true])));
+  // Power users can reveal items outside their role's default sidebar; remembered per browser.
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [theme, setTheme] = useState<ThemeChoice>("system");
   const tourAutoRef = useRef<string | null>(null);
 
@@ -211,6 +218,10 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
     const group = navGroups.find((item) => active && item.items.includes(active));
     if (group) setOpenNavGroups((current) => (current[group.key] ? current : { ...current, [group.key]: true }));
   }, [active]);
+
+  useEffect(() => {
+    try { setShowAdvanced(window.localStorage.getItem(NAV_ADVANCED_STORAGE_KEY) === "true"); } catch { /* storage unavailable */ }
+  }, []);
 
   useEffect(() => {
     try {
@@ -252,9 +263,17 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
   const activeLabel = navItems.find((item) => item.key === active)?.label || "Workspace";
   const currentProject = projects.find((project) => project.id === user.current_project_id) || projects.find((project) => project.is_current) || projects[0];
   const healthyProviders = providers.filter((provider) => provider.enabled && provider.status === "healthy");
-  const visibleNavItems = navItems.filter((item) => canView(item.key, user.role));
+  // canView is the route gate; isPrimaryNav only trims the sidebar. Items outside the role's
+  // default set stay reachable by URL, show under "Show advanced", and the open route is always listed.
+  const hiddenScreens = new Set((user.hidden_screens || []).filter((key) => key !== "admin"));
+  const permittedNavItems = navItems.filter((item) => canView(item.key, user.role) && !hiddenScreens.has(item.key));
+  const primaryNavItems = permittedNavItems.filter((item) => showAdvanced || isPrimaryNav(item.key, user.role));
+  const advancedNavCount = permittedNavItems.filter((item) => !isPrimaryNav(item.key, user.role)).length;
+  const visibleNavItems = permittedNavItems.filter((item) => primaryNavItems.includes(item) || item.key === active);
   const visibleNavGroups = navGroups.map((group) => ({ ...group, items: group.items.filter((key) => visibleNavItems.some((item) => item.key === key)) })).filter((group) => group.items.length);
-  const tourSteps = defaultTourSteps.filter((step) => visibleNavItems.some((item) => item.key === step.key));
+  // The collapsed desktop rail hides section headers, so it lists every visible item.
+  const railMode = !sidebarOpen && !mobileNav;
+  const tourSteps = defaultTourSteps.filter((step) => primaryNavItems.some((item) => item.key === step.key));
   const currentTourStep = tourSteps[tourStep] || tourSteps[0];
   const currentTourKey = currentTourStep?.key;
   const tourStepCount = tourSteps.length;
@@ -294,6 +313,12 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
     }
   }
 
+  function toggleAdvancedNav() {
+    const next = !showAdvanced;
+    setShowAdvanced(next);
+    try { window.localStorage.setItem(NAV_ADVANCED_STORAGE_KEY, String(next)); } catch { /* storage unavailable */ }
+  }
+
   function chooseTheme(next: ThemeChoice) {
     setTheme(next);
     const root = document.documentElement;
@@ -317,6 +342,7 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
       if (active === "conversations") router.replace(NAV_PATHS.conversations);
       // A new project id changes every query key, so no view can show the previous project's data.
       setUser((current) => current ? { ...current, current_project_id: project.id, current_project_name: project.name } : current);
+      window.dispatchEvent(new Event(SESSION_REFRESH_EVENT)); // hidden screens are per project
       setProjectDialog(false);
       notify(`Project switched to ${project.name}`);
     } catch (reason) { notify(reason instanceof Error ? reason.message : "Project switch failed", "error"); }
@@ -382,9 +408,9 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
         </div>
         <nav className="main-nav" aria-label="Product navigation">
           {visibleNavGroups.map((group) => (
-            <div className="nav-group" key={group.key}>
+            <div className="nav-group" key={group.key} role="group" aria-label={group.label}>
               <button className="nav-group-toggle" aria-expanded={!!openNavGroups[group.key]} onClick={() => setOpenNavGroups((current) => ({ ...current, [group.key]: !current[group.key] }))}><span>{group.label}</span><ChevronDown size={14} className={openNavGroups[group.key] ? "" : "collapsed"} /></button>
-              {openNavGroups[group.key] && group.items.map((key) => {
+              {(openNavGroups[group.key] || railMode) && group.items.map((key) => {
                 const item = navItems.find((candidate) => candidate.key === key);
                 if (!item) return null;
                 const Icon = item.icon;
@@ -396,6 +422,11 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
               })}
             </div>
           ))}
+          {advancedNavCount > 0 && (
+            <button type="button" className={`nav-advanced-toggle${showAdvanced ? " on" : ""}`} aria-pressed={showAdvanced} onClick={toggleAdvancedNav} title={showAdvanced ? "Hide advanced items" : `Show advanced items (${advancedNavCount} more)`}>
+              <SlidersHorizontal size={16} strokeWidth={1.8} /><span>{showAdvanced ? "Hide advanced" : `Show advanced (${advancedNavCount})`}</span>
+            </button>
+          )}
         </nav>
         <div className="sidebar-footer">
           <div className="local-status">
@@ -485,7 +516,13 @@ function ShellChrome({ children, setUser, onSignedOut, clearSeeds }: {
         </header>
 
         <main className="content" key={projectKey}>
-          {allowed ? children : <LoadingBlock label="Opening your home view" />}
+          {!allowed ? <LoadingBlock label="Opening your home view" /> : active && hiddenScreens.has(active) ? (
+            <div className="screen-hidden-notice surface">
+              <strong>This screen is hidden for {user.current_project_name || "this project"}</strong>
+              <p>An admin hid it to keep this workspace focused. {user.role === "admin" ? "Show it again in Admin → Screens." : "Ask an admin if you need it."}</p>
+              {user.role === "admin" && <button type="button" className="secondary-button" onClick={() => router.push(`${NAV_PATHS.admin}?tab=screens`)}>Open Admin → Screens</button>}
+            </div>
+          ) : children}
         </main>
       </div>
       {mobileNav && <button className="nav-backdrop" aria-label="Close menu" onClick={() => setMobileNav(false)} />}

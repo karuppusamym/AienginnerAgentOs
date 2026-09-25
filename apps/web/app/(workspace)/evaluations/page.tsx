@@ -1,9 +1,9 @@
 "use client";
 
-import { EvaluationsView } from "../../components/EvaluationsView";
-import { useWorkspace } from "../../lib/workspace";
+import { RouteRedirect } from "../../components/RouteRedirect";
+import { NAV_REDIRECTS } from "../../lib/routes";
 
+/** Evaluations is a tab of Learning; old /evaluations links land on it. */
 export default function EvaluationsPage() {
-  const { notify } = useWorkspace();
-  return <EvaluationsView notify={notify} />;
+  return <RouteRedirect to={NAV_REDIRECTS.evaluations || "/learning?tab=evaluations"} label="Opening evaluations" />;
 }

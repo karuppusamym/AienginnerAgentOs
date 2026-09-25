@@ -340,12 +340,43 @@ def list_agents(_: User = Depends(get_current_user), db: Session = Depends(get_d
         output.append({**as_dict(agent, ["id", "name", "purpose", "autonomy_level", "enabled", "tool_names", "query_tool_names", "policy"]), "current_version": latest.version if latest else 0, "version_status": latest.status if latest else "unversioned", "model_provider_id": latest.model_provider_id if latest else None, "evaluation_score": latest.evaluation_score if latest else None})
     return output
 
+class AgentDraftRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    brief: str = Field(default="", max_length=2_000)
+
+
+class AgentCreateRequest(AgentDefinitionCreate):
+    # Purpose may be left empty: the agent designer fills it from the name (never blocks creation).
+    purpose: str = Field(default="", max_length=10_000)
+
+
+@router.post("/agents/draft")
+def draft_agent_definition(payload: AgentDraftRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Draft purpose, instructions, autonomy and registry-only tool bindings for review. Nothing is saved."""
+    from ..agent_designer import draft_agent
+
+    require_permission(user, db, "registry:write", "Registry write permission required")
+    project = require_current_project(db, user)
+    draft = draft_agent(db, user, project.id, payload.name.strip(), payload.brief.strip())
+    audit(db, user, "agent.drafted", "agent", None, {"name": payload.name[:120], "by": draft["by"], "tools": draft["tool_names"], "rejected": draft["rejected_tool_names"]})
+    db.commit()
+    return draft
+
+
 @router.post("/agents", status_code=201)
-def create_agent(payload: AgentDefinitionCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+def create_agent(payload: AgentCreateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     require_permission(user, db, "registry:write", "Registry write permission required")
     project = require_current_project(db, user)
     if db.scalar(select(AgentDefinition).where(func.lower(AgentDefinition.name) == payload.name.lower())):
         raise HTTPException(status_code=409, detail="An agent with this name already exists")
+    if not payload.purpose.strip():
+        from ..agent_designer import suggest_purpose
+
+        try:
+            suggested = suggest_purpose(db, user, project.id, payload.name)
+        except Exception:
+            suggested = None
+        payload.purpose = suggested or f"The {payload.name} agent handles {payload.name.lower()} requests in this project using governed, read-only tools."
     known_tools = set(db.scalars(select(ToolDefinition.name).where(ToolDefinition.name.in_(payload.tool_names))).all()) if payload.tool_names else set()
     if known_tools != set(payload.tool_names):
         raise HTTPException(status_code=400, detail="Every selected tool must exist in the registry")

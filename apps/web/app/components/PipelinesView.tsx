@@ -5,6 +5,7 @@ import {
   Database,
   FileUp,
   GitBranch,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -25,12 +26,16 @@ import type {
 } from "../types";
 import { scopes, useDebouncedValue, useInvalidate, usePagedQuery, usePagination, useQueryErrorToast } from "../lib/queries";
 import { StatusPill, Modal, Pagination, useConfirm } from "./shared";
+import { useWorkspace } from "../lib/workspace";
 
 const NO_PIPELINES: PipelineDefinition[] = [];
 
 
 export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
   const [confirm, confirmDialog] = useConfirm();
+  const { user } = useWorkspace();
+  // Schedule changes need catalog:write on the API (admin, engineer); the API stays the enforcement point.
+  const canManageSchedules = user.role === "admin" || user.role === "engineer";
   const [objective, setObjective] = useState("Ingest daily transaction files, validate schema, and publish a clean local table");
   const [steps, setSteps] = useState<Job["plan"]>([]);
   const [busy, setBusy] = useState(false);
@@ -76,6 +81,14 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
   }
   async function runSchedule(id: string) {
     try { const result = await api<{ status: string }>(`/schedules/${id}/run`, { method: "POST" }); notify(`Schedule run ${result.status.toLowerCase()}`); window.setTimeout(loadSchedules, 800); } catch (reason) { notify(reason instanceof Error ? reason.message : "Schedule run failed", "error"); }
+  }
+  async function disableSchedule(schedule: IngestionSchedule) {
+    if (!(await confirm({ title: "Disable schedule", body: `Stop "${schedule.name}" from running? Runs stop immediately; re-enabling it needs a new approval.`, confirmLabel: "Disable schedule" }))) return;
+    try { await api(`/schedules/${schedule.id}/disable`, { method: "POST" }); await loadSchedules(); notify("Schedule disabled"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Schedule could not be disabled", "error"); }
+  }
+  async function enableSchedule(schedule: IngestionSchedule) {
+    if (!(await confirm({ title: "Re-enable schedule", body: `Request approval to re-enable "${schedule.name}" (${schedule.cron} UTC)? It stays off until an approver accepts.`, confirmLabel: "Request approval", danger: false }))) return;
+    try { const result = await api<{ approval_id: string }>(`/schedules/${schedule.id}/enable`, { method: "POST" }); await loadSchedules(); notify(`Re-enable submitted for approval: ${result.approval_id.slice(0, 8)}`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Schedule could not be re-enabled", "error"); }
   }
   function openPipelineGenerator(pipeline?: PipelineDefinition) {
     setEditingPipeline(pipeline || null);
@@ -134,7 +147,7 @@ export function PipelinesView({ notify }: { notify: (message: string, tone?: "ok
       <section className="surface schedule-surface">
         <div className="section-heading"><div><span className="eyebrow">DURABLE AUTOMATION</span><h3>Ingestion schedules</h3><p>Approved mappings run through the local worker with optional incremental watermarks.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={14} /><input placeholder="Search schedules..." value={scheduleSearch} onChange={(e) => setScheduleSearch(e.target.value)} /></div><button className="primary-button" onClick={() => setShowSchedule(true)} disabled={!mappings.length}><CalendarClock size={17} />Add schedule</button></div></div>
         <div className="table-header schedule-grid"><span>Schedule</span><span>Mapping</span><span>Mode</span><span>Next run</span><span /></div>
-        {schedules.filter(s => scheduleSearch ? s.name.toLowerCase().includes(scheduleSearch.toLowerCase()) || (s.target_table || "").toLowerCase().includes(scheduleSearch.toLowerCase()) : true).map((schedule) => <div className="data-row schedule-grid" key={schedule.id}><span><strong>{schedule.name}</strong><small>{schedule.cron} / UTC</small></span><span><strong>{schedule.target_table}</strong><small>{schedule.filename}</small></span><span><StatusPill value={schedule.enabled ? schedule.load_mode : "awaiting_approval"} />{schedule.last_watermark && <small>{schedule.last_watermark}</small>}</span><span>{schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "-"}</span><button className="icon-button" title="Run now" disabled={!schedule.enabled} onClick={() => runSchedule(schedule.id)}><Play size={16} /></button></div>)}
+        {schedules.filter(s => scheduleSearch ? s.name.toLowerCase().includes(scheduleSearch.toLowerCase()) || (s.target_table || "").toLowerCase().includes(scheduleSearch.toLowerCase()) : true).map((schedule) => <div className="data-row schedule-grid" key={schedule.id}><span><strong>{schedule.name}</strong><small>{schedule.cron} / UTC</small></span><span><strong>{schedule.target_table}</strong><small>{schedule.filename}</small></span><span><StatusPill value={schedule.enabled ? schedule.load_mode : schedule.last_run_at ? "disabled" : "awaiting_approval"} />{schedule.last_watermark && <small>{schedule.last_watermark}</small>}</span><span>{schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "-"}</span><span className="row-actions"><button className="icon-button" title="Run now" disabled={!schedule.enabled} onClick={() => runSchedule(schedule.id)}><Play size={16} /></button>{schedule.enabled ? <button className="icon-button" title={canManageSchedules ? "Disable schedule" : "Disabling schedules requires catalog:write (engineer or admin)"} disabled={!canManageSchedules} onClick={() => disableSchedule(schedule)}><Pause size={16} /></button> : <button className="icon-button" title={canManageSchedules ? "Request approval to enable this schedule" : "Enabling schedules requires catalog:write (engineer or admin)"} disabled={!canManageSchedules} onClick={() => enableSchedule(schedule)}><CalendarClock size={16} /></button>}</span></div>)}
         {!schedules.length && <div className="inline-empty">No ingestion schedules have been requested.</div>}
       </section>
       {showSchedule && <Modal title="Schedule ingestion" onClose={() => setShowSchedule(false)}><form className="modal-form" onSubmit={createSchedule}><label>Name<input value={scheduleForm.name} onChange={(event) => setScheduleForm({ ...scheduleForm, name: event.target.value })} required /></label><label>Mapping<select value={scheduleForm.mapping_id} onChange={(event) => setScheduleForm({ ...scheduleForm, mapping_id: event.target.value, key_column: "", watermark_column: "" })} required>{mappings.map((mapping) => <option value={mapping.id} key={mapping.id}>{mapping.filename} / {mapping.target_table}</option>)}</select></label><div className="form-grid"><label>Cron<input value={scheduleForm.cron} onChange={(event) => setScheduleForm({ ...scheduleForm, cron: event.target.value })} required /></label><label>Load mode<select value={scheduleForm.load_mode} onChange={(event) => setScheduleForm({ ...scheduleForm, load_mode: event.target.value })}><option value="append">Append</option><option value="upsert">Merge</option></select></label></div><div className="form-grid"><label>Watermark<select value={scheduleForm.watermark_column} onChange={(event) => setScheduleForm({ ...scheduleForm, watermark_column: event.target.value })}><option value="">None</option>{selectedMapping?.columns.map((column) => <option value={column.target_name} key={column.target_name}>{column.target_name}</option>)}</select></label>{scheduleForm.load_mode === "upsert" && <label>Merge key<select value={scheduleForm.key_column} onChange={(event) => setScheduleForm({ ...scheduleForm, key_column: event.target.value })} required><option value="">Select key</option>{selectedMapping?.columns.map((column) => <option value={column.target_name} key={column.target_name}>{column.target_name}</option>)}</select></label>}</div><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowSchedule(false)}>Cancel</button><button className="primary-button"><CalendarClock size={17} />Request approval</button></div></form></Modal>}

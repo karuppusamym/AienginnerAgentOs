@@ -1,5 +1,7 @@
+import { ScreenVisibilityPanel } from "./ScreenVisibilityPanel";
 import {
   AlertCircle,
+  EyeOff,
   Archive,
   Bot,
   Check,
@@ -23,6 +25,7 @@ import {
   Users,
   XCircle,
 } from "lucide-react";
+import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api, SessionUser } from "../lib/api";
 import { scopes, useConnectors, useDebouncedValue, useFacets, useInvalidate, useModelProviders, useModelRouting, useModelUsage, usePagedQuery, usePagination, useQueryErrorToast, useSchemaDrift, type Facet, type PageParams } from "../lib/queries";
@@ -36,13 +39,13 @@ import type {
   QueryTool,
   QueryToolGrant,
   QueryToolDraft,
+  QueryToolAiDraft,
   RelationOption,
   QueryToolRegistrySummary,
   PromptArtifact,
   RetentionPolicy,
   SchemaDrift,
   ModelUsage,
-  LearningSuggestion,
   ModelRouting,
 } from "../types";
 import {
@@ -52,15 +55,19 @@ import {
 } from "../lib/constants";
 import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, useConfirm, formatUsd, CollapsibleGroup, GroupBySelect, Pagination } from "./shared";
 import { AuditLogPanel } from "./AuditLog";
+import { useWorkspace } from "../lib/workspace";
+
+/** GET /query-tools/{id}/analytics (admin-only). */
+type QueryToolAnalytics = { invocation_count: number; success_count: number; failure_count: number; success_rate: number | null; median_latency_ms: number | null; rows_returned: number; last_invoked_at: string | null; client_usage: { client: string; invocations: number }[]; recent_errors: { at: string; error: string }[] };
 
 
 export function AdminView({ currentUser, notify, setActive: setAppActive }: { currentUser: SessionUser; notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
-  const [tab, setTab] = useState<"users" | "projects" | "connectors" | "models" | "governance" | "audit" | "auth">("connectors");
+  const [tab, setTab] = useState<"users" | "projects" | "connectors" | "models" | "governance" | "audit" | "auth" | "screens">(() => (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("tab") === "screens" ? "screens" : "connectors"));
   return (
     <div className="view-stack">
       <div className="view-header"><div><h2>Administration</h2><p>Configure local access, data sources, model routing, and enterprise identity.</p></div><StatusPill value={currentUser.role} /></div>
-      <div className="tabs"><button className={tab === "connectors" ? "active" : ""} onClick={() => setTab("connectors")}><Server size={16} />Connectors</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Bot size={16} />Model providers</button><button className={tab === "governance" ? "active" : ""} onClick={() => setTab("governance")}><ShieldCheck size={16} />Governance</button><button className={tab === "projects" ? "active" : ""} onClick={() => setTab("projects")}><Layers3 size={16} />Projects</button><button className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}><Users size={16} />Users</button><button className={tab === "audit" ? "active" : ""} onClick={() => setTab("audit")}><Clock3 size={16} />Audit log</button><button className={tab === "auth" ? "active" : ""} onClick={() => setTab("auth")}><KeyRound size={16} />Authentication</button></div>
-      <p className="admin-hint">Looking for the query-tool / external-gateway registry or external agent call history? It's under <strong>Tool registry</strong> in the main navigation — External data tools and Invocation history tabs.</p>
+      <div className="tabs"><button className={tab === "connectors" ? "active" : ""} onClick={() => setTab("connectors")}><Server size={16} />Connectors</button><button className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}><Bot size={16} />Model providers</button><button className={tab === "governance" ? "active" : ""} onClick={() => setTab("governance")}><ShieldCheck size={16} />Governance</button><button className={tab === "projects" ? "active" : ""} onClick={() => setTab("projects")}><Layers3 size={16} />Projects</button><button className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}><Users size={16} />Users</button><button className={tab === "audit" ? "active" : ""} onClick={() => setTab("audit")}><Clock3 size={16} />Audit log</button><button className={tab === "auth" ? "active" : ""} onClick={() => setTab("auth")}><KeyRound size={16} />Authentication</button><button className={tab === "screens" ? "active" : ""} onClick={() => setTab("screens")}><EyeOff size={16} />Screens</button></div>
+      <p className="admin-hint">Looking for the query-tool / external-gateway registry or external agent call history? It's under <strong>Agents &amp; tools</strong> in the main navigation — External gateway / query tools and Invocation history tabs.</p>
       {tab === "connectors" && <ConnectorsAdmin notify={notify} />}
       {tab === "models" && <ModelsAdmin notify={notify} />}
       {tab === "governance" && <GovernanceAdmin notify={notify} setActive={setAppActive} />}
@@ -68,6 +75,7 @@ export function AdminView({ currentUser, notify, setActive: setAppActive }: { cu
       {tab === "users" && <UsersAdmin notify={notify} currentUser={currentUser} />}
       {tab === "audit" && <AuditLogPanel notify={notify} />}
       {tab === "auth" && <AuthAdmin notify={notify} />}
+      {tab === "screens" && <ScreenVisibilityPanel notify={notify} />}
     </div>
   );
 }
@@ -81,6 +89,20 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
   const [showWizard, setShowWizard] = useState(false);
   const [selected, setSelected] = useState<QueryTool | null>(null);
   const [toolForm, setToolForm] = useState(emptyTool);
+  const [aiToolQuestion, setAiToolQuestion] = useState("");
+  const [aiToolDrafting, setAiToolDrafting] = useState(false);
+  async function draftToolWithAi() {
+    setAiToolDrafting(true);
+    try {
+      const draft = await api<QueryToolAiDraft>("/query-tools/draft", { method: "POST", body: JSON.stringify({ sql: toolForm.sql_template, question: aiToolQuestion }) });
+      setToolForm((current) => ({ ...current, name: draft.name, description: draft.description, purpose: draft.purpose, line_of_business: draft.line_of_business, tags: draft.tags.join(", "), parameter_schema: JSON.stringify(draft.parameter_schema, null, 2), allowed_relations: draft.allowed_relations.length ? draft.allowed_relations.join(", ") : current.allowed_relations }));
+      notify(draft.by === "llm" ? `Drafted by ${draft.model ?? "the design model"}: review before saving` : "Drafted from the SQL (no design model routed): review before saving");
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "The draft could not be created", "error");
+    } finally {
+      setAiToolDrafting(false);
+    }
+  }
   const [clientName, setClientName] = useState("");
   const [issuedToken, setIssuedToken] = useState("");
   const [grantClient, setGrantClient] = useState("");
@@ -90,6 +112,11 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
   const [rotating, setRotating] = useState<ExternalClient | null>(null);
   const [rotateExpiryDays, setRotateExpiryDays] = useState("");
   const [testParameters, setTestParameters] = useState("{}");
+  const [confirmRetire, retireDialog] = useConfirm();
+  const { user } = useWorkspace();
+  // Retire and usage analytics are admin-only on the API; engineers see the buttons disabled.
+  const isAdmin = user.role === "admin";
+  const [analytics, setAnalytics] = useState<QueryToolAnalytics | null>(null);
   const [summary, setSummary] = useState<QueryToolRegistrySummary | null>(null);
   const [search, setSearch] = useState("");
   const [groupBy, setGroupBy] = useState<"none" | "data_source" | "line_of_business">("none");
@@ -100,9 +127,14 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Gateway configuration unavailable", "error")); }, [load, notify]);
   function chooseGrantClient(clientId: string, known: QueryToolGrant[] = grants) { setGrantClient(clientId); const existing = known.find((item) => item.external_client_id === clientId); setGrantQuota(existing?.daily_quota ? String(existing.daily_quota) : ""); }
   async function loadGrants(tool: QueryTool) { try { const data = await api<QueryToolGrant[]>(`/query-tools/${tool.id}/grants`); setGrants(data); chooseGrantClient(clients[0]?.id || "", data); } catch { setGrants([]); } }
-  function openTool(tool?: QueryTool) { setGrants([]); setGrantQuota(""); if (tool) void loadGrants(tool); setSelected(tool || null); setToolForm(tool ? { name: tool.name, description: tool.description, purpose: tool.purpose, data_source: tool.data_source, line_of_business: tool.line_of_business, owner: tool.owner, tags: tool.tags.join(", "), connector_id: tool.connector_id || "", upstream_tool_name: tool.upstream_tool_name || "", sql_template: tool.sql_template, parameter_schema: JSON.stringify(tool.parameter_schema, null, 2), allowed_relations: tool.allowed_relations.join(", "), row_limit: tool.row_limit, timeout_seconds: tool.timeout_seconds } : emptyTool); setTestParameters("{}"); setGrantClient(clients[0]?.id || ""); setShowTool(true); }
+  function openTool(tool?: QueryTool) { setAnalytics(null); setGrants([]); setGrantQuota(""); if (tool) void loadGrants(tool); setSelected(tool || null); setToolForm(tool ? { name: tool.name, description: tool.description, purpose: tool.purpose, data_source: tool.data_source, line_of_business: tool.line_of_business, owner: tool.owner, tags: tool.tags.join(", "), connector_id: tool.connector_id || "", upstream_tool_name: tool.upstream_tool_name || "", sql_template: tool.sql_template, parameter_schema: JSON.stringify(tool.parameter_schema, null, 2), allowed_relations: tool.allowed_relations.join(", "), row_limit: tool.row_limit, timeout_seconds: tool.timeout_seconds } : emptyTool); setTestParameters("{}"); setGrantClient(clients[0]?.id || ""); setShowTool(true); }
   function startFromTemplate(kind: "lookup" | "count") { const lookup = kind === "lookup"; setSelected(null); setToolForm({ ...emptyTool, name: lookup ? "record.lookup" : "records.count_by_filter", description: lookup ? "Look up one record by a governed identifier." : "Count governed records using an optional bounded status filter.", purpose: lookup ? "Support a read-only support lookup by identifier." : "Support a read-only operational count by status.", tags: lookup ? "lookup, read-only" : "count, read-only", sql_template: lookup ? "SELECT * FROM staging.example WHERE id = :id LIMIT 1" : "SELECT COUNT(*) AS total FROM staging.example WHERE status = :status", parameter_schema: lookup ? '{"type":"object","required":["id"],"properties":{"id":{"type":"integer"}},"additionalProperties":false}' : '{"type":"object","required":["status"],"properties":{"status":{"type":"string"}},"additionalProperties":false}', allowed_relations: "staging.example", row_limit: lookup ? 1 : 100 }); setTestParameters(lookup ? '{"id": 1}' : '{"status": "active"}'); setGrantClient(clients[0]?.id || ""); setShowTool(true); }
   async function saveTool(event: FormEvent) { event.preventDefault(); try { const payload = { ...toolForm, connector_id: toolForm.connector_id || null, upstream_tool_name: toolForm.upstream_tool_name || null, tags: toolForm.tags.split(",").map((item) => item.trim()).filter(Boolean), parameter_schema: JSON.parse(toolForm.parameter_schema), result_schema: { type: "object" }, allowed_relations: toolForm.allowed_relations.split(",").map((item) => item.trim()).filter(Boolean), requires_approval: false }; await api(selected ? `/query-tools/${selected.id}` : "/query-tools", { method: selected ? "PUT" : "POST", body: JSON.stringify(payload) }); setShowTool(false); setSelected(null); await load(); notify(selected ? "Query tool saved as a new draft version" : "Query tool draft created"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Query tool could not be saved", "error"); } }
+  async function retire(tool: QueryTool) {
+    if (!(await confirmRetire({ title: "Retire query tool", body: `Retire "${tool.name}" v${tool.version}? External agents and bound agents can no longer list or invoke it. The definition and its history are kept.`, confirmLabel: "Retire tool" }))) return;
+    try { await api(`/query-tools/${tool.id}/retire`, { method: "POST" }); await load(); if (selected?.id === tool.id) setShowTool(false); notify("Query tool retired"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Query tool could not be retired", "error"); }
+  }
+  async function loadAnalytics(tool: QueryTool) { try { setAnalytics(await api<QueryToolAnalytics>(`/query-tools/${tool.id}/analytics`)); } catch (reason) { notify(reason instanceof Error ? reason.message : "Usage analytics unavailable", "error"); } }
   async function publish(tool: QueryTool) { try { await api(`/query-tools/${tool.id}/publish`, { method: "POST" }); await load(); notify("Query tool published"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Query tool could not be published", "error"); } }
   async function testTool() { if (!selected) return; try { const result = await api<{ row_count: number }>(`/query-tools/${selected.id}/test`, { method: "POST", body: JSON.stringify({ parameters: JSON.parse(testParameters) }) }); notify(`Query tool returned ${result.row_count} rows`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Query tool test failed", "error"); } }
   async function grant() { if (!selected || !grantClient) return; const quota = grantQuota.trim() ? Number(grantQuota) : null; if (quota !== null && (!Number.isInteger(quota) || quota < 1)) { notify("Daily quota must be a whole number of at least 1, or empty for unlimited", "error"); return; } try { const saved = await api<QueryToolGrant>(`/query-tools/${selected.id}/grants`, { method: "POST", body: JSON.stringify({ external_client_id: grantClient, enabled: true, daily_quota: quota }) }); setGrants((current) => [...current.filter((item) => item.external_client_id !== saved.external_client_id), saved]); notify(quota ? `External client grant saved (${quota} calls/day)` : "External client grant saved (no daily quota)"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Grant could not be saved", "error"); } }
@@ -116,7 +148,7 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
       <div className="section-heading"><div><span className="eyebrow">EXTERNAL AGENT ACCESS</span><h3>Governed query gateway</h3><p>Published parameterized tools are searchable by purpose, source, LOB, owner, and tags over REST and MCP.</p></div><div className="row-actions"><div className="toolbar-search"><Search size={16} /><input placeholder="Search tools by name, owner, LOB, tag..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="secondary-button" onClick={() => setShowWizard(true)}><Database size={16} />Catalog wizard</button><button className="secondary-button" onClick={() => startFromTemplate("lookup")}><Database size={16} />Lookup template</button><button className="secondary-button" onClick={() => startFromTemplate("count")}><FlaskConical size={16} />Count template</button><button className="secondary-button" onClick={() => { setIssuedToken(""); setShowClient(true); }}><KeyRound size={16} />New client</button><button className="primary-button" onClick={() => openTool()}><Plus size={16} />New query tool</button></div></div>
       <div className="metric-grid three"><Metric label="Published" value={summary?.published ?? "-"} detail="Available to granted clients" icon={<Check size={18} />} tone="teal" /><Metric label="Invocations" value={summary?.tools.reduce((total, tool) => total + tool.invocation_count, 0) ?? "-"} detail="Audited external requests" icon={<Network size={18} />} tone="blue" /><Metric label="Never invoked" value={summary?.never_invoked ?? "-"} detail="Review for adoption or retirement" icon={<AlertCircle size={18} />} tone="amber" /></div>
       <div className="list-toolbar"><GroupBySelect value={groupBy} onChange={setGroupBy} options={[{ value: "none", label: "None" }, { value: "data_source", label: "Data source" }, { value: "line_of_business", label: "Line of business" }]} /></div>
-      {groupBy === "none" ? <GatewayToolRows params={{ q: query }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} /> : facets.data ? (facets.data[groupBy].length ? facets.data[groupBy].map((facet) => <CollapsibleGroup key={facet.value} title={facet.value} count={facet.count} defaultOpen={facets.data!.total <= 20}><GatewayToolRows params={{ q: query, [groupBy]: facet.value }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} compact /></CollapsibleGroup>) : <div className="inline-empty">{query ? "No tools match your search." : "No query tools yet."}</div>) : <LoadingBlock label="Grouping tools" />}
+      {groupBy === "none" ? <GatewayToolRows params={{ q: query }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} onRetire={retire} canRetire={isAdmin} /> : facets.data ? (facets.data[groupBy].length ? facets.data[groupBy].map((facet) => <CollapsibleGroup key={facet.value} title={facet.value} count={facet.count} defaultOpen={facets.data!.total <= 20}><GatewayToolRows params={{ q: query, [groupBy]: facet.value }} connectors={connectors} searching={!!query} onOpen={openTool} onPublish={publish} onRetire={retire} canRetire={isAdmin} compact /></CollapsibleGroup>) : <div className="inline-empty">{query ? "No tools match your search." : "No query tools yet."}</div>) : <LoadingBlock label="Grouping tools" />}
     </section>
     <section className="surface admin-surface">
       <div className="section-heading compact"><div><span className="eyebrow">CLIENT CREDENTIALS</span><h3>External clients</h3></div><code>/mcp / external/v1/query-tools</code></div>
@@ -131,24 +163,26 @@ export function GatewayAdmin({ notify }: { notify: (message: string, tone?: "ok"
       <div className="form-grid"><label>Owner<input value={toolForm.owner} onChange={(event) => setToolForm({ ...toolForm, owner: event.target.value })} required /></label><label>Tags<input value={toolForm.tags} onChange={(event) => setToolForm({ ...toolForm, tags: event.target.value })} placeholder="accounts, customer, read-only" /></label></div>
       {selectedConnector?.connection_mode === "mcp" && <label>Upstream MCP tool name<input value={toolForm.upstream_tool_name} onChange={(event) => setToolForm({ ...toolForm, upstream_tool_name: event.target.value })} placeholder="get_account" required /></label>}
       <label>Read-only SQL template<textarea rows={7} value={toolForm.sql_template} onChange={(event) => setToolForm({ ...toolForm, sql_template: event.target.value })} required /></label>
+      {!selected && <div className="tool-ai-draft-row"><input value={aiToolQuestion} onChange={(event) => setAiToolQuestion(event.target.value)} placeholder="Optional: the business question this tool answers" aria-label="Question for AI draft" /><button type="button" className="secondary-button" onClick={() => void draftToolWithAi()} disabled={aiToolDrafting || (!toolForm.sql_template.trim() && !aiToolQuestion.trim())}>{aiToolDrafting ? <RefreshCw size={16} className="spin" /> : <Sparkles size={16} />}Draft with AI</button></div>}
       <label>Parameter JSON Schema<textarea rows={7} value={toolForm.parameter_schema} onChange={(event) => setToolForm({ ...toolForm, parameter_schema: event.target.value })} required /></label>
       <div className="form-grid"><label>Allowed relations<input value={toolForm.allowed_relations} onChange={(event) => setToolForm({ ...toolForm, allowed_relations: event.target.value })} /></label><label>Row limit<input type="number" min={1} max={1000} value={toolForm.row_limit} onChange={(event) => setToolForm({ ...toolForm, row_limit: Number(event.target.value) })} /></label></div>
-      {selected && <><label>Test parameters<textarea rows={4} value={testParameters} onChange={(event) => setTestParameters(event.target.value)} /></label><div className="inline-admin-form"><select value={grantClient} onChange={(event) => chooseGrantClient(event.target.value)}><option value="">Select external client</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select><input type="number" min={1} max={1000000} placeholder="Daily quota (unlimited)" title="Maximum invocations per UTC day for this client; empty = unlimited" value={grantQuota} onChange={(event) => setGrantQuota(event.target.value)} /><button type="button" className="secondary-button" onClick={grant}><KeyRound size={16} />Grant</button><button type="button" className="secondary-button" onClick={testTool}><Play size={16} />Test</button></div></>}
+      {selected && <><label>Test parameters<textarea rows={4} value={testParameters} onChange={(event) => setTestParameters(event.target.value)} /></label><div className="inline-admin-form"><select value={grantClient} onChange={(event) => chooseGrantClient(event.target.value)}><option value="">Select external client</option>{clients.map((client) => <option value={client.id} key={client.id}>{client.name}</option>)}</select><input type="number" min={1} max={1000000} placeholder="Daily quota (unlimited)" title="Maximum invocations per UTC day for this client; empty = unlimited" value={grantQuota} onChange={(event) => setGrantQuota(event.target.value)} /><button type="button" className="secondary-button" onClick={grant}><KeyRound size={16} />Grant</button><button type="button" className="secondary-button" onClick={testTool}><Play size={16} />Test</button><button type="button" className="secondary-button" onClick={() => void loadAnalytics(selected)} disabled={!isAdmin} title={isAdmin ? "Invocation analytics for this tool" : "Usage analytics are admin-only"}><Gauge size={16} />Usage</button><button type="button" className="secondary-button danger" onClick={() => void retire(selected)} disabled={!isAdmin || selected.status === "retired"} title={isAdmin ? "Retire this tool" : "Retiring tools is admin-only"}><XCircle size={16} />Retire</button></div>{analytics && <div className="policy-details query-tool-analytics"><div><span>Invocations</span><strong>{analytics.invocation_count} ({analytics.success_count} ok / {analytics.failure_count} failed)</strong></div><div><span>Success rate</span><strong>{analytics.success_rate == null ? "-" : `${analytics.success_rate}%`}</strong></div><div><span>Median latency</span><strong>{analytics.median_latency_ms == null ? "-" : `${analytics.median_latency_ms} ms`}</strong></div><div><span>Rows returned</span><strong>{analytics.rows_returned}</strong></div><div><span>Last invoked</span><strong>{analytics.last_invoked_at ? new Date(analytics.last_invoked_at).toLocaleString() : "Never"}</strong></div><div><span>Clients</span><strong>{analytics.client_usage.map((item) => `${item.client} (${item.invocations})`).join(", ") || "None"}</strong></div>{analytics.recent_errors.length > 0 && <div><span>Recent errors</span><strong>{analytics.recent_errors.map((item) => item.error).join(" · ")}</strong></div>}</div>}</>}
       <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowTool(false)}>Cancel</button><button className="primary-button"><Archive size={16} />Save draft</button></div>
     </form></Modal>}
     {rotating && <Modal title={`Rotate token: ${rotating.name}`} onClose={() => setRotating(null)}><form className="modal-form" onSubmit={rotate}><div className="policy-banner"><KeyRound size={18} /><span><strong>The current token stops working immediately</strong><small>{rotating.expires_at ? `${rotating.expired ? "Expired" : "Expires"} ${new Date(rotating.expires_at).toLocaleDateString()}` : "The current token never expires"}. Leave the field empty to keep the current expiry.</small></span></div><label>Expires in days<input type="number" min={1} max={365} placeholder="Keep current expiry" value={rotateExpiryDays} onChange={(event) => setRotateExpiryDays(event.target.value)} /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setRotating(null)}>Cancel</button><button className="primary-button"><RefreshCw size={16} />Rotate token</button></div></form></Modal>}
+    {retireDialog}
     {showClient && <Modal title="External client" onClose={() => setShowClient(false)}>{issuedToken ? <div className="modal-form"><div className="policy-banner"><KeyRound size={18} /><span><strong>One-time client token</strong><small>This value is not available again after this dialog closes.</small></span></div><label>Bearer token<textarea readOnly rows={4} value={issuedToken} onFocus={(event) => event.currentTarget.select()} /></label><div className="modal-actions"><button className="primary-button" onClick={() => setShowClient(false)}><Check size={16} />Done</button></div></div> : <form className="modal-form" onSubmit={createClient}><label>Client name<input value={clientName} onChange={(event) => setClientName(event.target.value)} required /></label><label>Expires in days<input type="number" min={1} max={365} placeholder="Never expires" value={clientExpiryDays} onChange={(event) => setClientExpiryDays(event.target.value)} /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowClient(false)}>Cancel</button><button className="primary-button"><KeyRound size={16} />Issue token</button></div></form>}</Modal>}
   </div>;
 }
 
-function GatewayToolRows({ params, connectors, searching, onOpen, onPublish, compact = false }: { params: PageParams; connectors: Connector[]; searching: boolean; onOpen: (tool: QueryTool) => void; onPublish: (tool: QueryTool) => void; compact?: boolean }) {
+function GatewayToolRows({ params, connectors, searching, onOpen, onPublish, onRetire, canRetire = false, compact = false }: { params: PageParams; connectors: Connector[]; searching: boolean; onOpen: (tool: QueryTool) => void; onPublish: (tool: QueryTool) => void; onRetire?: (tool: QueryTool) => void; canRetire?: boolean; compact?: boolean }) {
   const pagination = usePagination(params, compact ? 25 : 50);
   const page = usePagedQuery<QueryTool>(scopes.queryTools, "/query-tools", params, pagination);
   const items = page.data?.items ?? [];
   if (!items.length) return page.isPending ? <LoadingBlock label="Loading tools" /> : <div className="inline-empty">{searching ? "No tools match your search." : "No query tools yet."}</div>;
   return <>
     <div className="table-header gateway-tool-grid"><span>Tool</span><span>Connector</span><span>Version</span><span>Status</span><span /></div>
-    {items.map((tool) => <div className="data-row gateway-tool-grid" key={tool.id}><button className="metric-main" onClick={() => onOpen(tool)}><strong>{tool.name}</strong><small>{tool.line_of_business} · {tool.purpose}</small></button><span>{connectors.find((item) => item.id === tool.connector_id)?.name || "Local PostgreSQL"}</span><span>v{tool.version}</span><StatusPill value={tool.status} /><button className="icon-button" title="Publish query tool" disabled={tool.status === "published"} onClick={() => onPublish(tool)}><Check size={16} /></button></div>)}
+    {items.map((tool) => <div className="data-row gateway-tool-grid" key={tool.id}><button className="metric-main" onClick={() => onOpen(tool)}><strong>{tool.name}</strong><small>{tool.line_of_business} · {tool.purpose}</small></button><span>{connectors.find((item) => item.id === tool.connector_id)?.name || "Local PostgreSQL"}</span><span>v{tool.version}</span><StatusPill value={tool.status} /><span className="row-actions"><button className="icon-button" title={tool.status === "retired" ? "Publish again (un-retire)" : "Publish query tool"} disabled={tool.status === "published"} onClick={() => onPublish(tool)}><Check size={16} /></button>{onRetire && <button className="icon-button danger" title={canRetire ? "Retire query tool" : "Retiring tools is admin-only"} disabled={!canRetire || tool.status === "retired"} onClick={() => onRetire(tool)}><XCircle size={16} /></button>}</span></div>)}
     <Pagination state={pagination} total={page.data?.total ?? 0} count={items.length} busy={page.isFetching} label="tools" compact={compact} />
   </>;
 }
@@ -167,22 +201,6 @@ export function QueryToolWizard({ notify, onCancel, onUse }: { notify: (message:
   return <div className="view-stack"><div className="view-header"><div><h2>Catalog query-tool wizard</h2><p>Select a governed relation and column. The generated contract remains a draft for review, testing, publication, and grants.</p></div><button className="secondary-button" onClick={onCancel}>Back to gateway</button></div><section className="surface admin-surface"><form className="modal-form" onSubmit={(event) => { event.preventDefault(); void generate(); }}><label>Relation<select value={assetId} onChange={(event) => chooseAsset(event.target.value)} required>{relations.map((relation) => <option value={relation.asset_id} key={relation.asset_id}>{relation.relation} / {relation.connector_name}</option>)}</select></label>{selected && <div className="policy-banner"><Database size={18} /><span><strong>{selected.source_name}</strong><small>{selected.tags.join(", ") || "No catalog tags"}</small></span></div>}<div className="form-grid"><label>Contract template<select value={template} onChange={(event) => setTemplate(event.target.value as "record_lookup" | "filtered_count" | "recent_records")}><option value="record_lookup">Record lookup</option><option value="filtered_count">Count by filter</option><option value="recent_records">Recent records</option></select></label><label>{columnLabel}<select value={column} onChange={(event) => setColumn(event.target.value)} required>{selected?.columns.map((item) => <option key={item.name} value={item.name}>{item.name} / {item.type}</option>)}</select></label></div><div className="modal-actions"><button type="button" className="secondary-button" onClick={onCancel}>Cancel</button><button className="primary-button" disabled={!selected || !column || generating}>{generating ? <RefreshCw size={16} className="spin" /> : <Sparkles size={16} />}Generate draft</button></div></form></section></div>;
 }
 
-// Maps a learning suggestion's proposed_change.review_target (the
-// FeedbackCreate.context_type it originated from — sql/agent_run/dataset/
-// notebook/artifact) to the nav section where a human would actually go to
-// make the versioned change the suggestion is asking for review of. This is
-// UI-only wayfinding: it does not touch any prompt, tool, or policy, and
-// nothing about it violates the "no automatic runtime change" governance
-// posture documented in ARCHITECTURE_DECISIONS.md §2 — it just removes the
-// friction of a reviewer having to remember which screen owns which area.
-const REVIEW_TARGET_NAV: Record<string, { key: NavKey; label: string }> = {
-  sql: { key: "sql", label: "Open SQL workspace" },
-  agent_run: { key: "agents", label: "Open agent registry" },
-  dataset: { key: "datasets", label: "Open dataset catalog" },
-  notebook: { key: "notebooks", label: "Open notebooks" },
-  artifact: { key: "artifacts", label: "Open artifacts" },
-};
-
 export function GovernanceAdmin({ notify, setActive }: { notify: (message: string, tone?: "ok" | "error") => void; setActive?: (key: NavKey) => void }) {
   const [confirm, confirmDialog] = useConfirm();
   const emptyPrompt = { name: "", system_prompt: "", template: "", variables: "" };
@@ -193,25 +211,10 @@ export function GovernanceAdmin({ notify, setActive }: { notify: (message: strin
   const [promptForm, setPromptForm] = useState(emptyPrompt);
   const [rollbackVersion, setRollbackVersion] = useState(1);
   const [retentionForm, setRetentionForm] = useState({ resource_type: "audit_events", retention_days: 365, enabled: true });
-  const [suggestions, setSuggestions] = useState<LearningSuggestion[]>([]);
-  const [suggestionFilter, setSuggestionFilter] = useState<"open" | "accepted" | "dismissed">("open");
-  const [reviewingSuggestion, setReviewingSuggestion] = useState<LearningSuggestion | null>(null);
-  const [reviewNote, setReviewNote] = useState("");
-  const [govTab, setGovTab] = useState<"prompts" | "retention" | "learning" | "router">("prompts");
+  // Learning-loop suggestions and router evaluation moved to Learning (docs/UX_CONSOLIDATION.md §4.2).
+  const [govTab, setGovTab] = useState<"prompts" | "retention">("prompts");
   const load = useCallback(async () => { const [promptData, retentionData] = await Promise.all([api<PromptArtifact[]>("/prompts"), api<RetentionPolicy[]>("/retention-policies")]); setPrompts(promptData); setPolicies(retentionData); }, []);
-  const loadSuggestions = useCallback(async (status: "open" | "accepted" | "dismissed") => { try { setSuggestions(await api<LearningSuggestion[]>(`/learning-suggestions?status=${status}`)); } catch (reason) { notify(reason instanceof Error ? reason.message : "Learning suggestions unavailable", "error"); } }, [notify]);
   useEffect(() => { load().catch((reason) => notify(reason instanceof Error ? reason.message : "Governance configuration unavailable", "error")); }, [load, notify]);
-  useEffect(() => { loadSuggestions(suggestionFilter); }, [loadSuggestions, suggestionFilter]);
-  function openReview(suggestion: LearningSuggestion) { setReviewingSuggestion(suggestion); setReviewNote(""); }
-  async function submitReview(status: "accepted" | "dismissed") {
-    if (!reviewingSuggestion) return;
-    try {
-      await api(`/learning-suggestions/${reviewingSuggestion.id}`, { method: "PUT", body: JSON.stringify({ status, note: reviewNote || null }) });
-      notify(status === "accepted" ? "Suggestion accepted — apply the change as a versioned update yourself" : "Suggestion dismissed");
-      setReviewingSuggestion(null);
-      await loadSuggestions(suggestionFilter);
-    } catch (reason) { notify(reason instanceof Error ? reason.message : "Review could not be saved", "error"); }
-  }
   function openPrompt(prompt?: PromptArtifact) { setEditing(prompt || null); setPromptForm(prompt ? { name: prompt.name, system_prompt: prompt.content.system_prompt || "", template: prompt.content.template || "", variables: (prompt.content.variables || []).join(", ") } : emptyPrompt); setRollbackVersion(1); setShowPrompt(true); }
   async function savePrompt(event: FormEvent) { event.preventDefault(); try { await api("/prompts", { method: "POST", body: JSON.stringify({ ...promptForm, variables: promptForm.variables.split(",").map((item) => item.trim()).filter(Boolean), prompt_id: editing?.id || null, metadata: {} }) }); setShowPrompt(false); await load(); notify("Prompt draft version saved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be saved", "error"); } }
   async function publishPrompt(prompt: PromptArtifact) { try { await api(`/artifacts/${prompt.id}/review`, { method: "POST", body: JSON.stringify({ decision: "approved", note: "Published from prompt governance" }) }); await load(); notify("Prompt approved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Prompt could not be approved", "error"); } }
@@ -220,24 +223,11 @@ export function GovernanceAdmin({ notify, setActive }: { notify: (message: strin
   async function saveRetention(event: FormEvent) { event.preventDefault(); try { await api("/retention-policies", { method: "POST", body: JSON.stringify(retentionForm) }); await load(); notify("Retention policy saved"); } catch (reason) { notify(reason instanceof Error ? reason.message : "Retention policy could not be saved", "error"); } }
   async function runRetention(policy: RetentionPolicy) { try { const result = await api<{ candidate_count: number }>(`/retention-policies/${policy.id}/run`, { method: "POST" }); notify(`${result.candidate_count} expired records sent for approval`); } catch (reason) { notify(reason instanceof Error ? reason.message : "Retention preview failed", "error"); } }
   return <div className="view-stack">
-    <div className="tabs"><button className={govTab === "prompts" ? "active" : ""} onClick={() => setGovTab("prompts")}><Archive size={16} />Prompts</button><button className={govTab === "retention" ? "active" : ""} onClick={() => setGovTab("retention")}><Clock3 size={16} />Retention</button><button className={govTab === "learning" ? "active" : ""} onClick={() => setGovTab("learning")}><Sparkles size={16} />Learning loop{suggestions.length > 0 && suggestionFilter === "open" ? <span className="nav-count">{suggestions.length}</span> : null}</button><button className={govTab === "router" ? "active" : ""} onClick={() => setGovTab("router")}><Network size={16} />Router evaluation</button></div>
-    {govTab === "router" && <RouterEvaluationPanel notify={notify} />}
+    <div className="tabs"><button className={govTab === "prompts" ? "active" : ""} onClick={() => setGovTab("prompts")}><Archive size={16} />Prompts</button><button className={govTab === "retention" ? "active" : ""} onClick={() => setGovTab("retention")}><Clock3 size={16} />Retention</button></div>
+    <p className="admin-hint">Learning-loop suggestions and router evaluation now live in <Link href="/learning?tab=suggestions">Learning → Suggestions</Link> and <Link href="/learning?tab=router">Learning → Router &amp; tool choice</Link>, next to verified queries and evaluations.</p>
     {govTab === "prompts" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">PROMPT LIFECYCLE</span><h3>Versioned prompts</h3><p>Draft, review, approve, and roll back reusable model instructions.</p></div><button className="primary-button" onClick={() => openPrompt()}><Plus size={16} />New prompt</button></div><div className="table-header prompt-grid"><span>Prompt</span><span>Version</span><span>Status</span><span /></div>{prompts.map((prompt) => <div className="data-row prompt-grid" key={prompt.id}><button className="metric-main" onClick={() => openPrompt(prompt)}><strong>{prompt.name}</strong><small>{(prompt.content.variables || []).join(", ") || "No variables"}</small></button><span>v{prompt.version}</span><StatusPill value={prompt.status} /><span className="row-actions"><button className="icon-button" title="Approve prompt" disabled={prompt.status === "approved"} onClick={() => publishPrompt(prompt)}><Check size={16} /></button><button className="icon-button" title="Delete prompt and version history" onClick={() => deletePrompt(prompt)}><XCircle size={16} /></button></span></div>)}</section>}
     {govTab === "retention" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">DATA LIFECYCLE</span><h3>Retention controls</h3><p>Preview expired operational records and route permanent deletion through approval.</p></div></div><form className="inline-admin-form retention-form" onSubmit={saveRetention}><select value={retentionForm.resource_type} onChange={(event) => setRetentionForm({ ...retentionForm, resource_type: event.target.value })}><option value="audit_events">Audit events</option><option value="model_call_logs">Model call logs</option><option value="external_invocations">External invocations</option><option value="user_feedback">User feedback</option></select><input type="number" min={1} max={3650} value={retentionForm.retention_days} onChange={(event) => setRetentionForm({ ...retentionForm, retention_days: Number(event.target.value) })} aria-label="Retention days" /><button className="primary-button"><Archive size={16} />Save</button></form><div className="table-header retention-grid"><span>Resource</span><span>Days</span><span>Status</span><span /></div>{policies.map((policy) => <div className="data-row retention-grid" key={policy.id}><strong>{policy.resource_type.replaceAll("_", " ")}</strong><span>{policy.retention_days}</span><StatusPill value={policy.enabled ? "enabled" : "disabled"} /><button className="secondary-button" onClick={() => runRetention(policy)}><Play size={15} />Preview and run</button></div>)}</section>}
-    {govTab === "learning" && <section className="surface admin-surface"><div className="section-heading"><div><span className="eyebrow">LEARNING LOOP</span><h3>Feedback-derived suggestions</h3><p>Repeated not-helpful feedback in the same area is grouped into one suggestion with escalating severity. Nothing here changes runtime behavior automatically — review and apply changes yourself.</p></div><select value={suggestionFilter} onChange={(event) => setSuggestionFilter(event.target.value as typeof suggestionFilter)} aria-label="Filter suggestions by status"><option value="open">Open</option><option value="accepted">Accepted</option><option value="dismissed">Dismissed</option></select></div>{suggestions.length ? <div className="table-header suggestion-grid"><span>Signal</span><span>Category</span><span>Occurrences</span><span>Severity</span><span /></div> : <div className="inline-empty">No {suggestionFilter} suggestions for this project.</div>}{suggestions.map((suggestion) => <div className="data-row suggestion-grid" key={suggestion.id}><span><strong>{suggestion.title}</strong><small>{suggestion.rationale}</small></span><span>{suggestion.category.replaceAll("_", " ")}</span><span className="mono">{suggestion.occurrence_count}</span><StatusPill value={suggestion.severity} />{suggestion.status === "open" ? <button className="secondary-button" onClick={() => openReview(suggestion)}><Check size={15} />Review</button> : <span className="caption">{suggestion.status} {suggestion.review_note ? `— ${suggestion.review_note}` : ""}</span>}</div>)}</section>}
-    {showPrompt && <Modal title={editing ? `Edit ${editing.name}` : "Create prompt"} onClose={() => setShowPrompt(false)}><form className="modal-form" onSubmit={savePrompt}><label>Name<input value={promptForm.name} onChange={(event) => setPromptForm({ ...promptForm, name: event.target.value })} required /></label><label>System prompt<textarea rows={7} value={promptForm.system_prompt} onChange={(event) => setPromptForm({ ...promptForm, system_prompt: event.target.value })} required /></label><label>Template<textarea rows={7} value={promptForm.template} onChange={(event) => setPromptForm({ ...promptForm, template: event.target.value })} required /></label><label>Variables<input value={promptForm.variables} onChange={(event) => setPromptForm({ ...promptForm, variables: event.target.value })} placeholder="question, catalog_context" /></label>{editing && <div className="inline-admin-form prompt-rollback"><input type="number" min={1} max={editing.version} value={rollbackVersion} onChange={(event) => setRollbackVersion(Number(event.target.value))} aria-label="Rollback source version" /><button type="button" className="secondary-button" onClick={rollbackPrompt}><RefreshCw size={16} />Rollback</button></div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowPrompt(false)}>Cancel</button><button className="primary-button"><Archive size={16} />Save version</button></div></form></Modal>}{reviewingSuggestion && <Modal title={reviewingSuggestion.title} onClose={() => setReviewingSuggestion(null)}><p className="modal-description">{reviewingSuggestion.rationale}</p><div className="policy-details"><div><span>Category</span><strong>{reviewingSuggestion.category.replaceAll("_", " ")}</strong></div><div><span>Occurrences</span><strong>{reviewingSuggestion.occurrence_count}</strong></div><div><span>Severity</span><strong>{reviewingSuggestion.severity}</strong></div></div>{reviewingSuggestion.proposed_change.recent_signals?.length ? <div className="tool-list">{reviewingSuggestion.proposed_change.recent_signals.map((signal, index) => <div key={signal.feedback_id || index}><span><small>{signal.comment || "No comment provided"}</small></span></div>)}</div> : null}
-{setActive && reviewingSuggestion.proposed_change.review_target && REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target] && (
-  <div className="modal-note">
-    <ShieldCheck size={16} />
-    <span>
-      Accepting only records your decision — it never changes a prompt, tool, or policy by itself. To make the actual fix, go review it yourself.
-      <button type="button" className="link-button" onClick={() => setActive!(REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target!].key)}>
-        {REVIEW_TARGET_NAV[reviewingSuggestion.proposed_change.review_target!].label} →
-      </button>
-    </span>
-  </div>
-)}
-<label>Review note<textarea rows={4} value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} placeholder="What you decided and why, for the audit trail" /></label><div className="modal-actions"><button type="button" className="secondary-button" onClick={() => submitReview("dismissed")}><XCircle size={16} />Dismiss</button><button className="primary-button" onClick={() => submitReview("accepted")}><Check size={16} />Accept</button></div></Modal>}{confirmDialog}</div>;
+    {showPrompt && <Modal title={editing ? `Edit ${editing.name}` : "Create prompt"} onClose={() => setShowPrompt(false)}><form className="modal-form" onSubmit={savePrompt}><label>Name<input value={promptForm.name} onChange={(event) => setPromptForm({ ...promptForm, name: event.target.value })} required /></label><label>System prompt<textarea rows={7} value={promptForm.system_prompt} onChange={(event) => setPromptForm({ ...promptForm, system_prompt: event.target.value })} required /></label><label>Template<textarea rows={7} value={promptForm.template} onChange={(event) => setPromptForm({ ...promptForm, template: event.target.value })} required /></label><label>Variables<input value={promptForm.variables} onChange={(event) => setPromptForm({ ...promptForm, variables: event.target.value })} placeholder="question, catalog_context" /></label>{editing && <div className="inline-admin-form prompt-rollback"><input type="number" min={1} max={editing.version} value={rollbackVersion} onChange={(event) => setRollbackVersion(Number(event.target.value))} aria-label="Rollback source version" /><button type="button" className="secondary-button" onClick={rollbackPrompt}><RefreshCw size={16} />Rollback</button></div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowPrompt(false)}>Cancel</button><button className="primary-button"><Archive size={16} />Save version</button></div></form></Modal>}{confirmDialog}</div>;
 }
 
 export function ProjectsAdmin({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
@@ -507,95 +497,6 @@ function ModelRoutingPanel({ notify }: { notify: (message: string, tone?: "ok" |
         </div>
       </>}
     </div>
-  );
-}
-
-type RouterEvaluation = {
-  cases: number;
-  backends: Record<string, { accuracy: number | null; avg_latency_ms: number | null; effective_backend: string | null; results: { question: string; expected: string; got: string; confidence: number; backend: string; correct: boolean }[] }>;
-};
-const ROUTER_BACKENDS = ["local", "llm", "jev"] as const;
-const ROUTER_SAMPLE_CASES = "How many orders were placed per month? | sql_analysis\nRun the monthly revenue reconciliation agent | agent_run\nWhat does it mean? | clarify";
-
-const BACKEND_KIND_LABELS: Record<string, string> = { llm: "LLM", jev: "Jev", local: "Local" };
-
-/**
- * The backend that actually answered: "llm:gemini-3.6-flash" / "jev:typesafe/jev-1.13-…" show
- * the kind and model; only "local (…)" — e.g. "local (jev unavailable)" — is a fallback.
- */
-function EffectiveBackend({ value }: { value: string | null }) {
-  if (!value) return <span>-</span>;
-  if (value.startsWith("local (")) {
-    const reason = value.slice("local (".length).replace(/\)$/, "");
-    return <span className="effective-backend"><strong>Local</strong><span className="chip fallback-chip" title={`Fell back to local rules: ${reason}`}>fallback</span><small>{reason}</small></span>;
-  }
-  const separator = value.indexOf(":");
-  if (separator > 0) {
-    const kind = value.slice(0, separator);
-    const model = value.slice(separator + 1);
-    return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[kind] || kind}</strong><small className="mono">{model}</small></span>;
-  }
-  return <span className="effective-backend" title={value}><strong>{BACKEND_KIND_LABELS[value] || value}</strong></span>;
-}
-
-/** Replays labelled questions through each decision-router backend (POST /router/evaluate). */
-export function RouterEvaluationPanel({ notify }: { notify: (message: string, tone?: "ok" | "error") => void }) {
-  const [casesText, setCasesText] = useState(ROUTER_SAMPLE_CASES);
-  const [backends, setBackends] = useState<Record<string, boolean>>({ local: true, llm: true, jev: true });
-  const [includeFeedback, setIncludeFeedback] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [report, setReport] = useState<RouterEvaluation | null>(null);
-  const [openBackend, setOpenBackend] = useState("");
-  async function run(event: FormEvent) {
-    event.preventDefault();
-    const cases = casesText.split("\n").map((line) => line.split("|").map((part) => part.trim())).filter(([question, route]) => question && route).map(([question, route]) => ({ question, expected_route: route }));
-    const selected = ROUTER_BACKENDS.filter((name) => backends[name]);
-    if (!selected.length) { notify("Choose at least one backend", "error"); return; }
-    if (!cases.length && !includeFeedback) { notify("Add at least one labelled case (question | expected_route) or include feedback", "error"); return; }
-    setRunning(true);
-    try {
-      setReport(await api<RouterEvaluation>("/router/evaluate", { method: "POST", body: JSON.stringify({ backends: selected, cases, include_feedback: includeFeedback }) }));
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : "Router evaluation failed", "error");
-    } finally {
-      setRunning(false);
-    }
-  }
-  const rows = report ? Object.entries(report.backends) : [];
-  // Best = highest accuracy; ties go to the lowest average latency.
-  const best = rows.filter(([, item]) => item.accuracy != null).sort(([, a], [, b]) => (b.accuracy! - a.accuracy!) || ((a.avg_latency_ms ?? Infinity) - (b.avg_latency_ms ?? Infinity)))[0]?.[0] || "";
-  const openItem = openBackend ? report?.backends[openBackend] : undefined;
-  return (
-    <section className="surface admin-surface">
-      <div className="section-heading"><div><span className="eyebrow">DECISION ROUTER</span><h3>Router evaluation</h3><p>Replay labelled questions, plus answers users rated, through each routing backend. Enable a backend only if it wins on your own data.</p></div></div>
-      <form className="modal-form router-eval-form" onSubmit={run}>
-        <label>Labelled cases (one per line: question | expected_route)<textarea rows={4} value={casesText} onChange={(event) => setCasesText(event.target.value)} placeholder="How many orders per month? | sql_analysis" /></label>
-        <div className="router-eval-options">
-          {ROUTER_BACKENDS.map((name) => <label key={name} className="check-option"><input type="checkbox" checked={!!backends[name]} onChange={(event) => setBackends((current) => ({ ...current, [name]: event.target.checked }))} />{name}</label>)}
-          <label className="check-option"><input type="checkbox" checked={includeFeedback} onChange={(event) => setIncludeFeedback(event.target.checked)} />Include rated answers</label>
-          <button className="primary-button" disabled={running}>{running ? <RefreshCw size={16} className="spin" /> : <Play size={16} />}Run evaluation</button>
-        </div>
-      </form>
-      {report && <>
-        <div className="subheading"><h4>Results</h4><span>{report.cases} case{report.cases === 1 ? "" : "s"}</span></div>
-        <div className="table-header router-eval-grid"><span>Backend</span><span>Effective</span><span>Accuracy</span><span>Avg latency</span><span /></div>
-        {rows.map(([name, item]) => (
-          <div key={name} className={`data-row router-eval-grid${name === best ? " best" : ""}${openBackend === name ? " selected" : ""}`}>
-            <span><strong>{name}</strong>{name === best && <span className="chip best-chip" title="Highest accuracy (ties: lowest latency)">best</span>}</span>
-            <EffectiveBackend value={item.effective_backend} />
-            <span className="mono">{item.accuracy == null ? "-" : `${Math.round(item.accuracy * 100)}%`}</span>
-            <span className="mono">{item.avg_latency_ms == null ? "-" : `${Math.round(item.avg_latency_ms)} ms`}</span>
-            <button type="button" className="text-button" onClick={() => setOpenBackend(openBackend === name ? "" : name)} aria-expanded={openBackend === name} aria-controls="router-eval-cases">{openBackend === name ? "Hide cases" : "Cases"}</button>
-          </div>
-        ))}
-        {openItem && (
-          <div className="router-eval-case-panel" id="router-eval-cases">
-            <div className="subheading"><h4>Cases for {openBackend}</h4><span>{openItem.results.filter((result) => result.correct).length} of {openItem.results.length} correct</span></div>
-            <div className="router-eval-cases">{openItem.results.map((result, index) => <div key={index} className={result.correct ? "" : "miss"}>{result.correct ? <Check size={13} aria-label="correct" /> : <XCircle size={13} aria-label="wrong" />}<span><strong>{result.question}</strong><small>expected {result.expected} · got {result.got} ({Math.round(result.confidence * 100)}%)</small></span></div>)}</div>
-          </div>
-        )}
-      </>}
-    </section>
   );
 }
 

@@ -283,6 +283,10 @@ async def retry_job(job_id: str, user: User = Depends(get_current_user), db: Ses
     require_project_resource(original, project, "Job")
     if original.status not in {"FAILED", "CANCELLED", "PARTIALLY_SUCCEEDED"}:
         raise HTTPException(status_code=409, detail="Only failed, cancelled, or partial jobs can be retried")
+    rerun_from = {"sql_tuning": "Learning → Performance (Tune)", "sql_composition": "SQL → Build from business logic", "prompt_optimization": "Learning → Prompt optimization"}
+    if original.job_type in rerun_from:
+        # Retry replays agent plans; these jobs have their own inputs, so re-run them where they started.
+        raise HTTPException(status_code=409, detail=f"Re-run this {original.job_type.replace('_', ' ')} job from {rerun_from[original.job_type]}")
     # The retry keeps the original's autonomy level and full objective (the
     # title is truncated to 200 chars) but never inherits its plan binding:
     # the retry is re-planned and, if risky, held for a fresh approval.

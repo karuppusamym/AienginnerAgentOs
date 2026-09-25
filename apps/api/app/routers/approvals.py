@@ -246,7 +246,7 @@ def list_approvals(
     ]
 
 # High-impact actions that need a second person when APPROVAL_SEPARATION_OF_DUTIES=true.
-SEPARATE_APPROVER_ACTIONS = {"agent_execution", "create_index", "prompt_activation", "publish_superset_query", "tool_execution", "deploy_pipeline", "apply_retention"}
+SEPARATE_APPROVER_ACTIONS = {"agent_execution", "create_index", "prompt_activation", "publish_superset_query", "tool_execution", "deploy_pipeline", "apply_retention", "sql_rewrite_activation"}
 
 
 @router.post("/approvals/{approval_id}/decision")
@@ -272,7 +272,7 @@ async def decide_approval(
     job, schedule = apply_approval_decision(db, project, approval, payload.decision, payload.note, user)
     workflow_id = None
     approval_evidence = approval.evidence or {}
-    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index"}:
+    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index", "sql_rewrite_activation"}:
         # Plan-bound approvals (review finding H5): the worker loads the plan
         # frozen in approval.evidence, re-verifies plan_hash and executes it
         # verbatim -- it never re-plans, and a hash mismatch fails the job
@@ -469,6 +469,11 @@ def apply_approval_decision(
             job.progress = 100
             job.evidence = [*job.evidence, {"type": "deleted_records", "label": str(deleted_count)}]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
+    if approval.action_type == "sql_rewrite_activation":
+        # A tuned, result-equivalent rewrite becomes the verified query for its question.
+        from ..query_tuner import apply_rewrite_decision
+
+        apply_rewrite_decision(db, approval, decision, actor)
     if approval.action_type == "prompt_activation":
         if decision == "approved":
             learning.activate_runtime_prompt(db, str(approval.evidence.get("artifact_id", "")), int(approval.evidence.get("version", 0)))

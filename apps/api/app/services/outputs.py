@@ -51,6 +51,12 @@ def project_output(project: Project, db: Session, user: User) -> dict[str, Any]:
     }
 
 
+def _hidden_screens(project: Project | None) -> list[str]:
+    from ..screen_visibility import hidden_screens
+
+    return hidden_screens(project)
+
+
 def session_user_output(user: User, db: Session) -> dict[str, Any]:
     membership = current_membership(db, user)
     project = db.get(Project, membership.project_id) if membership else None
@@ -60,6 +66,8 @@ def session_user_output(user: User, db: Session) -> dict[str, Any]:
         "current_project_name": project.name if project else None,
         "effective_project_role": membership.role if membership else None,
         "permissions": sorted(project_permissions(user, membership.role if membership else None)),
+        # Screens an admin hid for this project (e.g. for a demo); navigation leaves them out.
+        "hidden_screens": _hidden_screens(project),
     }
 
 

@@ -313,3 +313,31 @@ def set_project_model_provider(
     audit(db, user, "project.model_selected", "project", project.id, {"provider_id": provider.id})
     db.commit()
     return project_output(project, db, user)
+
+
+class ScreenVisibilityUpdate(BaseModel):
+    hidden: list[str] = Field(default_factory=list, max_length=40)
+
+
+@router.get("/ui/screens")
+def get_screen_visibility(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Screens hidden for the current project (navigation leaves them out)."""
+    from ..screen_visibility import LOCKED_SCREENS, hidden_screens
+
+    project = require_current_project(db, user)
+    return {"project_id": project.id, "hidden": hidden_screens(project), "locked": sorted(LOCKED_SCREENS), "can_edit": user.role == "admin"}
+
+
+@router.put("/ui/screens")
+def update_screen_visibility(payload: ScreenVisibilityUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Hide or show screens for the current project, e.g. to keep a demo focused. Presentation only: APIs are unchanged."""
+    from ..screen_visibility import LOCKED_SCREENS, set_hidden_screens
+
+    project = require_current_project(db, admin)
+    try:
+        hidden = set_hidden_screens(project, payload.hidden)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, admin, "project.screens_updated", "project", project.id, {"hidden": hidden})
+    db.commit()
+    return {"project_id": project.id, "hidden": hidden, "locked": sorted(LOCKED_SCREENS), "can_edit": True}

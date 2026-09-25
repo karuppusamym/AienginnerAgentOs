@@ -25,12 +25,21 @@ import type {
 import { StatusPill, Metric, ControlItem, SecurityOverviewPanel } from "./shared";
 
 
+/**
+ * Home. The objective box hands the question to Analysis (docs/UX_CONSOLIDATION.md §4.4),
+ * which keeps the conversation and routes to agents itself; "Run as agent" still starts a
+ * bounded agent run directly for roles allowed to (jobs:write: admin, engineer).
+ */
 export function WorkspaceView({
   setActive,
   notify,
+  onAskInAnalysis,
+  canRunAgent = false,
 }: {
   setActive: (key: NavKey) => void;
   notify: (message: string, tone?: "ok" | "error") => void;
+  onAskInAnalysis?: (question: string) => void;
+  canRunAgent?: boolean;
 }) {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [security, setSecurity] = useState<SecurityOverview | null>(null);
@@ -53,8 +62,14 @@ export function WorkspaceView({
 
   useEffect(load, [load]);
 
-  async function runObjective(event: FormEvent) {
+  function askInAnalysis(event: FormEvent) {
     event.preventDefault();
+    if (!objective.trim()) return;
+    if (onAskInAnalysis) onAskInAnalysis(objective.trim());
+    else void runObjective();
+  }
+
+  async function runObjective() {
     if (!objective.trim()) return;
     setRunning(true);
     try {
@@ -79,9 +94,9 @@ export function WorkspaceView({
       <section className="command-surface">
         <div className="command-heading">
           <div>
-            <span className="eyebrow">AUTONOMY LEVEL 2 / BOUNDED DRAFT</span>
+            <span className="eyebrow">ASK IN ANALYSIS / AGENT RUNS AT AUTONOMY LEVEL 2</span>
             <h2>What do you want to build or understand?</h2>
-            <p>DataPilot will inspect metadata, select specialists, and return a reviewable plan with evidence.</p>
+            <p>Your question opens in Analysis, which keeps the conversation and routes to the right specialist agents. Use Run as agent for a detached, bounded agent run with a reviewable plan.</p>
           </div>
           <div className="command-model">
             <span className="status-dot" />
@@ -92,7 +107,7 @@ export function WorkspaceView({
             <Bot size={16} />
           </div>
         </div>
-        <form className="command-input" onSubmit={runObjective}>
+        <form className="command-input" onSubmit={askInAnalysis}>
           <Sparkles size={20} />
           <textarea
             value={objective}
@@ -100,10 +115,16 @@ export function WorkspaceView({
             placeholder="Ask about your data, generate SQL, or draft a pipeline..."
             rows={2}
           />
-          <button className="send-button" disabled={running || !objective.trim()} aria-label="Run request">
-            {running ? <RefreshCw size={19} className="spin" /> : <Send size={19} />}
+          <button className="send-button" disabled={running || !objective.trim()} aria-label="Ask in Analysis" title="Ask in Analysis">
+            <Send size={19} />
           </button>
         </form>
+        <div className="command-secondary">
+          <button type="button" className="secondary-button" onClick={() => void runObjective()} disabled={!canRunAgent || running || !objective.trim()} title={canRunAgent ? "Start a bounded agent run (autonomy level 2) and show its plan here" : "Running agents requires jobs:write (engineer or admin)"}>
+            {running ? <RefreshCw size={16} className="spin" /> : <Bot size={16} />}Run as agent
+          </button>
+          {!canRunAgent && <small>Agent runs need engineer or admin permissions.</small>}
+        </div>
         <div className="quick-prompts" aria-label="Catalog-based recommended questions">
           {recommendations.map((recommendation, index) => <button key={`${recommendation.relation}-${index}`} title={recommendation.basis} onClick={() => setObjective(recommendation.question)}>{recommendation.question}</button>)}
         </div>

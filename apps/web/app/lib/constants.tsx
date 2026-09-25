@@ -9,46 +9,46 @@ import {
   Code2,
   Database,
   FileUp,
-  FlaskConical,
   Gauge,
   GitBranch,
   GraduationCap,
   LayoutDashboard,
   MessageSquare,
-  Network,
   Settings,
   ShieldCheck,
 } from "lucide-react";
 import type { NavKey } from "../types";
 
+// Sidebar information architecture (docs/UX_CONSOLIDATION.md). "tools" and
+// "evaluations" keep their NavKey and route but are not listed: their pages were
+// merged into Agents & tools and Learning, and the routes redirect there (NAV_REDIRECTS).
 export const navItems: { key: NavKey; label: string; icon: typeof LayoutDashboard }[] = [
-  { key: "workspace", label: "Workspace", icon: LayoutDashboard },
+  { key: "workspace", label: "Home", icon: LayoutDashboard },
   { key: "conversations", label: "Analysis", icon: MessageSquare },
+  { key: "superset", label: "Dashboards", icon: Gauge },
   { key: "datasets", label: "Datasets", icon: Database },
   { key: "files", label: "Files", icon: FileUp },
+  { key: "semantic", label: "Semantic layer", icon: Braces },
+  { key: "quality", label: "Quality", icon: ShieldCheck },
   { key: "sql", label: "SQL", icon: Code2 },
   { key: "notebooks", label: "Notebooks", icon: BookOpen },
   { key: "pipelines", label: "Pipelines", icon: GitBranch },
-  { key: "jobs", label: "Jobs", icon: Activity },
   { key: "artifacts", label: "Artifacts", icon: Archive },
-  { key: "quality", label: "Quality", icon: ShieldCheck },
-  { key: "superset", label: "Superset", icon: Gauge },
+  { key: "agents", label: "Agents & tools", icon: Bot },
+  { key: "jobs", label: "Jobs", icon: Activity },
   { key: "approvals", label: "Approvals", icon: Check },
-  { key: "tools", label: "Tool registry", icon: Network },
-  { key: "agents", label: "Agents", icon: Bot },
-  { key: "semantic", label: "Semantic layer", icon: Braces },
-  { key: "evaluations", label: "Evaluations", icon: FlaskConical },
   { key: "learning", label: "Learning", icon: GraduationCap },
   { key: "admin", label: "Admin", icon: Settings },
   { key: "architecture", label: "Architecture", icon: Boxes },
 ];
 
+/** Five areas by user job: Analyze · Data · Build · Automate · Govern. */
 export const navGroups: { key: string; label: string; items: NavKey[] }[] = [
-  { key: "overview", label: "Overview", items: ["workspace", "conversations"] },
-  { key: "data", label: "Data workspace", items: ["datasets", "files", "sql", "notebooks"] },
-  { key: "delivery", label: "Build & operate", items: ["pipelines", "jobs", "quality", "artifacts", "approvals"] },
-  { key: "governance", label: "Governance & agents", items: ["semantic", "tools", "agents", "evaluations", "learning", "superset"] },
-  { key: "administration", label: "Administration", items: ["admin", "architecture"] },
+  { key: "analyze", label: "Analyze", items: ["workspace", "conversations", "superset"] },
+  { key: "data", label: "Data", items: ["datasets", "files", "semantic", "quality"] },
+  { key: "build", label: "Build", items: ["sql", "notebooks", "pipelines", "artifacts"] },
+  { key: "automate", label: "Automate", items: ["agents", "jobs"] },
+  { key: "govern", label: "Govern", items: ["approvals", "learning", "admin", "architecture"] },
 ];
 
 export const roleLanding: Record<string, NavKey> = {
@@ -58,12 +58,36 @@ export const roleLanding: Record<string, NavKey> = {
   viewer: "datasets",
 };
 
+/**
+ * Nav items a role sees by default ("all" = everything `canView` allows).
+ * Everything else the role may open stays reachable by URL and appears under
+ * "Show advanced". This is presentation only: `canView` remains the route gate
+ * and the API enforces permissions. Unknown roles see everything they may open.
+ */
+export const roleNav: Record<string, NavKey[] | "all"> = {
+  admin: "all",
+  engineer: [
+    "workspace", "conversations", "superset", "datasets", "files", "semantic", "quality", "sql", "notebooks",
+    "pipelines", "artifacts", "agents", "jobs", "approvals", "learning",
+  ],
+  analyst: ["conversations", "superset", "datasets", "semantic", "sql", "notebooks", "artifacts"],
+  viewer: ["datasets", "semantic", "superset", "artifacts"],
+};
+
+/** True when the item is in the role's default (non-advanced) sidebar. */
+export function isPrimaryNav(view: NavKey, role: string) {
+  const items = roleNav[role];
+  return !items || items === "all" || items.includes(view);
+}
+
+export const NAV_ADVANCED_STORAGE_KEY = "datapilot.nav.showAdvanced";
+
 export const TOUR_STORAGE_KEY = "datapilot_tour_completed_v1";
 
 export const defaultTourSteps: { key: NavKey; title: string; body: string }[] = [
   {
     key: "workspace",
-    title: "Workspace overview",
+    title: "Home overview",
     body: "Start here for system health, recent jobs, recommendations, and a quick way to launch a governed objective.",
   },
   {

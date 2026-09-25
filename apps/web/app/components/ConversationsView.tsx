@@ -37,7 +37,7 @@ import {
 import React, { FormEvent, KeyboardEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError, apiStream, SessionUser } from "../lib/api";
-import type { AnswerEnsemble, AnswerLearning, AnswerStage, ChartType, Connector, Conversation, ConversationMessage, JevDecision, RouteCandidate, RouteDecision, SQLExecutionResult } from "../types";
+import type { AnswerEnsemble, AnswerLearning, AnswerReview, AnswerStage, ChartType, Connector, Conversation, ConversationMessage, JevDecision, RouteCandidate, RouteDecision, SQLExecutionResult } from "../types";
 import { projectKey, scopes, useConnectors, useConversationMessages, useConversations, useInvalidate, useQueryErrorToast, useSupersetStatus, type MessagePages } from "../lib/queries";
 import dynamic from "next/dynamic";
 import { useWorkspace } from "../lib/workspace";
@@ -69,6 +69,7 @@ const ANSWER_STAGES: { key: string; label: string }[] = [
   { key: "executing", label: "Run preview" },
   { key: "routing", label: "Route" },
   { key: "answering", label: "Answer" },
+  { key: "reviewing", label: "Review" },
 ];
 const ROUTE_ICONS: Record<string, ReactNode> = {
   sql_analysis: <Sparkles size={13} />,
@@ -151,6 +152,44 @@ function ResultTable({ result }: { result: SQLExecutionResult }) {
         {pages > 1 && <span className="row-actions"><button className="icon-button" aria-label="Previous page" disabled={page === 0} onClick={() => setPage(page - 1)}><ChevronLeft size={14} /></button><span>{page + 1}/{pages}</span><button className="icon-button" aria-label="Next page" disabled={page >= pages - 1} onClick={() => setPage(page + 1)}><ChevronRight size={14} /></button></span>}
       </div>
     </div>
+  );
+}
+
+const REVIEW_LABELS: Record<AnswerReview["verdict"], string> = { ok: "Reviewed ✓", check: "Check", doubtful: "Doubtful", unreviewed: "Unreviewed" };
+const REVIEW_CHECK_LABELS: Record<string, string> = {
+  sql_executed: "SQL executed",
+  rows_returned: "Rows returned",
+  numbers_in_result: "Figures come from the result",
+  tables_match_grounding: "Tables match the grounding",
+  not_fallback: "Not the safety fallback",
+  route_confident: "Question was grounded",
+};
+
+function ReviewBadge({ review }: { review: AnswerReview }) {
+  const failed = review.checks.filter((check) => !check.passed).map((check) => check.detail);
+  const title = review.warning || (failed.length ? failed.join("; ") : review.verdict === "unreviewed" ? "The reviewer could not run" : "All review checks passed");
+  return <span className={`review-badge review-${review.verdict}`} title={title}>{REVIEW_LABELS[review.verdict] || review.verdict}</span>;
+}
+
+/** Automatic answer reviewer: deterministic checks plus the answer_review decision model. */
+function ReviewSection({ review }: { review?: AnswerReview }) {
+  if (!review) return null;
+  const probabilities = Object.entries(review.probabilities || {});
+  return (
+    <section className="inspector-section">
+      <h4>Review</h4>
+      <p className="inspector-line"><ReviewBadge review={review} />{review.score != null && <small> score {formatProbability(review.score)}</small>}<small> · {review.by === "jev" ? "Jev" : review.by === "llm" ? "text model" : review.by === "deterministic" ? "deterministic checks only" : "not reviewed"}{review.model ? <> · <code>{review.model}</code></> : null}{review.latency_ms != null ? ` · ${review.latency_ms} ms` : ""}{review.cost_usd ? ` · ${formatUsd(review.cost_usd)}` : ""}</small></p>
+      {review.warning && <p className="review-warning">{review.warning}</p>}
+      {review.checks.length ? (
+        <ul className="review-checks">
+          {review.checks.map((check) => <li key={check.name} className={check.passed ? "passed" : "failed"}><span aria-label={check.passed ? "passed" : "failed"}>{check.passed ? "✓" : "✗"}</span><strong>{REVIEW_CHECK_LABELS[check.name] || check.name}</strong><small>{check.detail}</small></li>)}
+        </ul>
+      ) : null}
+      {probabilities.map(([name, value]) => (
+        <div className="score-row" key={name}><span className="score-label">{name === "answers_question" ? "Answers the question" : name === "grounded" ? "Narrative consistent" : name}</span><small>{formatProbability(value)}</small><ScoreBar value={value} tone={value >= 0.6 ? "brand" : "muted"} label={`${name} probability`} /></div>
+      ))}
+      {review.model_error && <p className="inspector-muted">Decision model: {review.model_error}</p>}
+    </section>
   );
 }
 
@@ -721,6 +760,7 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
                       {execution && !execution.error && <span><b>{execution.row_count}</b> row{execution.row_count === 1 ? "" : "s"}{execution.truncated ? "+" : ""}</span>}
                       {s.cache?.hit && <span className="chip">cached</span>}
                       {s.route && <RouteBadge route={s.route} />}
+                      {s.review && <ReviewBadge review={s.review} />}
                       <ChevronRight size={14} className="result-card-arrow" />
                     </button>
                   )}
@@ -792,6 +832,7 @@ export function ConversationsView({ notify, currentUser, seed, onSeedConsumed, r
               onCsv={downloadCsv}
               onPublish={(sql) => setDialog({ kind: "tool", name: selectedConversation?.title || "Tool API", sql, purpose: inspected.structured.question || selectedConversation?.title || "", source: inspected.structured.source?.name || "DataPilot workspace" })}
               onNotebook={(sql) => setDialog({ kind: "notebook", name: selectedConversation?.title || "Analysis Notebook", sql })}
+              onAsk={canEdit && !busy ? (text) => void ask(text) : undefined}
             />
           ) : <EmptyState icon={<CircleGauge size={24} />} title="No results yet" body="The result table, chart, SQL, grounding sources and routing decision for the selected answer appear here." />}
         </aside>
@@ -846,7 +887,7 @@ function ThinkingBubble({ stage, onStop }: { stage: AnswerStage | null; onStop: 
   );
 }
 
-function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, canEdit, onCopy, onCsv, onPublish, onNotebook }: {
+function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, canEdit, onCopy, onCsv, onPublish, onNotebook, onAsk }: {
   message: ConversationMessage;
   tab: InspectorTab;
   onTab: (tab: InspectorTab) => void;
@@ -858,6 +899,8 @@ function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, ca
   onCsv: (result: SQLExecutionResult, name: string) => void;
   onPublish: (sql: string) => void;
   onNotebook: (sql: string) => void;
+  /** Chart drill-down that needs finer data than the result holds asks it as a follow-up question. */
+  onAsk?: (question: string) => void;
 }) {
   const s = message.structured;
   const execution = toolResult?.result || s.execution;
@@ -885,9 +928,9 @@ function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, ca
                 {!toolResult && (s.chart?.data?.length && shownChart ? (
                   <>
                     <ChartTypeSwitcher options={chartOptions} value={shownChart} onChange={onChartType} reason={s.chart.reason} />
-                    {shownChart !== "table" && <AnalysisChart chart={s.chart} type={shownChart} />}
+                    {shownChart !== "table" && <AnalysisChart chart={s.chart} type={shownChart} onDrill={onAsk ? (request) => onAsk(request.question) : undefined} />}
                   </>
-                ) : <AnalysisChart chart={s.chart} />)}
+                ) : <AnalysisChart chart={s.chart} onDrill={onAsk ? (request) => onAsk(request.question) : undefined} />)}
                 <ResultTable result={execution} />
                 <div className="inspector-actions"><button className="secondary-button compact" onClick={() => onCsv(execution, s.question || "result")}><Download size={13} />CSV</button>{!toolResult && s.sql && <SupersetPublishButton message={message} canEdit={canEdit} />}</div>
               </>
@@ -955,6 +998,7 @@ function Inspector({ message, tab, onTab, toolResult, chartType, onChartType, ca
           <>
             {s.route ? <DecisionPanel route={s.route} /> : <p className="inspector-muted inspector-pad">This answer predates the decision router.</p>}
             {s.route?.jev && <JevSection jev={s.route.jev} />}
+            <ReviewSection review={s.review} />
             <EnsembleSection ensemble={s.ensemble} />
           </>
         )}

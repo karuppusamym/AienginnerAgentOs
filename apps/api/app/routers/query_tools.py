@@ -426,6 +426,25 @@ def query_tool_analytics(
         raise HTTPException(status_code=404, detail="Query tool not found")
     return {"tool": query_tool_output(tool), **query_tool_usage_summary(db, tool)}
 
+class QueryToolDraftRequest(BaseModel):
+    sql: str = Field(default="", max_length=100_000)
+    question: str = Field(default="", max_length=4_000)
+
+
+@router.post("/query-tools/draft")
+def draft_query_tool_metadata(payload: QueryToolDraftRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Draft purpose, description, tags, parameter schema and line of business from SQL or a question. Nothing is saved."""
+    from ..agent_designer import draft_query_tool
+
+    require_permission(user, db, "registry:write", "Registry write permission required")
+    if not payload.sql.strip() and not payload.question.strip():
+        raise HTTPException(status_code=422, detail="Give the SQL template or the question the tool should answer")
+    project = require_current_project(db, user)
+    draft = draft_query_tool(db, user, project.id, payload.sql, payload.question)
+    db.commit()  # keeps the agent_design call log
+    return draft
+
+
 @router.post("/query-tools", status_code=201)
 def create_query_tool(payload: QueryToolCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     require_permission(user, db, "registry:write", "Registry write permission required")

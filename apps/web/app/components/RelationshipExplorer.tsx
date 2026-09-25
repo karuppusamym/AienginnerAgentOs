@@ -2,16 +2,19 @@ import {
   ArrowLeft,
   Braces,
   ChevronRight,
+  ChevronsDown,
+  ChevronsUp,
   CircleCheck,
+  Columns3,
   Download,
   ExternalLink,
   Eye,
   FileCode2,
   FileSpreadsheet,
-  Info,
   LocateFixed,
   Network,
   Search,
+  Share2,
   Table2,
   TriangleAlert,
   Wrench,
@@ -19,6 +22,7 @@ import {
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { api } from "../lib/api";
+import { GraphCanvas, type GraphEdge, type GraphLayout, type GraphNode } from "./GraphCanvas";
 import { LoadingBlock, EmptyState, StatusPill } from "./shared";
 import "./relationship-explorer.css";
 
@@ -189,6 +193,71 @@ function edgeTitle(edge: ExplorerEdge, name: (id: string) => string): string {
 
 const edgeClass = (edge: ExplorerEdge) => (edge.type !== "lineage" && edge.cross_connector ? "cross" : edge.type);
 
+/**
+ * The interactive diagram's nodes and edges at the current drill level: a collapsed source is
+ * one node (its relationships aggregated), an expanded source shows its tables, and a table
+ * with its columns open shows column nodes plus column-level join / lineage edges.
+ */
+function buildCanvas(input: {
+  nodes: ExplorerNode[]; edges: ExplorerEdge[]; mode: "overview" | "focus"; focus: string | null;
+  collapsed: Set<string>; columns: Record<string, AssetColumn[]>; sources: ExplorerSource[];
+  color: (key: string) => string; name: (id: string) => string;
+}): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const { nodes, edges, mode, focus, collapsed, columns, sources, color, name } = input;
+  const out: GraphNode[] = [];
+  const links: GraphEdge[] = [];
+  const bySource = new Map<string, ExplorerNode[]>();
+  nodes.forEach((node) => bySource.set(sourceKey(node), [...(bySource.get(sourceKey(node)) || []), node]));
+  const columnIds = new Set<string>();
+  for (const [key, members] of bySource) {
+    if (collapsed.has(key)) {
+      const meta = sources.find((source) => source.key === key);
+      out.push({ id: `src:${key}`, kind: "source", label: meta?.label || members[0].source_label, sublabel: `${members.length} asset${members.length === 1 ? "" : "s"} in view${meta && meta.asset_count > members.length ? ` of ${meta.asset_count}` : ""}`, color: color(key), weight: members.length, expandable: true, expanded: false, focus: members.some((node) => node.id === focus), rank: mode === "focus" ? 0 : null });
+      continue;
+    }
+    for (const node of members) {
+      const badges = [KIND_LABEL[node.kind], `${node.column_count} cols`, ...(node.pii_column_count ? [`PII ${node.pii_column_count}`] : []), ...(!node.queryable ? ["not queryable"] : [])];
+      out.push({ id: node.id, kind: "table", label: node.table_name, sublabel: `${node.schema_name} · ${node.source_label}`, color: color(key), rank: mode === "focus" ? node.level ?? 0 : null, seedFrom: `src:${key}`, weight: node.column_count, expandable: node.column_count > 0, expanded: Boolean(columns[node.id]), focus: node.id === focus, warn: !node.queryable, badges });
+      for (const column of columns[node.id] || []) {
+        const id = `col:${node.id}:${column.name}`;
+        columnIds.add(id);
+        const pii = column.sensitivity === "pii" || Boolean(column.pii_category);
+        out.push({ id, kind: "column", label: column.name, sublabel: column.type, parent: node.id, color: color(key), badges: pii ? ["PII"] : undefined });
+        links.push({ id: `member:${id}`, source: node.id, target: id, kind: "member" });
+      }
+    }
+  }
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const representative = (id: string) => { const node = byId.get(id); if (!node) return null; const key = sourceKey(node); return collapsed.has(key) ? `src:${key}` : id; };
+  const aggregate = new Map<string, { source: string; target: string; count: number; kinds: Map<string, number> }>();
+  for (const edge of edges) {
+    const a = representative(edge.source);
+    const b = representative(edge.target);
+    if (!a || !b || a === b) continue;
+    if (a.startsWith("src:") || b.startsWith("src:")) {
+      const key = [a, b].sort().join("|");
+      const entry = aggregate.get(key) || { source: a, target: b, count: 0, kinds: new Map<string, number>() };
+      entry.count += 1;
+      entry.kinds.set(edge.type, (entry.kinds.get(edge.type) || 0) + 1);
+      aggregate.set(key, entry);
+      continue;
+    }
+    const kind = edgeClass(edge);
+    const directed = edge.type === "lineage";
+    links.push({ id: edge.id, source: a, target: b, kind, directed, title: edgeTitle(edge, name) });
+    if (columns[edge.source] && columns[edge.target]) {
+      edge.columns.forEach((pair, position) => {
+        const from = `col:${edge.source}:${pair.left}`;
+        const to = `col:${edge.target}:${pair.right}`;
+        if (columnIds.has(from) && columnIds.has(to)) links.push({ id: `${edge.id}:col:${position}`, source: from, target: to, kind, directed, title: `${name(edge.source)}.${pair.left} ${directed ? "→" : "="} ${name(edge.target)}.${pair.right}` });
+      });
+    }
+  }
+  const typeLabel: Record<string, string> = { lineage: "lineage", governed_join: "governed join", inferred_join: "inferred join" };
+  aggregate.forEach((entry, key) => links.push({ id: `agg:${key}`, source: entry.source, target: entry.target, kind: "aggregate", weight: entry.count, title: `${entry.count} relationship${entry.count === 1 ? "" : "s"}: ${[...entry.kinds].map(([type, count]) => `${count} ${typeLabel[type] || type}`).join(", ")} — expand the source to see them` }));
+  return { nodes: out, edges: links };
+}
+
 function download(filename: string, type: string, body: string) {
   const url = URL.createObjectURL(new Blob([body], { type }));
   const link = document.createElement("a");
@@ -206,7 +275,15 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
   const [includeInferred, setIncludeInferred] = useState(true);
   const [trail, setTrail] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [hovered, setHovered] = useState<string | null>(null);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  const [selectedColumn, setSelectedColumn] = useState<string | null>(null);
+  const [layoutChoice, setLayoutChoice] = useState<GraphLayout | null>(null);
+  // null = automatic: big multi-source overviews start collapsed to one node per source.
+  const [collapsed, setCollapsed] = useState<Set<string> | null>(null);
+  const [columnsOpen, setColumnsOpen] = useState<Record<string, AssetColumn[]>>({});
+  const [extra, setExtra] = useState<{ nodes: ExplorerNode[]; edges: ExplorerEdge[] }>({ nodes: [], edges: [] });
+  const [fitVersion, setFitVersion] = useState(0);
+  const columnCache = useRef(new Map<string, AssetColumn[]>());
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [view, setView] = useState<"diagram" | "table">("diagram");
@@ -215,7 +292,6 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState<AssetDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
-  const viewportRef = useRef<HTMLDivElement>(null);
   const focusId = trail.length ? trail[trail.length - 1] : null;
 
   useEffect(() => {
@@ -252,7 +328,7 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
     let live = true;
     setDetailLoading(true);
     api<AssetDetail>(`/semantic/explorer/assets/${encodeURIComponent(detailId)}?include_inferred=${includeInferred}`)
-      .then((data) => { if (live) setDetail(data); })
+      .then((data) => { columnCache.current.set(data.asset.id, data.asset.columns); if (live) setDetail(data); })
       .catch((reason) => notify(reason instanceof Error ? reason.message : "Dataset context unavailable", "error"))
       .finally(() => { if (live) setDetailLoading(false); });
     return () => { live = false; };
@@ -263,35 +339,18 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
   const sourceColorIndex = useMemo(() => new Map(sources.map((source, position) => [source.key, (position % 8) + 1])), [sources]);
   const color = useCallback((key: string) => `var(--chart-${sourceColorIndex.get(key) || 8})`, [sourceColorIndex]);
   const nodes = useMemo(() => graph?.nodes || [], [graph]);
-  const nodeById = useMemo(() => new Map([...(index?.nodes || []), ...nodes].map((node) => [node.id, node])), [index, nodes]);
+  const nodeById = useMemo(() => new Map([...(index?.nodes || []), ...extra.nodes, ...nodes].map((node) => [node.id, node])), [index, nodes, extra]);
   const name = useCallback((id: string) => nodeById.get(id)?.relation || id, [nodeById]);
   const layout = useMemo(() => {
     if (!graph || !nodes.length) return null;
     return graph.mode === "focus" && graph.focus ? focusLayout(nodes, graph.focus) : overviewLayout(nodes, sources, color);
   }, [graph, nodes, sources, color]);
   const edges = useMemo(() => (graph?.edges || []).filter((edge) => layout?.rects.has(edge.source) && layout.rects.has(edge.target)), [graph, layout]);
-  const incomingViews = useMemo(() => {
-    const counts = new Map<string, number>();
-    edges.forEach((edge) => { if (edge.type === "lineage") counts.set(edge.target, (counts.get(edge.target) || 0) + 1); });
-    return counts;
-  }, [edges]);
-  const connected = useMemo(() => {
-    if (!hovered) return null;
-    const ids = new Set([hovered]);
-    edges.forEach((edge) => { if (edge.source === hovered || edge.target === hovered) { ids.add(edge.source); ids.add(edge.target); } });
-    return ids;
-  }, [hovered, edges]);
 
   const needle = query.trim().toLowerCase();
   const matches = useCallback((node: ExplorerNode) => !needle || node.relation.toLowerCase().includes(needle) || node.source_label.toLowerCase().includes(needle), [needle]);
   const searchResults = useMemo(() => (needle ? (index?.nodes || []).filter(matches).slice(0, 10) : []), [needle, index, matches]);
 
-  useEffect(() => {
-    if (!layout || !focusId || !viewportRef.current) return;
-    const rect = layout.rects.get(focusId);
-    const viewport = viewportRef.current;
-    if (rect) viewport.scrollTo({ left: Math.max(0, rect.x + CARD_W / 2 - viewport.clientWidth / 2), top: Math.max(0, rect.y - 60), behavior: "smooth" });
-  }, [layout, focusId]);
 
   const focusOn = (id: string) => {
     setTrail((current) => {
@@ -299,6 +358,8 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
       return existing >= 0 ? current.slice(0, existing + 1) : [...current, id];
     });
     setSelectedId(null);
+    setSelectedSource(null);
+    setSelectedColumn(null);
     setQuery("");
     setSearchOpen(false);
   };
@@ -337,6 +398,105 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
   };
 
   const focusNode = focusId ? nodeById.get(focusId) : null;
+  // ---------------------------------------------------------------- interactive graph: drill source -> table -> column
+  const [seenGraph, setSeenGraph] = useState<ExplorerGraph | null>(null);
+  if (graph !== seenGraph) {
+    // A new neighbourhood / scope starts from its own default drill level.
+    setSeenGraph(graph);
+    setExtra({ nodes: [], edges: [] });
+    setCollapsed(null);
+    setSelectedSource(null);
+    setSelectedColumn(null);
+  }
+  const allNodes = useMemo(() => {
+    const map = new Map(nodes.map((node) => [node.id, node]));
+    extra.nodes.forEach((node) => { if (!map.has(node.id)) map.set(node.id, node); });
+    return [...map.values()];
+  }, [nodes, extra]);
+  const allEdges = useMemo(() => {
+    const map = new Map((graph?.edges || []).map((edge) => [edge.id, edge]));
+    extra.edges.forEach((edge) => { if (!map.has(edge.id)) map.set(edge.id, edge); });
+    return [...map.values()];
+  }, [graph, extra]);
+  const presentSources = useMemo(() => [...new Set(allNodes.map(sourceKey))], [allNodes]);
+  const autoCollapsed = useMemo(() => new Set(graph?.mode === "overview" && allNodes.length > 40 && presentSources.length > 1 ? presentSources : []), [graph, allNodes.length, presentSources]);
+  const collapsedSet = collapsed ?? autoCollapsed;
+  const graphLayout: GraphLayout = layoutChoice ?? (graph?.mode === "focus" ? "hierarchical" : "force");
+  const canvas = useMemo(() => buildCanvas({ nodes: allNodes, edges: allEdges, mode: graph?.mode || "overview", focus: graph?.focus || null, collapsed: collapsedSet, columns: columnsOpen, sources, color, name }), [allNodes, allEdges, graph, collapsedSet, columnsOpen, sources, color, name]);
+
+  const expandSource = (key: string) => setCollapsed(new Set([...collapsedSet].filter((item) => item !== key)));
+  const collapseSource = (key: string) => setCollapsed(new Set([...collapsedSet, key]));
+  const showColumns = async (id: string) => {
+    try {
+      let columns = columnCache.current.get(id);
+      if (!columns) {
+        const data = await api<AssetDetail>(`/semantic/explorer/assets/${encodeURIComponent(id)}?include_inferred=${includeInferred}`);
+        columns = data.asset.columns;
+        columnCache.current.set(id, columns);
+      }
+      const shown = columns;
+      setColumnsOpen((current) => ({ ...current, [id]: shown }));
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Columns unavailable", "error");
+    }
+  };
+  const hideColumns = (id: string) => setColumnsOpen((current) => { if (!current[id]) return current; const next = { ...current }; delete next[id]; return next; });
+  const expandNode = (id: string) => { if (id.startsWith("src:")) expandSource(id.slice(4)); else if (!id.startsWith("col:")) void showColumns(id); };
+  const collapseNode = (id: string) => { if (id.startsWith("src:")) collapseSource(id.slice(4)); else if (!id.startsWith("col:")) hideColumns(id); };
+  const expandNeighbours = async (id: string) => {
+    try {
+      const params = new URLSearchParams({ scope: "all", depth: "1", include_inferred: String(includeInferred), focus: id });
+      const data = await api<ExplorerGraph>(`/semantic/explorer?${params}`);
+      const known = new Set(allNodes.map((node) => node.id));
+      const knownEdges = new Set(allEdges.map((edge) => edge.id));
+      const focusMode = graph?.mode === "focus";
+      const base = nodeById.get(id)?.level ?? 0;
+      const fresh = data.nodes.filter((node) => !known.has(node.id)).map((node) => ({ ...node, level: focusMode ? (node.lane === "join" ? base : base + (node.level ?? 0)) : null, lane: focusMode ? node.lane : null }));
+      const freshEdges = data.edges.filter((edge) => !knownEdges.has(edge.id));
+      if (!fresh.length && !freshEdges.length) { notify(`Every neighbour of ${name(id)} is already shown`); return; }
+      setExtra((current) => ({ nodes: [...current.nodes, ...fresh], edges: [...current.edges, ...freshEdges] }));
+      const freshSources = new Set(fresh.map(sourceKey));
+      if ([...freshSources].some((key) => collapsedSet.has(key))) setCollapsed(new Set([...collapsedSet].filter((key) => !freshSources.has(key))));
+      notify(`Added ${fresh.length} neighbour${fresh.length === 1 ? "" : "s"} and ${freshEdges.length} relationship${freshEdges.length === 1 ? "" : "s"} around ${name(id)}`);
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : "Neighbours unavailable", "error");
+    }
+  };
+  const selectCanvas = (id: string | null) => {
+    if (!id) { setSelectedId(null); setSelectedSource(null); setSelectedColumn(null); return; }
+    if (id.startsWith("src:")) { setSelectedSource(id.slice(4)); setSelectedId(null); setSelectedColumn(null); return; }
+    if (id.startsWith("col:")) {
+      const rest = id.slice(4);
+      const cut = rest.indexOf(":");
+      setSelectedId(rest.slice(0, cut));
+      setSelectedColumn(rest.slice(cut + 1));
+      setSelectedSource(null);
+      return;
+    }
+    setSelectedId(id);
+    setSelectedColumn(null);
+    setSelectedSource(null);
+  };
+  const canvasSelected = selectedSource ? `src:${selectedSource}` : selectedId && selectedColumn ? `col:${selectedId}:${selectedColumn}` : selectedId;
+  const selectedTable = selectedId ? nodeById.get(selectedId) || null : null;
+  const levelSource = selectedSource ?? (selectedTable ? sourceKey(selectedTable) : null);
+  const levelSourceLabel = levelSource ? sources.find((source) => source.key === levelSource)?.label || allNodes.find((node) => sourceKey(node) === levelSource)?.source_label || "Source" : null;
+  const allSourcesLevel = () => { setCollapsed(new Set(presentSources)); setColumnsOpen({}); selectCanvas(null); setFitVersion((value) => value + 1); };
+  const sourceLevel = (key: string) => { setCollapsed(new Set(presentSources.filter((item) => item !== key))); setColumnsOpen({}); setSelectedId(null); setSelectedColumn(null); setSelectedSource(key); setFitVersion((value) => value + 1); };
+  const tableLevel = (id: string) => { hideColumns(id); setSelectedId(id); setSelectedColumn(null); setSelectedSource(null); };
+  const canDrillUp = Boolean(selectedColumn || selectedId || (selectedSource && !collapsedSet.has(selectedSource)) || collapsedSet.size < presentSources.length);
+  const drillUp = () => {
+    if (selectedColumn && selectedId) { tableLevel(selectedId); return; }
+    if (selectedTable) { const key = sourceKey(selectedTable); hideColumns(selectedTable.id); collapseSource(key); setSelectedId(null); setSelectedSource(key); return; }
+    if (selectedSource && !collapsedSet.has(selectedSource)) { collapseSource(selectedSource); return; }
+    allSourcesLevel();
+  };
+  const canDrillDown = Boolean((selectedSource && collapsedSet.has(selectedSource)) || (selectedTable && selectedTable.column_count > 0 && !columnsOpen[selectedTable.id]));
+  const drillDown = () => {
+    if (selectedSource && collapsedSet.has(selectedSource)) { expandSource(selectedSource); return; }
+    if (selectedTable && !columnsOpen[selectedTable.id]) void showColumns(selectedTable.id);
+  };
+
   const scopeLabel = scope === "source" ? sources.find((source) => source.key === (graph?.connector_id || connectorKey))?.label : scope === "group" ? "one queryable group" : "all sources";
 
   return (
@@ -422,11 +582,11 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
         <span><svg className="rx-line" aria-hidden><line x1="0" y1="4" x2="26" y2="4" className="rx-edge cross" /></svg>cross-source policy (cannot run)</span>
       </div>
 
-      <div className={`rx-body${detailId ? "" : " is-wide"}`}>
+      <div className={`rx-body${detailId || selectedSource ? "" : " is-wide"}`}>
         <div className="rx-stage">
           <div className="rx-stage-head">
             <span>
-              {graph?.mode === "focus" && focusNode ? <>Focused on <strong>{focusNode.relation}</strong> · {depth} hop{depth > 1 ? "s" : ""} · click a card to drill in, use the trail to go back</> : "Overview — click any card to focus on it"}
+              {graph?.mode === "focus" && focusNode ? <>Focused on <strong>{focusNode.relation}</strong> · {depth} hop{depth > 1 ? "s" : ""} · click a node for details, + to expand, “Focus here” to re-centre</> : "Overview — click a node for details, + on a node to drill down"}
               {graph?.truncated ? ` · showing ${graph.nodes.length} of ${graph.total_in_scope}` : ""}
             </span>
             <div className="rx-segmented" role="group" aria-label="Presentation">
@@ -439,68 +599,101 @@ export function RelationshipExplorer({ notify, refreshKey = 0 }: { notify: Notif
           ) : view === "table" ? (
             <EdgeTable edges={edges} nodeById={nodeById} onFocus={focusOn} />
           ) : (
-            <div className="rx-viewport" ref={viewportRef}>
-              <div className="rx-canvas" style={{ width: layout.width, height: layout.height }} onMouseLeave={() => setHovered(null)}>
-                <svg className="rx-edges" width={layout.width} height={layout.height} role="presentation">
-                  <defs>
-                    <marker id="rx-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" className="rx-arrow" /></marker>
-                  </defs>
-                  {edges.map((edge) => {
-                    const d = edgePath(layout.rects.get(edge.source)!, layout.rects.get(edge.target)!);
-                    const active = hovered && (edge.source === hovered || edge.target === hovered);
-                    return (
-                      <g key={edge.id}>
-                        <path d={d} className={`rx-edge ${edgeClass(edge)}${active ? " is-active" : hovered ? " is-dim" : ""}`} markerEnd={edge.type === "lineage" ? "url(#rx-arrow)" : undefined} />
-                        <path d={d} className="rx-edge-hit" onMouseEnter={() => setHovered(edge.source)} onMouseLeave={() => setHovered(null)}><title>{edgeTitle(edge, name)}</title></path>
-                      </g>
-                    );
-                  })}
-                </svg>
-                {layout.headers.map((header) => (
-                  <div key={`${header.x}-${header.label}`} className="rx-colhead" style={{ left: header.x, top: header.y, width: header.width }}>
-                    {header.color && <i className="rx-swatch" style={{ background: header.color }} />}
-                    {header.label}{header.note && <small>{header.note}</small>}
-                  </div>
-                ))}
-                {layout.bands.map((band) => <div key={band.y} className="rx-band" style={{ top: band.y }}>{band.label}<small>{band.note}</small></div>)}
-                {nodes.map((node) => {
-                  const rect = layout.rects.get(node.id);
-                  if (!rect) return null;
-                  const dim = (connected && !connected.has(node.id)) || (Boolean(needle) && !matches(node));
-                  const reads = node.kind === "view" ? incomingViews.get(node.id) || 0 : 0;
-                  return (
-                    <div
-                      key={node.id}
-                      className={`rx-card${node.id === graph.focus ? " is-focus" : ""}${node.id === selectedId ? " is-selected" : ""}${hovered === node.id ? " is-hover" : ""}${dim ? " is-dim" : ""}`}
-                      style={{ left: rect.x, top: rect.y, width: CARD_W, height: CARD_H, "--rx-source": color(sourceKey(node)) } as CSSProperties}
-                      onMouseEnter={() => setHovered(node.id)}
-                      onMouseLeave={() => setHovered(null)}
-                    >
-                      <button type="button" className="rx-card-main" onClick={() => focusOn(node.id)} title={`${node.relation} — ${KIND_LABEL[node.kind]} in ${node.source_label}. Click to focus.`}>
-                        <span className="rx-card-title"><KindIcon kind={node.kind} /><span>{node.table_name}</span></span>
-                        <span className="rx-card-sub"><i className="rx-dot" /><span>{node.schema_name} · {node.source_label}</span></span>
-                        <span className="rx-badges">
-                          {node.kind === "view" && <span className="rx-badge view" title={reads ? `${reads} base relation(s) shown in this view` : undefined}>view</span>}
-                          <span className="rx-badge">{node.column_count} cols</span>
-                          {node.pii_column_count > 0 && <span className="rx-badge pii">PII {node.pii_column_count}</span>}
-                          {!node.queryable && <span className="rx-badge warn">not queryable</span>}
-                          {node.lane === "join" && (node.distance || 1) > 1 && <span className="rx-badge">{node.distance} hops</span>}
-                        </span>
-                      </button>
-                      <button type="button" className="rx-card-info" title="Show details without changing focus" aria-label={`Details for ${node.relation}`} onClick={() => setSelectedId(node.id)}><Info size={15} /></button>
-                    </div>
-                  );
-                })}
+            <>
+              <div className="rx-levelbar">
+                <nav className="rx-levels" aria-label="Drill level: source, table, column">
+                  <button type="button" onClick={allSourcesLevel} aria-current={!levelSource ? "page" : undefined} title="Collapse every source to one node">Sources</button>
+                  {levelSource && <><ChevronRight size={12} aria-hidden="true" /><button type="button" onClick={() => sourceLevel(levelSource)} aria-current={!selectedTable ? "page" : undefined} title="Show only this source's tables">{levelSourceLabel}</button></>}
+                  {selectedTable && <><ChevronRight size={12} aria-hidden="true" /><button type="button" onClick={() => tableLevel(selectedTable.id)} aria-current={!selectedColumn ? "page" : undefined} title="Back to the table (hides its columns)">{selectedTable.table_name}</button></>}
+                  {selectedColumn && <><ChevronRight size={12} aria-hidden="true" /><span aria-current="page">{selectedColumn}</span></>}
+                </nav>
+                <button type="button" className="secondary-button compact" onClick={drillUp} disabled={!canDrillUp} title="Column → table → source"><ChevronsUp size={14} aria-hidden="true" />Drill up</button>
+                <button type="button" className="secondary-button compact" onClick={drillDown} disabled={!canDrillDown} title="Source → tables, table → columns"><ChevronsDown size={14} aria-hidden="true" />Drill down</button>
+                <small>{collapsedSet.size ? `${collapsedSet.size} of ${presentSources.length} source${presentSources.length === 1 ? "" : "s"} collapsed · ` : ""}drag to pan, wheel to zoom, drag a node to pin it, double-click to release</small>
               </div>
-            </div>
+              <GraphCanvas
+                nodes={canvas.nodes}
+                edges={canvas.edges}
+                layout={graphLayout}
+                onLayoutChange={setLayoutChoice}
+                selectedId={canvasSelected}
+                onSelect={selectCanvas}
+                onExpand={expandNode}
+                onCollapse={collapseNode}
+                fitKey={`${graphPath}:${fitVersion}`}
+                ariaLabel="Relationship graph"
+              />
+            </>
           )}
           {graph?.mode === "focus" && graph.nodes.length === 1 && <p className="rx-note">No lineage or join relationships are recorded for this table in this scope yet. Try “All sources”, turn on inferred joins, or approve a join policy.</p>}
           {graph && graph.counts.cross_connector > 0 && <p className="rx-note warn"><TriangleAlert size={13} style={{ verticalAlign: -2 }} /> {graph.counts.cross_connector} approved join polic{graph.counts.cross_connector === 1 ? "y" : "ies"} in view cross sources and cannot execute — hover the red edge for details.</p>}
         </div>
 
-        {detailId && <DetailPanel detail={detail} loading={detailLoading} isFocus={detailId === focusId} color={color} onFocus={focusOn} onClose={() => (selectedId ? setSelectedId(null) : overview())} />}
+        {selectedSource ? (
+          <SourcePanel
+            source={sources.find((source) => source.key === selectedSource) || null}
+            label={levelSourceLabel || "Source"}
+            members={allNodes.filter((node) => sourceKey(node) === selectedSource)}
+            collapsed={collapsedSet.has(selectedSource)}
+            color={color(selectedSource)}
+            onExpand={() => expandSource(selectedSource)}
+            onCollapse={() => collapseSource(selectedSource)}
+            onSelectTable={(id) => { expandSource(selectedSource); selectCanvas(id); }}
+            onClose={() => setSelectedSource(null)}
+          />
+        ) : detailId && (
+          <DetailPanel
+            detail={detail}
+            loading={detailLoading}
+            isFocus={detailId === focusId}
+            color={color}
+            onFocus={focusOn}
+            highlightColumn={selectedColumn}
+            onClose={() => (selectedId ? selectCanvas(null) : overview())}
+            actions={view === "diagram" && canvas.nodes.some((node) => node.id === detailId) ? <>
+              <button type="button" className="secondary-button compact" onClick={() => (columnsOpen[detailId] ? hideColumns(detailId) : void showColumns(detailId))} aria-pressed={Boolean(columnsOpen[detailId])}><Columns3 size={14} aria-hidden="true" />{columnsOpen[detailId] ? "Hide columns" : "Show columns"}</button>
+              <button type="button" className="secondary-button compact" onClick={() => void expandNeighbours(detailId)} title="Add this table's direct upstream, downstream and join neighbours from every source"><Share2 size={14} aria-hidden="true" />Neighbours +1 hop</button>
+            </> : null}
+          />
+        )}
       </div>
     </section>
+  );
+}
+
+function SourcePanel({ source, label, members, collapsed, color, onExpand, onCollapse, onSelectTable, onClose }: {
+  source: ExplorerSource | null; label: string; members: ExplorerNode[]; collapsed: boolean; color: string;
+  onExpand: () => void; onCollapse: () => void; onSelectTable: (id: string) => void; onClose: () => void;
+}) {
+  return (
+    <aside className="rx-detail" aria-label={`Source ${label}`}>
+      <div className="rx-detail-head">
+        <span className="eyebrow" style={{ display: "flex", alignItems: "center", gap: 6 }}><i className="rx-dot" style={{ "--rx-source": color } as CSSProperties} />Source{source ? ` · ${source.connector_type}${source.connection_mode === "mcp" ? " (MCP)" : ""}` : ""}</span>
+        <h4>{label}</h4>
+        <span className="rx-badges" style={{ flexWrap: "wrap" }}>
+          <span className="rx-badge">{source?.asset_count ?? members.length} assets</span>
+          {source?.view_count ? <span className="rx-badge view">{source.view_count} views</span> : null}
+          {source ? <span className="rx-badge">{source.group_count} queryable group{source.group_count === 1 ? "" : "s"}</span> : null}
+          <span className="rx-badge">{members.length} in this view</span>
+        </span>
+        <div className="rx-detail-actions">
+          {collapsed
+            ? <button type="button" className="secondary-button compact" onClick={onExpand}><ChevronsDown size={14} aria-hidden="true" />Expand tables</button>
+            : <button type="button" className="secondary-button compact" onClick={onCollapse}><ChevronsUp size={14} aria-hidden="true" />Collapse to source</button>}
+          <button type="button" className="secondary-button compact" onClick={onClose}>Close</button>
+        </div>
+      </div>
+      <Section title="Assets in this view" count={members.length} open>
+        <ul className="rx-list">
+          {[...members].sort(byRelation).map((node) => (
+            <li key={node.id}>
+              <span style={{ display: "flex", gap: 6, alignItems: "center" }}><KindIcon kind={node.kind} size={14} /><button type="button" className="rx-link" onClick={() => onSelectTable(node.id)}>{node.relation}</button></span>
+              <small>{KIND_LABEL[node.kind]} · {node.column_count} cols{node.pii_column_count ? ` · PII ${node.pii_column_count}` : ""}{node.queryable ? "" : " · not queryable"}</small>
+            </li>
+          ))}
+        </ul>
+      </Section>
+    </aside>
   );
 }
 
@@ -531,7 +724,7 @@ function Section({ title, count, open = false, children }: { title: string; coun
   return <details open={open}><summary>{title}{count !== undefined && <small>({count})</small>}</summary>{children}</details>;
 }
 
-function DetailPanel({ detail, loading, isFocus, color, onFocus, onClose }: { detail: AssetDetail | null; loading: boolean; isFocus: boolean; color: (key: string) => string; onFocus: (id: string) => void; onClose: () => void }) {
+function DetailPanel({ detail, loading, isFocus, color, onFocus, onClose, actions, highlightColumn }: { detail: AssetDetail | null; loading: boolean; isFocus: boolean; color: (key: string) => string; onFocus: (id: string) => void; onClose: () => void; actions?: ReactNode; highlightColumn?: string | null }) {
   if (!detail) return <aside className="rx-detail">{loading ? <LoadingBlock label="Loading dataset context" /> : <p>Select a table to see its context.</p>}</aside>;
   const { asset } = detail;
   const pii = (column: AssetColumn) => column.sensitivity === "pii" || Boolean(column.pii_category);
@@ -566,6 +759,7 @@ function DetailPanel({ detail, loading, isFocus, color, onFocus, onClose }: { de
         <div className="rx-detail-actions">
           {!isFocus && <button type="button" className="secondary-button compact" onClick={() => onFocus(asset.id)}><LocateFixed size={14} />Focus here</button>}
           <Link className="secondary-button compact" href={`/datasets?asset=${encodeURIComponent(asset.id)}`}><ExternalLink size={14} />Open in Datasets</Link>
+          {actions}
           <button type="button" className="secondary-button compact" onClick={onClose}>{isFocus ? "Back to overview" : "Close"}</button>
         </div>
       </div>
@@ -589,7 +783,7 @@ function DetailPanel({ detail, loading, isFocus, color, onFocus, onClose }: { de
             <thead><tr><th scope="col">Column</th><th scope="col">Type</th><th scope="col">Business meaning</th></tr></thead>
             <tbody>
               {asset.columns.map((column) => (
-                <tr key={column.name}>
+                <tr key={column.name} className={highlightColumn === column.name ? "rx-row-highlight" : undefined} aria-current={highlightColumn === column.name ? "true" : undefined}>
                   <td><strong>{column.name}</strong>{pii(column) && <> <span className="rx-badge pii" title={column.pii_category || "PII"}>PII{column.pii_category ? ` · ${column.pii_category}` : ""}</span></>}</td>
                   <td>{column.type || "—"}{column.nullable === false ? " · required" : ""}</td>
                   <td>{column.business_name || column.description ? <>{column.business_name && <strong>{column.business_name}</strong>}{column.business_name && column.description ? " — " : ""}{column.description}</> : <span style={{ color: "var(--muted)" }}>not defined</span>}</td>

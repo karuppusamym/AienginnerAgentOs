@@ -630,6 +630,64 @@ def disable_schedule(
     db.commit()
     return schedule_output(schedule, db)
 
+@router.post("/schedules/{schedule_id}/enable", status_code=202)
+def request_schedule_enable(
+    schedule_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Re-enabling a disabled schedule goes through the same approval as creating it; nothing runs until approved."""
+    require_data_editor(user, db)
+    project = require_current_project(db, user)
+    schedule = require_project_resource(db.get(IngestionSchedule, schedule_id), project, "Ingestion schedule")
+    if schedule.enabled:
+        raise HTTPException(status_code=409, detail="The schedule is already enabled")
+    pending = db.scalars(
+        select(Approval).where(
+            Approval.project_id == project.id,
+            Approval.action_type == "enable_ingestion_schedule",
+            Approval.status == "pending",
+        )
+    ).all()
+    if any(str((item.evidence or {}).get("schedule_id", "")) == schedule.id for item in pending):
+        raise HTTPException(status_code=409, detail="An approval to enable this schedule is already pending")
+    mapping = db.get(IngestionMapping, schedule.mapping_id)
+    job = Job(
+        project_id=project.id,
+        title=f"Approve schedule: {schedule.name}",
+        job_type="schedule_creation",
+        status="WAITING_FOR_APPROVAL",
+        progress=70,
+        created_by=user.id,
+        plan=[
+            {"agent": "Pipeline", "action": "Validate mapping and load mode", "status": "complete"},
+            {"agent": "Policy", "action": "Approve re-enabling recurring execution", "status": "waiting"},
+        ],
+        evidence=[
+            {"type": "mapping", "label": mapping.name if mapping else "missing mapping"},
+            {"type": "schedule", "label": schedule.cron},
+        ],
+    )
+    db.add(job)
+    db.flush()
+    approval = Approval(
+        project_id=project.id,
+        job_id=job.id,
+        title=f"Enable ingestion schedule: {schedule.name}",
+        action_type="enable_ingestion_schedule",
+        risk_level="medium",
+        requested_by=user.id,
+        evidence={
+            "summary": f"Re-enable {schedule.name} on {schedule.cron} using {schedule.load_mode}",
+            "checks": ["local execution", "approved mapping", "read-only source", "audited target writes"],
+            "schedule_id": schedule.id,
+        },
+    )
+    db.add(approval)
+    audit(db, user, "schedule.enable_requested", "ingestion_schedule", schedule.id, {"approval_id": approval.id})
+    db.commit()
+    return {**schedule_output(schedule, db), "approval_id": approval.id, "job_id": job.id}
+
 @router.post("/files/{file_id}/schema", status_code=201)
 def save_file_schema(
     file_id: str,

@@ -8,7 +8,12 @@ export type SessionUser = {
   must_change_password?: boolean;
   current_project_id?: string | null;
   current_project_name?: string | null;
+  /** Screens an admin hid for the current project (Admin → Screens); left out of the navigation. */
+  hidden_screens?: string[];
 };
+
+/** Ask the workspace shell to re-read the session (e.g. after Admin → Screens changes). */
+export const SESSION_REFRESH_EVENT = "datapilot:session-refresh";
 
 export class ApiError extends Error {
   constructor(

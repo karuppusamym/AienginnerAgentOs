@@ -2,11 +2,9 @@
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback } from "react";
-import { LearningView, type LearningTab } from "../../components/LearningView";
+import { LearningView, learningTabsFor, type LearningTab } from "../../components/LearningView";
 import { LoadingBlock } from "../../components/shared";
 import { useWorkspace } from "../../lib/workspace";
-
-const TABS: LearningTab[] = ["verified", "optimization", "indexes", "router"];
 
 export default function LearningPage() {
   return (
@@ -16,14 +14,18 @@ export default function LearningPage() {
   );
 }
 
-/** Tab and selected optimization run live in the URL (?tab=…&run=…) so they survive refresh and deep links. */
+/**
+ * Tab and selected optimization run live in the URL (?tab=…&run=…) so they survive refresh and deep links.
+ * /evaluations redirects to ?tab=evaluations. Tabs are limited per role (learningTabsFor).
+ */
 function LearningRoute() {
-  const { notify } = useWorkspace();
+  const { notify, user } = useWorkspace();
+  const allowed = learningTabsFor(user.role, user.hidden_screens || []);
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
   const rawTab = searchParams?.get("tab") as LearningTab | null;
-  const tab: LearningTab = rawTab && TABS.includes(rawTab) ? rawTab : "verified";
+  const tab: LearningTab = rawTab && allowed.includes(rawTab) ? rawTab : allowed[0];
   const runId = searchParams?.get("run") || "";
   const update = useCallback((next: { tab?: LearningTab; run?: string }) => {
     const params = new URLSearchParams(searchParams?.toString() || "");
@@ -40,6 +42,7 @@ function LearningRoute() {
       onTab={(value) => update({ tab: value })}
       runId={runId}
       onRun={(value) => update({ tab: "optimization", run: value })}
+      role={user.role}
     />
   );
 }

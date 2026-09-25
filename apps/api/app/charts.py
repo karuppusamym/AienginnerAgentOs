@@ -23,6 +23,15 @@ _MONEY_NAME = re.compile(r"(amount|revenue|balance|price|cost|spend|value_usd|sa
 _ID_NAME = re.compile(r"(^id$|_id$|^key$|_key$)", re.IGNORECASE)
 
 
+def json_default(value: Any) -> Any:
+    """JSON encoder fallback: source decimals (SQL Server / Oracle DECIMAL) stay numbers, everything else becomes text."""
+    from decimal import Decimal
+
+    if isinstance(value, Decimal):
+        return float(value) if value == value.to_integral_value() or abs(value.as_tuple().exponent) <= 12 else str(value)
+    return str(value)
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -55,7 +64,7 @@ def infer_chart(question: str, execution: dict[str, Any] | None) -> dict[str, An
     title = question[:120]
     if not execution or execution.get("error") or not execution.get("rows"):
         return {"type": "table", "title": title, "data": [], "alternatives": ["table"], "reason": "no rows to chart"}
-    rows = json.loads(json.dumps(execution["rows"][:500], default=str))
+    rows = json.loads(json.dumps(execution["rows"][:500], default=json_default))
     columns = list(execution.get("columns") or (rows[0].keys() if rows else []))
     values = {column: [row.get(column) for row in rows] for column in columns}
     numeric = [c for c in columns if values[c] and all(v is None or _is_number(v) for v in values[c]) and any(_is_number(v) for v in values[c]) and not _ID_NAME.search(c)]

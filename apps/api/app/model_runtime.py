@@ -127,7 +127,9 @@ def generate_text(
     governance_business_id: str | None = None,
     governance_session_id: str | None = None,
     governance_user_id: str | None = None,
+    timeout: float | None = None,
 ) -> ProviderGenerationResult:
+    """``timeout`` (seconds) overrides the default 45 s HTTP timeout, e.g. for long SQL rewrites."""
     if provider.provider_type == "local_mock":
         return ProviderGenerationResult(content="", latency_ms=1)
     if provider.provider_type == "jev":
@@ -143,7 +145,7 @@ def generate_text(
         {"role": "user", "content": user_prompt},
     ])
     try:
-        with httpx.Client(timeout=45.0) as client:
+        with httpx.Client(timeout=float(timeout) if timeout else 45.0) as client:
             if provider.provider_type == "gemini":
                 base_url = (provider.base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
                 response = client.post(

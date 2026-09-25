@@ -394,6 +394,7 @@ def decide(
     llm_provider: Any = None,
     backend_override: str | None = None,
     user_id: str | None = None,
+    connector_id: str | None = None,
 ) -> dict[str, Any]:
     """``llm_provider`` is the model routed to ``decision_routing`` (a Jev decision model or a text model)."""
     started = time.perf_counter()
@@ -401,6 +402,13 @@ def decide(
     tools = db.scalars(
         select(QueryTool).where(QueryTool.project_id == project_id, QueryTool.status == "published")
     ).all()
+    if connector_id is not None:
+        # Only suggest saved queries that run on the source the question is about.
+        from .models import Connector
+
+        local_ids = set(db.scalars(select(Connector.id).where(Connector.project_id == project_id, Connector.connector_type == "local_files")).all())
+        on_local = connector_id == "" or connector_id in local_ids
+        tools = [tool for tool in tools if (tool.connector_id in local_ids or tool.connector_id is None) if on_local] if on_local else [tool for tool in tools if tool.connector_id == connector_id]
     agents = db.scalars(select(AgentDefinition).where(AgentDefinition.enabled.is_(True))).all()
     candidates = local_scores(question, grounding, tools, agents, policy)[:8]
     backend = "local"

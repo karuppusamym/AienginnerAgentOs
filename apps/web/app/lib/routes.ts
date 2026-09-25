@@ -26,6 +26,15 @@ export const NAV_PATHS: Record<NavKey, string> = {
   architecture: "/architecture",
 };
 
+/**
+ * Keys whose page was merged into another screen (docs/UX_CONSOLIDATION.md §4).
+ * Their routes still exist and redirect here, so old links and `/?view=` links keep working.
+ */
+export const NAV_REDIRECTS: Partial<Record<NavKey, string>> = {
+  tools: "/agents?tab=tools",
+  evaluations: "/learning?tab=evaluations",
+};
+
 export function isNavKey(value: string | null | undefined): value is NavKey {
   return !!value && Object.prototype.hasOwnProperty.call(NAV_PATHS, value);
 }
@@ -48,7 +57,10 @@ export function analysisPath(conversationId?: string, messageId?: string) {
 /** Role gate shared by the shell and the root redirect. */
 export function canView(view: NavKey, role: string) {
   if (view === "admin") return role === "admin";
-  if (view === "tools" || view === "learning") return ["admin", "engineer"].includes(role);
+  // /tools and /evaluations only redirect into merged pages (NAV_REDIRECTS); the merged
+  // pages gate their own tabs (external gateway: admin/engineer, invocation history: admin).
+  // Learning: every role may open it because it now hosts Evaluations (the former
+  // /evaluations page, open to all). LearningView shows the other tabs to admin/engineer only.
   return true;
 }
 
@@ -61,5 +73,5 @@ export function legacyViewTarget(search: string): string | null {
   const view = params.get("view");
   if (!isNavKey(view)) return null;
   if (view === "conversations") return analysisPath(params.get("c") || "", params.get("m") || "");
-  return NAV_PATHS[view];
+  return NAV_REDIRECTS[view] || NAV_PATHS[view];
 }

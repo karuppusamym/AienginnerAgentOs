@@ -1,7 +1,7 @@
 # DataPilot Agent OS — Implementation Status Matrix
 
 **Purpose:** a single completed / partial / not-completed checklist, reconciled directly against the code (not just prior documentation), for presentation and tracking use.
-**Method:** cross-checked against `apps/api/app/routers/*.py`, `apps/api/app/models.py`, Alembic revisions `0001`–`0006` and `apps/web/app/components/*.tsx`, and driven live on the Docker Compose stack (`docker compose --profile analytics up -d --build`). Backend suite: **211 passed, 1 skipped** (`cd apps/api && python -m pytest tests -q`). Web: `tsc --noEmit` clean, `tests/app-source.test.mjs` 7/7.
+**Method:** cross-checked against `apps/api/app/routers/*.py`, `apps/api/app/models.py`, Alembic revisions `0001`–`0006` and `apps/web/app/components/*.tsx`, and driven live on the Docker Compose stack (`docker compose --profile analytics up -d --build`). Backend suite: **288 passed, 1 skipped** (`cd apps/api && python -m pytest tests -q`). Web: `tsc --noEmit` clean, `tests/app-source.test.mjs` 7/7.
 **Last reconciled:** September 24, 2026 (nineteenth pass: LLM-suggested catalog metadata, paste-SQL explain mode, catalog/graph export, semantic-graph readability at scale — see the change log). Rows in §1–§8 are the August state, and §0 the eighteenth-pass review, unless the change log says otherwise.
 
 > **Read this before trusting any status row below that predates this revision:** the previous revision of this document (the one ending in the "Superset dashboard-collision fix" change-log entry) was reconciled against code that, as of this pass, **did not actually run** — 8 routers referenced `require_permission`/`project_permissions`/`current_membership` without importing them, and every write path through those routers raised a live `NameError`. That prior revision's "70/70 passing" masthead claim was written either just before this regression landed or without re-running the suite after it. This revision fixes the regression and re-verifies from an actual green test run, not from reading the previous revision's prose.
@@ -64,6 +64,13 @@ model, the learning loop, embedded analytics and the agent/tool hardening. Detai
 | Cascade vote (the expensive third model only on disagreement) | ✅ | `SQL_VOTE_MODE=cascade` default; live: 2/2 agreement, Sonnet 5 not called |
 | DDL is suggestion-only, driven by slow queries | ✅ | `SLOW_QUERY_MS` (500); `ddl_suggestion` artifacts; runs only with `ALLOW_DDL_EXECUTION=true` + approval |
 | Profiled-only files broke SQL generation | ✅ Fixed | `catalog_scope.py`; Datasets "profile only" tag |
+| Column / schema questions ran unrelated SQL | ✅ Fixed | `catalog_answer.py`: answered from catalog metadata, no SQL; "this / closest table" follows the conversation across sources |
+| Rejected model SQL silently replaced by a generic fallback shown as PASSED | ✅ Fixed | Status "fallback" + the answer says the result may not answer the question |
+| Follow-up after reload ran on the wrong source | ✅ Fixed | Source picker restores the conversation's last source |
+| "Banking demo warehouse" was catalog-only (no credentials) | ✅ Fixed | Live `RetailBanking` DB in `sqlserver-demo` (`infra/sqlserver-init/retail_banking.sql`); connector wired to `env:SQLSERVER_DEMO_CREDENTIALS` |
+| Query-tool suggestions from another source | ✅ Fixed | `decide(..., connector_id)` only offers tools for the selected source |
+| SQL Server decimals stored as text (charts fell back to tables) | ✅ Fixed | `charts.json_default` keeps DECIMAL numeric |
+| One-click "Publish to Superset" from a chat answer; resizable chat panels | ✅ | `POST /analytics/publish-message`; draggable History / Inspector widths |
 
 ### 0.4 Embedded analytics (Superset)
 
@@ -94,6 +101,21 @@ model, the learning loop, embedded analytics and the agent/tool hardening. Detai
 | 14 | Jev judges split votes | ✅ |
 | 15 | Tool-choice evaluation | ✅ |
 | 16 | Data residency option | ✅ |
+
+### 0.7 Learning, building, agents, graphs and consolidation (Sep 24–25)
+
+| Item | Status | Evidence |
+|---|---|---|
+| Plan-guided query tuner: equivalence-checked rewrites (up to 6–8 attempts), no index creation, apply only via approval | ✅ | `query_tuner.py`, `POST /sql/tune`, Learning → Performance; live: 2.71 → 1.98 ms (27%) with 3 equivalent attempts |
+| Paste & run any-length SQL, plan analysis in plain language, full / piece-wise (per-CTE) rewrite | ✅ | `POST /sql/run`, `POST /sql/analyze`; 1,000+ line query ran live; piece-wise rewrite accepted only if the whole result matches |
+| Build very large SQL from business logic (plan → per-step build + repair → one WITH query) | ✅ | `sql_composer.py`, `/sql/compose/*`, SQL → Build from business logic; 65-step plan in tests, 7-step plan live |
+| Reviewer agent: every chat answer gets ok / check / doubtful with checks + Jev probabilities | ✅ | `answer_review.py`; live verdict ok 0.90 via Jev |
+| Draft with AI for new agents and query tools (registry-only tools) | ✅ | `agent_designer.py`, `POST /agents/draft`, `POST /query-tools/draft`; Jev + design model picks, validated |
+| Interactive charts: drill down/up, legend toggle, zoom, fullscreen; drill beyond the rows asks a follow-up | ✅ | `charts.tsx` (`onDrill` wired in Analysis) |
+| Relationship graph: pan/zoom/drag, focus, source → table → column drill, search, force/hierarchy layout | ✅ | `GraphCanvas.tsx`, `RelationshipExplorer.tsx` |
+| Consolidation: five nav areas, role defaults + "Show advanced", Agents & tools merged, Learning holds all feedback loops, Home opens Analysis, missing safety buttons, one "Save as…" menu | ✅ | `docs/UX_CONSOLIDATION.md`; `/tools` and `/evaluations` redirect |
+| Admin → Screens: hide pages or single tabs per project (e.g. for demos); presentation only, audited | ✅ | `screen_visibility.py`, `GET/PUT /ui/screens`, `ScreenVisibilityPanel.tsx` |
+| Jobs → Retry for tuning / composition / prompt-optimisation jobs | ✅ Fixed | Returns where to re-run instead of starting an agent |
 
 ### 0.6 Still open
 

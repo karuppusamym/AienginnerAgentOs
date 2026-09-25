@@ -63,6 +63,10 @@ DEFAULT_ROUTE_MODELS = {
     "risk_check": ("jev", "typesafe/jev-1.13"),
     "sql_candidate_judge": ("jev", "typesafe/jev-1.13"),
     "tool_selection": ("jev", "typesafe/jev-1.13"),
+    "sql_composition": ("openrouter", "anthropic/claude-sonnet-5"),
+    "sql_tuning": ("openrouter", "anthropic/claude-sonnet-5"),
+    "answer_review": ("jev", "typesafe/jev-1.13"),  # automatic chat answer reviewer (answer_review.py)
+    "agent_design": ("openrouter", "anthropic/claude-sonnet-5"),  # "Draft with AI" for agents and query tools
 }
 
 
@@ -87,6 +91,15 @@ def ensure_control_plane(db: Session) -> None:
             if not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "gemini", ModelProvider.default_model == model)):
                 db.add(ModelProvider(name=name, provider_type="gemini", base_url="https://generativelanguage.googleapis.com/v1beta", default_model=model, embedding_model="gemini-embedding-001", secret_reference="env:GEMINI_API_KEY", enabled=True, is_default=False, status="not_tested"))
         db.flush()
+    if os.getenv("SQLSERVER_DEMO_CREDENTIALS"):
+        # The catalog-only "Banking demo warehouse" gets a live database (RetailBanking in the
+        # sqlserver-demo container, created by infra/sqlserver-init/retail_banking.sql).
+        warehouse = db.scalar(select(Connector).where(Connector.name == "Banking demo warehouse", Connector.host == "mock-sqlserver"))
+        if warehouse is not None:
+            warehouse.host = "sqlserver-demo"
+            warehouse.secret_reference = "env:SQLSERVER_DEMO_CREDENTIALS"
+            warehouse.status = "not_tested"
+            db.flush()
     if os.getenv("OPENROUTER_API_KEY") and not db.scalar(select(ModelProvider).where(ModelProvider.provider_type == "jev")):
         # TypeSafe Jev, a decision model served by the OpenRouter Decisions API.
         db.add(ModelProvider(name="Jev 1.13 (TypeSafe decision model)", provider_type="jev", base_url="https://openrouter.ai/api/alpha/decisions", default_model="typesafe/jev-1.13", secret_reference="env:OPENROUTER_API_KEY", enabled=True, is_default=False, status="not_tested"))
@@ -259,6 +272,7 @@ def ensure_control_plane(db: Session) -> None:
         ("Troubleshooter", "Explains failed jobs and recommends bounded remediation.", ["catalog.search", "job.inspect", "lineage.query"], 1, {"role": "troubleshooter"}),
         ("Policy", "Explains policy decisions while deterministic controls remain authoritative.", ["catalog.search", "job.inspect"], 2, {"role": "policy", "deterministic_authority": True, "writes_require_approval": True}),
         ("Analytics", "Builds grounded metric and dashboard analyses from approved catalog context.", ["catalog.search", "dataset.profile", "sql.generate", "sql.preview", "lineage.query"], 2, {"role": "analytics", "writes_require_approval": True}),
+        ("Reviewer", "Checks each chat answer after it is built: the SQL ran, the result is not empty, the narrative's figures come from the result and the tables match the grounding. Flags doubtful answers; never edits data.", ["catalog.search", "sql.preview"], 1, {"role": "reviewer", "read_only": True}),
     ]
     for name, purpose, tool_names, level, policy in agents:
         if not db.scalar(select(AgentDefinition).where(AgentDefinition.name == name)):

@@ -179,3 +179,35 @@ def choose_tools_with_error(db: Any, provider: Any | None, step_action: str, obj
     if not cleaned:
         return None, "Response named none of the offered tools"
     return {"by": "jev", "model": result["model"], "probabilities": cleaned, "latency_ms": result["latency_ms"], "cost_usd": result["cost_usd"]}, None
+
+
+REVIEW_QUESTIONS: dict[str, dict[str, str]] = {
+    "answers_question": {
+        "type": "noul",
+        "instructions": "Would running `sql` (which returned `row_count` rows with columns `columns`) answer `question` directly and correctly?",
+    },
+    "grounded": {
+        "type": "noul",
+        "instructions": "Is `narrative` (figures masked as #) consistent with a result that has columns `columns` and `row_count` rows, without claiming facts the result cannot contain?",
+    },
+}
+
+
+def review_answer_with_error(db: Any, provider: Any | None, state: dict[str, Any], project_id: str | None = None, user_id: str | None = None, timeout: float | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """Answer-review probabilities (``answers_question``, ``grounded``) for a built chat answer.
+
+    ``state`` must hold only trusted, value-free text: the question, the SQL, result column
+    names, the row count and a narrative with figures masked (see answer_review.review_state).
+    """
+    result = ask(provider, state, REVIEW_QUESTIONS, timeout=timeout)
+    log_call(db, provider, "answer_review", result, project_id, user_id)
+    if not result["ok"]:
+        return None, result.get("error") or "Decision model call failed"
+    probabilities: dict[str, float] = {}
+    for name in REVIEW_QUESTIONS:
+        value = (result["answers"].get(name) or {}).get("noul")
+        if isinstance(value, (int, float)):
+            probabilities[name] = max(0.0, min(1.0, float(value)))
+    if not probabilities:
+        return None, "Response had no review probabilities"
+    return {"by": "jev", "model": result["model"], "probabilities": probabilities, "latency_ms": result["latency_ms"], "cost_usd": result["cost_usd"]}, None

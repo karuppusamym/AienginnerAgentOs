@@ -117,6 +117,7 @@ from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_meta
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter, Response
+from ..charts import json_default
 import contextvars
 import queue
 import threading
@@ -375,7 +376,7 @@ def _answer_question(
         routing_model = selected_model_provider(db, user, "decision_routing")
     except HTTPException:
         routing_model = None
-    route = decide(db, project.id, payload.content, analysis.get("grounding"), llm_provider=routing_model, user_id=user.id)
+    route = decide(db, project.id, payload.content, analysis.get("grounding"), llm_provider=routing_model, user_id=user.id, connector_id=payload.connector_id or "")
     progress("answering", "Writing the answer")
     try:
         provider = selected_model_provider(db, user, "conversation_summary")
@@ -407,6 +408,13 @@ def _answer_question(
             "I could not ground this question confidently in the catalog, so treat the draft query below as a guess. "
             "Which table, metric or time range do you mean? " + answer
         )
+    # Reviewer agent: deterministic checks + the answer_review model; never raises (verdict "unreviewed").
+    from ..answer_review import review_answer_safely
+
+    progress("reviewing", "Reviewing the answer against the result")
+    review = review_answer_safely(db, user, project.id, payload.content, analysis, execution, answer, route)
+    if review.get("warning"):
+        answer = f"{answer}\n\n{review['warning']}"
     if cancelled is not None and cancelled.is_set():
         db.rollback()
         raise HTTPException(status_code=499, detail="Request cancelled by the client before the answer was saved")
@@ -422,7 +430,7 @@ def _answer_question(
         "grounding": analysis.get("grounding"),
         "validation": analysis["validation"],
         "sources": analysis["sources"],
-        "execution": json.loads(json.dumps(execution, default=str)) if execution else None,
+        "execution": json.loads(json.dumps(execution, default=json_default)) if execution else None,
         "chart": chart,
         "source": analysis["source"],
         "memory": {"prior_messages_used": len(prior_messages), "persisted": True},
@@ -430,6 +438,7 @@ def _answer_question(
         "follow_ups": follow_up_questions(payload.content, execution),
         "learning": analysis.get("learning"),
         "ensemble": analysis.get("ensemble"),
+        "review": review,
     }
     assistant_message = ConversationMessage(conversation_id=conversation.id, role="assistant", content=answer, structured=structured)
     db.add(assistant_message)
@@ -445,7 +454,7 @@ def _answer_question(
         policy_version=route["policy_version"],
         candidates=route["candidates"],
         risk=route["risk"],
-        outcome={"execution_error": bool((execution or {}).get("error")), "row_count": row_count},
+        outcome={"execution_error": bool((execution or {}).get("error")), "row_count": row_count, "review_verdict": review.get("verdict"), "review_score": review.get("score")},
         created_by=user.id,
     ))
     conversation.summary = refresh_conversation_summary(conversation, [*prior_messages, user_message, assistant_message])
