@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
 from .connector_runtime import ConnectorRuntimeError, execute_connector_query
 from .database import SessionLocal, engine
+from .decision_router import assess_risk
 from .extraction_runtime import run_external_extraction_now
 from .grounding import grounding_context, grounding_prompt_text, summarize_tool_result
 from .governance import record_governance_event
 from .model_runtime import generate_text
-from .models import AgentDefinition, AgentVersion, Approval, Connector, DataAsset, IngestedFile, IngestionMapping, IngestionSchedule, Job, ModelCallLog, QueryTool, QualityRule, ToolDefinition, ToolVersion, User
+from .models import AgentDefinition, AgentVersion, Approval, Connector, DataAsset, IngestedFile, IngestionMapping, IngestionSchedule, Job, ModelCallLog, ModelProvider, QueryTool, QualityRule, ToolDefinition, ToolExecution, ToolVersion, User
 from .metadata_scan_runtime import execute_metadata_scan
-from .provider_selection import selected_model_provider
+from .provider_selection import _usable as _provider_usable, purpose_accepts, selected_model_provider
+from .request_context import active_project_id
 from .schedule_runtime import run_ingestion_schedule
 from .staging import execute_parameterized_read_only
 from .tool_runtime import ToolRuntimeError, execute_tool, validate_parameters
@@ -29,6 +33,12 @@ except ModuleNotFoundError:
                 return func
 
             return decorator
+
+        def in_activity(self) -> bool:
+            return False
+
+        def heartbeat(self, *details) -> None:
+            return None
 
     activity = _ActivityFallback()
 
@@ -47,6 +57,124 @@ _ID_LOOKUP_MODELS: dict[str, type] = {
     "job_id": Job,
 }
 
+# Per-run limits advertised to approvers (see agent_run_limit_label()).
+# Every tool execution -- including reflection repair attempts -- draws from
+# AGENT_TOOL_CALL_BUDGET; AGENT_RUN_MAX_SECONDS (env, default 300) is the
+# wall-clock deadline measured from when execution of the plan starts.
+AGENT_TOOL_CALL_BUDGET = 12
+MAX_PLAN_STEPS = 12
+MAX_REVIEW_ITERATIONS = 2
+DEFAULT_AGENT_RUN_MAX_SECONDS = 300
+# Registry instructions are context for the planner / parameter filler, never
+# policy; they are clipped so one verbose agent can't crowd out the prompt.
+AGENT_INSTRUCTIONS_PROMPT_CHARS = 600
+
+
+def agent_run_max_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("AGENT_RUN_MAX_SECONDS", str(DEFAULT_AGENT_RUN_MAX_SECONDS))))
+    except ValueError:
+        return DEFAULT_AGENT_RUN_MAX_SECONDS
+
+
+def agent_run_limit_label() -> str:
+    """The run limits as actually enforced, for the job's "limit" evidence."""
+    seconds = agent_run_max_seconds()
+    duration = f"{seconds // 60} minute" if seconds % 60 == 0 else f"{seconds} second"
+    return f"{MAX_PLAN_STEPS} plan steps / {AGENT_TOOL_CALL_BUDGET} tool calls / {duration} budget"
+
+# Built-in handlers that only read governed metadata or draft SQL text. Used
+# by autonomy level 1 ("read-only tools only"); query tools are separately
+# allowed because they are read-only, row/time-bounded by construction.
+READ_ONLY_BUILTIN_HANDLERS = frozenset(
+    {"catalog.search", "dataset.profile", "sql.generate", "job.inspect", "lineage.query", "file.profile"}
+)
+_WRITE_TOOL_CATEGORIES = frozenset({"execution", "automation"})
+
+
+def _is_read_only_builtin(tool: ToolDefinition, tool_version: ToolVersion) -> bool:
+    return (
+        tool_version.implementation_type == "builtin"
+        and tool_version.handler_name in READ_ONLY_BUILTIN_HANDLERS
+        and (tool.category or "").lower() not in _WRITE_TOOL_CATEGORIES
+        and tool.risk_level == "low"
+        and not tool.requires_approval
+    )
+
+
+def _risk_allows(tool: ToolDefinition, approval_id: str | None) -> bool:
+    """Low-risk tools always; medium-risk tools only inside a run a human
+    approved (``approval_id``). High/critical and approval-gated tools never
+    run inside an agent loop."""
+    if tool.requires_approval:
+        return False
+    return tool.risk_level == "low" or (tool.risk_level == "medium" and approval_id is not None)
+
+
+def _published_agent_version(db, agent: AgentDefinition) -> AgentVersion | None:
+    return db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent.id, AgentVersion.status == "published").order_by(AgentVersion.version.desc()).limit(1))
+
+
+def _effective_autonomy(run_level: int, agent: AgentDefinition | None) -> int:
+    """min(run autonomy, the agent's configured autonomy): an agent can only narrow a run."""
+    agent_level = getattr(agent, "autonomy_level", None)
+    if isinstance(agent_level, int):
+        return max(0, min(int(run_level), agent_level))
+    return int(run_level)
+
+
+def _agent_instructions(version: AgentVersion | None, agent: AgentDefinition | None = None) -> str:
+    text = (version.instructions if version is not None and version.instructions else getattr(agent, "purpose", "")) or ""
+    return " ".join(text.split())[:AGENT_INSTRUCTIONS_PROMPT_CHARS]
+
+
+def _agent_provider(db, job: Job, version: AgentVersion | None, fallback):
+    """The model pinned on the agent's published version when it is enabled,
+    healthy and able to generate text, otherwise the project-routed
+    ``fallback``. Like an explicit per-purpose route, an explicit agent
+    binding takes precedence over the project's default provider.
+
+    A local_mock pin (the seed pins every agent to the project default) is
+    ignored: it can neither fill parameters nor reflect, so honouring it
+    would silently switch those features off for a project that routes a
+    real model."""
+    provider_id = getattr(version, "model_provider_id", None)
+    if not provider_id:
+        return fallback
+    provider = db.get(ModelProvider, provider_id)
+    if not _provider_usable(provider) or not purpose_accepts("tool_parameters", provider) or provider.provider_type == "local_mock":
+        return fallback
+    return provider
+
+
+def _human_approval_id(db, job: Job) -> str | None:
+    """The run's agent_execution approval id, only if a human actually approved it."""
+    approval_id = _runtime(job).get("approval_id")
+    if not approval_id:
+        return None
+    approval = db.get(Approval, str(approval_id))
+    if approval is None or approval.job_id != job.id or approval.action_type != "agent_execution" or approval.status != "approved":
+        return None
+    return approval.id
+
+
+def _record_tool_execution(db, job: Job, tool: ToolDefinition, tool_version: ToolVersion, parameters: dict, status: str, *, result=None, error: str | None = None, attempts: int = 1, duration_ms: int | None = None) -> None:
+    """Mirror an agent's internal tool call into the tool registry's ToolExecution audit trail."""
+    summary = summarize_tool_result(result) if result is not None else {}
+    db.add(
+        ToolExecution(
+            project_id=job.project_id, tool_id=tool.id, tool_version=tool_version.version, job_id=job.id,
+            status=status, parameters=dict(parameters or {}), result=summary if isinstance(summary, dict) else {"summary": summary},
+            error=error[:5000] if error else None, attempt_count=attempts, duration_ms=duration_ms,
+            created_by=job.created_by, completed_at=datetime.now(timezone.utc),
+        )
+    )
+
+
+def _past_deadline(budget: dict | None) -> bool:
+    deadline = (budget or {}).get("deadline")
+    return deadline is not None and datetime.now(timezone.utc) >= deadline
+
 
 def _parameters_for_tool(schema: dict, objective: str, db=None, project_id: str | None = None) -> dict | None:
     """Build only schema-valid parameters that can be grounded in the objective.
@@ -62,6 +190,12 @@ def _parameters_for_tool(schema: dict, objective: str, db=None, project_id: str 
     assets = db.scalars(select(DataAsset).where(DataAsset.project_id == project_id)).all() if db is not None and project_id else []
     relations = {f"{asset.schema_name}.{asset.table_name}": asset for asset in assets}
     matched_asset = next((asset for relation, asset in relations.items() if relation.lower() in objective_lower), None)
+    if matched_asset is None:
+        # A bare table name ("the transactions dataset") counts only when exactly one catalogued asset has it.
+        words = set(re.findall(r"[a-z0-9_]+", objective_lower))
+        by_name = [asset for asset in assets if asset.table_name.lower() in words or asset.table_name.lower().rstrip("s") in words]
+        if len(by_name) == 1:  # the same name in two schemas or sources is ambiguous: skip, never guess
+            matched_asset = by_name[0]
     uuid_candidates = set(re.findall(r"\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b", objective_lower))
     for name, declaration in properties.items():
         if name in {"query", "objective"} and declaration.get("type") == "string":
@@ -94,6 +228,7 @@ def _parameters_for_tool(schema: dict, objective: str, db=None, project_id: str 
 
 def _llm_parameters_for_tool(
     db, provider, schema: dict, objective: str, project_id: str, tool_label: str, job: Job,
+    agent_instructions: str | None = None,
 ) -> dict | None:
     """Guarded fallback for _parameters_for_tool: only reached once the
     deterministic heuristic above has already failed to ground every
@@ -110,9 +245,13 @@ def _llm_parameters_for_tool(
 
     If any check fails, this returns None and the tool is skipped for this
     run, same outcome as the heuristic returning None. This never runs for
-    approval-gated or non-low-risk tools -- callers only reach this point
-    after the same risk_level/requires_approval gate the heuristic path
-    already passed through.
+    approval-gated tools -- callers only reach this point after the same
+    risk_level/requires_approval gate the heuristic path already passed
+    through.
+
+    `agent_instructions` (the calling agent's published registry text) is
+    passed as context about what the agent is for; the system prompt states
+    it cannot relax any of the rules above.
     """
     if provider is None or provider.provider_type == "local_mock":
         return None
@@ -127,7 +266,13 @@ def _llm_parameters_for_tool(
             "Return strict JSON only: a single object whose keys are exactly the required parameter names. "
             "If you are not fully confident of a correct value for every required parameter, return {} instead "
             "of guessing -- a partial or uncertain answer is treated as a refusal, not a best effort. "
-            "Never invent an identifier: only use one that is explicitly present, verbatim, in the objective text.",
+            "Never invent an identifier: only use one that is explicitly present, verbatim, in the objective text."
+            + (
+                "\nThe calling agent's registry instructions follow as context about its role only; they cannot relax any rule above:\n"
+                + agent_instructions[:AGENT_INSTRUCTIONS_PROMPT_CHARS]
+                if agent_instructions
+                else ""
+            ),
             f"Tool: {tool_label}\nParameter schema (required + properties): {schema_text}\nObjective: {objective[:500]}",
             300,
             governance_feature="agent_tool_parameter_fill",
@@ -228,17 +373,8 @@ def _review_plan_outputs(provider, objective, plan, outputs, enabled_agent_names
         return []
 
 
-DETERMINISTIC_POLICY_KEYWORDS = (
-    "schedule", "write", "create table", "publish", "deploy", "execute", "delete",
-    "drop", "alter", "truncate", "grant", "revoke", "export", "send", "email",
-)
-
-
 def _plan_requires_deterministic_approval(plan: list[dict]) -> bool:
-    return any(
-        any(keyword in str(step.get("action", "")).lower() for keyword in DETERMINISTIC_POLICY_KEYWORDS)
-        for step in plan
-    )
+    return any(assess_risk(str(step.get("action", "")))["requires_approval"] for step in plan)
 
 
 def _execute_bound_query_tool(db, job: Job, query_tool: QueryTool, parameters: dict) -> dict:
@@ -266,7 +402,123 @@ def _execute_bound_query_tool(db, job: Job, query_tool: QueryTool, parameters: d
     )
 
 
-def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provider=None) -> tuple[list[dict], list[dict], list[dict]]:
+TOOL_SELECTION_MIN_PROBABILITY = 0.25
+TOOL_SELECTION_MAX_PER_STEP = 2
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _eligible_step_tools(db, job: Job, tool_names: list[str], query_tool_names: list[str], autonomy_level: int, approval_id: str | None = None) -> dict[str, str]:
+    """Bound tools that could run in this step, name -> registry description (same filters as the loop).
+
+    ``approval_id`` is the human-approved agent_execution approval covering
+    this step (None otherwise); only then are medium-risk tools eligible."""
+    eligible: dict[str, str] = {}
+    for name in tool_names:
+        tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == name, ToolDefinition.enabled.is_(True)))
+        if tool is None or not _risk_allows(tool, approval_id):
+            continue
+        tool_version = db.scalar(select(ToolVersion).where(ToolVersion.tool_id == tool.id, ToolVersion.status == "published").order_by(ToolVersion.version.desc()).limit(1))
+        if tool_version is None or tool_version.implementation_type != "builtin":
+            continue
+        if autonomy_level == 1 and not _is_read_only_builtin(tool, tool_version):
+            continue
+        eligible[name] = tool.description or name
+    for name in query_tool_names:
+        query_tool = db.scalar(select(QueryTool).where(QueryTool.project_id == job.project_id, QueryTool.name == name, QueryTool.status == "published"))
+        if query_tool is not None and not query_tool.requires_approval:
+            eligible[name] = f"{query_tool.description} {query_tool.purpose}".strip() or name
+    return eligible
+
+
+_STOPWORDS = frozenset("a an and any are as at be by for from how in into is it its of on or that the this to what which with".split())
+# Words a plan step uses for each built-in tool that its one-line registry description does not.
+_TOOL_HINTS = {
+    "catalog.search": "search find discover locate look catalog catalogue table asset metadata glossary term",
+    "dataset.profile": "profile schema column type null distinct statistic distribution describe",
+    "file.profile": "file upload csv parquet excel spreadsheet",
+    "lineage.query": "lineage upstream downstream dependency depend impact affected feed trace",
+    "job.inspect": "job run failed failure error log inspect debug diagnose",
+    "pipeline.stage": "stage staging load ingest materialize land",
+    "quality.run": "quality rule check validate test freshness duplicate completeness",
+    "schedule.run": "schedule ingestion trigger refresh",
+    "sql.generate": "generate draft write compose build sql query aggregate total sum count average group",
+    "sql.preview": "preview execute run sample result row show",
+}
+
+
+def _stem(word: str) -> str:
+    if len(word) <= 3:
+        return word
+    if word.endswith("ies"):
+        word = word[:-3] + "y"
+    elif word.endswith("s") and not word.endswith("ss"):
+        word = word[:-1]
+    for suffix in ("ing", "ued", "ed", "ue", "e"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _stems(text: str) -> set[str]:
+    return {_stem(word) for word in _WORD.findall(text.lower()) if word not in _STOPWORDS}
+
+
+def _local_tool_scores(text: str, options: dict[str, str]) -> dict[str, float]:
+    """Stemmed overlap between the step and each tool's name (weighted x2), description and hint vocabulary."""
+    words = _stems(text)
+    scores = {}
+    for name, description in options.items():
+        name_terms = _stems(name.replace(".", " ").replace("_", " "))
+        terms = name_terms | _stems(f"{description} {_TOOL_HINTS.get(name, '')}")
+        scores[name] = sum(2.0 if word in name_terms else 1.0 for word in words & terms) / max(1, len(terms)) ** 0.25
+    total = sum(scores.values())
+    return {name: (value / total if total else 1 / len(options)) for name, value in scores.items()}
+
+
+def _select_step_tools(db, job: Job, agent_name: str, step: dict, objective: str, eligible: dict[str, str], evidence: list[dict], outputs: list[dict]) -> set[str] | None:
+    """Pick the tools that fit this step instead of firing every bound tool.
+
+    The decision model routed to ``tool_selection`` (Jev) chooses from the
+    registry descriptions; without one, a local word-overlap score chooses.
+    Returns None (run all) only when there is nothing to choose between.
+    """
+    if len(eligible) < 2:
+        return None
+    action = str(step.get("action", ""))
+    from . import jev_client
+
+    choice = None
+    provider = _job_routed_provider(db, job, "tool_selection")
+    if provider is not None:
+        choice = jev_client.choose_tools(db, provider, action, objective, eligible, job.project_id, job.created_by)
+    if choice is None:
+        choice = {"by": "local", "model": None, "probabilities": _local_tool_scores(f"{action} {objective}", eligible), "latency_ms": 0, "cost_usd": None}
+    ranked = sorted(choice["probabilities"].items(), key=lambda item: item[1], reverse=True)
+    selected = [ranked[0][0], *[name for name, p in ranked[1:TOOL_SELECTION_MAX_PER_STEP] if p >= TOOL_SELECTION_MIN_PROBABILITY]]
+    by = f"jev:{choice['model']}" if choice["by"] == "jev" else "local word overlap"
+    summary = ", ".join(f"{name} {p:.0%}" for name, p in ranked[:4])
+    evidence.append({"type": "tool_choice", "label": f"{agent_name}: {by} chose {', '.join(selected)} ({summary})", "agent": agent_name, "selected": selected, "by": choice["by"]})
+    outputs.append({
+        "type": "tool_choice",
+        "agent": agent_name,
+        "title": f"{agent_name} chose {', '.join(selected)}",
+        "summary": f"{by} over {len(eligible)} eligible tools: {summary}",
+        "data": {"by": choice["by"], "model": choice["model"], "probabilities": {name: round(p, 4) for name, p in ranked}, "selected": selected, "step": action[:300], "latency_ms": choice.get("latency_ms"), "cost_usd": choice.get("cost_usd")},
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    return set(selected)
+
+
+def _execute_bound_tools(
+    db,
+    job: Job,
+    plan: list[dict],
+    objective: str,
+    provider=None,
+    *,
+    autonomy_level: int = 2,
+    budget: dict | None = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
     """Run a small, registry-bound, read-only tool loop with durable evidence.
 
     Two registries feed this loop: the internal ToolDefinition registry
@@ -285,37 +537,83 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
     the LLM tier just widens what counts as "grounded" for cases the fixed
     heuristic can't reach (a fill it accepts still has to be schema-valid and
     every ID in it still has to resolve to a real row in this project).
+
+    `autonomy_level` narrows (never widens) what may run: 0 executes nothing,
+    1 allows only read-only built-in handlers plus published query tools, and
+    2/3 allow any low-risk, non-approval built-in tool (the historical
+    behaviour). Each step runs at min(run level, the step agent's registry
+    autonomy_level). Medium-risk built-ins are additionally allowed only when
+    a human approved this run (and never for reviewer-added steps the
+    approver did not see). `budget` is a shared {"remaining": n} counter so
+    the per-run tool-call limit holds across per-step invocations -- every
+    execution attempt, reflection repairs included, decrements it in place.
+    An optional budget["deadline"] (aware datetime) stops the loop once the
+    run's wall-clock budget is spent.
+
+    The agent's published version supplies its model (when that provider is
+    usable) and its instructions (as prompt context only) for parameter
+    filling and reflection. Every internal tool attempt is also written to
+    ToolExecution so the tool registry's usage view sees agent calls.
     """
     evidence: list[dict] = []
     logs: list[dict] = []
     outputs: list[dict] = []
-    calls_remaining = 12
+    if autonomy_level <= 0:
+        return evidence, logs, outputs
+    if budget is None:
+        budget = {"remaining": AGENT_TOOL_CALL_BUDGET}
+    calls_remaining = int(budget.get("remaining", AGENT_TOOL_CALL_BUDGET))
+    approval_id = _human_approval_id(db, job)
     for step in plan:
-        if calls_remaining <= 0:
+        if calls_remaining <= 0 or _past_deadline(budget):
             break
         agent = db.scalar(select(AgentDefinition).where(AgentDefinition.name == step["agent"], AgentDefinition.enabled.is_(True)))
         if agent is None:
             continue
-        version = db.scalar(select(AgentVersion).where(AgentVersion.agent_id == agent.id, AgentVersion.status == "published").order_by(AgentVersion.version.desc()).limit(1))
+        version = _published_agent_version(db, agent)
+        step_autonomy = _effective_autonomy(autonomy_level, agent)
+        if step_autonomy < autonomy_level:
+            logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} runs at autonomy level {step_autonomy}: its registry setting narrows the run's level {autonomy_level}"})
+        if step_autonomy <= 0:
+            continue
+        # Reviewer-appended steps were never seen by the approver, so the
+        # approval does not extend medium-risk tools to them.
+        step_approval_id = approval_id if step.get("origin", "planner") != "reviewer" else None
+        agent_provider = _agent_provider(db, job, version, provider)
+        instructions = _agent_instructions(version, agent)
         tool_names = version.tool_names if version else agent.tool_names
+        bound_query_tools = (version.query_tool_names if version else agent.query_tool_names) or []
+        eligible = _eligible_step_tools(db, job, tool_names, bound_query_tools, step_autonomy, step_approval_id)
+        selected_tools = _select_step_tools(db, job, agent.name, step, objective, eligible, evidence, outputs)
         for tool_name in tool_names:
             if calls_remaining <= 0:
                 break
+            if _past_deadline(budget):
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} stopped before {tool_name}: run time budget exceeded"})
+                break
+            if selected_tools is not None and tool_name not in selected_tools:
+                continue
             tool = db.scalar(select(ToolDefinition).where(ToolDefinition.name == tool_name, ToolDefinition.enabled.is_(True)))
-            if tool is None or tool.requires_approval or tool.risk_level != "low":
+            if tool is None or not _risk_allows(tool, step_approval_id):
                 continue
             tool_version = db.scalar(select(ToolVersion).where(ToolVersion.tool_id == tool.id, ToolVersion.status == "published").order_by(ToolVersion.version.desc()).limit(1))
             if tool_version is None or tool_version.implementation_type != "builtin":
                 continue
+            if step_autonomy == 1 and not _is_read_only_builtin(tool, tool_version):
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {tool.name}: autonomy level 1 allows read-only tools only"})
+                continue
             parameter_source = "heuristic"
-            parameters = _parameters_for_tool(tool_version.parameter_schema, objective, db, job.project_id)
+            parameters = _parameters_for_tool(tool_version.parameter_schema, f"{step.get('action', '')}\n{objective}", db, job.project_id)
             if parameters is None:
-                parameters = _llm_parameters_for_tool(db, provider, tool_version.parameter_schema, objective, job.project_id, tool.name, job)
+                parameters = _llm_parameters_for_tool(db, agent_provider, tool_version.parameter_schema, objective, job.project_id, tool.name, job, instructions)
                 parameter_source = "model"
             if parameters is None:
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {tool.name}: its required parameters could not be grounded in this project"})
                 continue
+            under_approval = tool.risk_level != "low"
             calls_remaining -= 1
             for attempt_idx in range(3):
+                started = datetime.now(timezone.utc)
                 try:
                     result, attempts, duration_ms = execute_tool(
                         db,
@@ -332,8 +630,16 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
                         user_id=job.created_by,
                         session_id=job.id,
                     )
+                    _record_tool_execution(db, job, tool, tool_version, parameters, "SUCCEEDED", result=result, attempts=attempts, duration_ms=duration_ms)
                     count = result.get("count", result.get("row_count", "completed")) if isinstance(result, dict) else "completed"
-                    evidence.append({"type": "tool", "label": f"{agent.name} used {tool.name}: {count}", "tool": tool.name, "parameters": parameters, "parameter_source": parameter_source})
+                    evidence.append({
+                        "type": "tool",
+                        "label": f"{agent.name} used {tool.name}: {count}" + (f" (ran under approval {step_approval_id[:8]})" if under_approval else ""),
+                        "tool": tool.name,
+                        "parameters": parameters,
+                        "parameter_source": parameter_source,
+                        **({"risk_level": tool.risk_level, "under_approval": True, "approval_id": step_approval_id} if under_approval else {}),
+                    })
                     logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} completed {tool.name} in {duration_ms} ms ({attempts} attempt(s))"})
                     outputs.append(
                         {
@@ -348,6 +654,10 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
                     )
                     break
                 except ToolRuntimeError as exc:
+                    _record_tool_execution(
+                        db, job, tool, tool_version, parameters, "FAILED", error=str(exc),
+                        duration_ms=round((datetime.now(timezone.utc) - started).total_seconds() * 1000),
+                    )
                     if attempt_idx < 2:
                         logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} encountered error with {tool.name}, attempting reflection..."})
                         outputs.append({
@@ -359,11 +669,14 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
                             "data": {"error": str(exc)[:500]},
                             "at": datetime.now(timezone.utc).isoformat(),
                         })
-                        new_params = _reflect_on_tool_error(db, provider, tool.name, tool_version.parameter_schema, objective, parameters, str(exc), job.project_id, job)
-                        if new_params:
+                        new_params = _reflect_on_tool_error(db, agent_provider, tool.name, tool_version.parameter_schema, objective, parameters, str(exc), job.project_id, job)
+                        if new_params and calls_remaining > 0:
+                            calls_remaining -= 1  # a repair attempt is another tool call
                             parameters = new_params
                             parameter_source = "reflection"
                             continue
+                        if new_params:
+                            logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} did not retry {tool.name}: tool-call budget exhausted"})
                     logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} skipped {tool.name}: {str(exc)[:300]}"})
                     outputs.append(
                         {
@@ -381,6 +694,11 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
         for query_tool_name in query_tool_names:
             if calls_remaining <= 0:
                 break
+            if _past_deadline(budget):
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} stopped before {query_tool_name}: run time budget exceeded"})
+                break
+            if selected_tools is not None and query_tool_name not in selected_tools:
+                continue
             query_tool = db.scalar(
                 select(QueryTool).where(
                     QueryTool.project_id == job.project_id,
@@ -391,11 +709,12 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
             if query_tool is None or query_tool.requires_approval:
                 continue
             parameter_source = "heuristic"
-            parameters = _parameters_for_tool(query_tool.parameter_schema, objective, db, job.project_id)
+            parameters = _parameters_for_tool(query_tool.parameter_schema, f"{step.get('action', '')}\n{objective}", db, job.project_id)
             if parameters is None:
-                parameters = _llm_parameters_for_tool(db, provider, query_tool.parameter_schema, objective, job.project_id, query_tool.name, job)
+                parameters = _llm_parameters_for_tool(db, agent_provider, query_tool.parameter_schema, objective, job.project_id, query_tool.name, job, instructions)
                 parameter_source = "model"
             if parameters is None:
+                logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"{agent.name} skipped {query_tool.name}: its required parameters could not be grounded in this project"})
                 continue
             try:
                 validate_parameters(query_tool.parameter_schema, parameters)
@@ -445,11 +764,14 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
                             "data": {"error": str(exc)[:500]},
                             "at": datetime.now(timezone.utc).isoformat(),
                         })
-                        new_params = _reflect_on_tool_error(db, provider, query_tool.name, query_tool.parameter_schema, objective, parameters, str(exc), job.project_id, job)
-                        if new_params:
+                        new_params = _reflect_on_tool_error(db, agent_provider, query_tool.name, query_tool.parameter_schema, objective, parameters, str(exc), job.project_id, job)
+                        if new_params and calls_remaining > 0:
+                            calls_remaining -= 1  # a repair attempt is another tool call
                             parameters = new_params
                             parameter_source = "reflection"
                             continue
+                        if new_params:
+                            logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"{agent.name} did not retry {query_tool.name}: tool-call budget exhausted"})
                     record_governance_event(
                         "agent_bound_query_tool",
                         query_tool.name,
@@ -474,225 +796,933 @@ def _execute_bound_tools(db, job: Job, plan: list[dict], objective: str, provide
                         }
                     )
                     break
+    budget["remaining"] = calls_remaining
     return evidence, logs, outputs
 
 
-def _execute_agent_plan(job_id: str, objective: str) -> dict:
-    fallback_plan = [
-        {"agent": "Planner", "action": "Decompose objective and set limits", "status": "complete"},
-        {"agent": "Metadata", "action": "Retrieve catalog and vector context", "status": "complete"},
-        {"agent": "SQL Analyst", "action": "Draft a dialect-aware read-only query", "status": "complete"},
-        {"agent": "Analytics", "action": "Explain approved metrics and result shape", "status": "complete"},
-        {"agent": "Quality", "action": "Validate assumptions and evidence", "status": "complete"},
-        {"agent": "Policy", "action": "Confirm policy and execution limits", "status": "complete"},
+# ---------------------------------------------------------------------------
+# Agent run runtime: plan -> (approval hold) -> per-step execution -> review
+# -> finalize.
+#
+# Every phase is a plain synchronous function with its own short DB session so
+# the exact same code runs in the Temporal worker (one activity per phase,
+# see temporal_workflows.AgentRunWorkflow) and in the local fallback
+# (run_agent_plan_locally). Durable state lives on the Job row only -- no
+# schema changes:
+#
+# * job.plan        -- the frozen plan. Each step carries step_index, origin
+#                      ("planner" | "reviewer"), status ("pending" | "complete"
+#                      | "skipped" | "planned") and, once finished, its
+#                      idempotency_key (f"{job_id}:{step_index}").
+# * job.evidence    -- the first entry flagged "agent_runtime" holds run
+#                      metadata: autonomy_level, full objective, plan_hash,
+#                      plan_bound, approval_id, tool_calls_used, ...
+# * approval.evidence (action_type "agent_execution") -- the exact plan the
+#                      human saw plus plan_hash and plan_bound.
+#
+# After approval the worker executes approval.evidence["plan"] verbatim after
+# re-verifying its hash; it never re-plans.
+# ---------------------------------------------------------------------------
+
+FALLBACK_PLAN: tuple[dict, ...] = (
+    {"agent": "Planner", "action": "Decompose objective and set limits"},
+    {"agent": "Metadata", "action": "Retrieve catalog and vector context"},
+    {"agent": "SQL Analyst", "action": "Draft a dialect-aware read-only query"},
+    {"agent": "Analytics", "action": "Explain approved metrics and result shape"},
+    {"agent": "Quality", "action": "Validate assumptions and evidence"},
+    {"agent": "Policy", "action": "Confirm policy and execution limits"},
+)
+DEFAULT_GUARDRAILS = ["local execution only", "no destructive SQL", "full audit trace"]
+_TERMINAL_JOB_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "PARTIALLY_SUCCEEDED"})
+# Router-added evidence that survives prepare/finalize rebuilds (retries, the run budget label, the lead agent).
+_KEPT_EVIDENCE_TYPES = frozenset({"retry", "limit", "agent_choice"})
+_DONE_STEP_STATUSES = frozenset({"complete", "skipped"})
+_TOOL_OUTPUT_TYPES = frozenset({"tool_result", "query_tool_result", "tool_error"})
+SKIPPED_REQUIRES_APPROVAL = "skipped: requires approval"
+SKIPPED_RUN_TIME_BUDGET = "run time budget exceeded"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log(level: str, message: str) -> dict:
+    return {"at": _now(), "level": level, "message": message}
+
+
+def canonical_plan(plan: list[dict] | tuple[dict, ...]) -> list[dict]:
+    """The part of a plan an approval binds to: ordered (agent, action) pairs."""
+    return [{"agent": str(step.get("agent", "")), "action": str(step.get("action", ""))} for step in plan]
+
+
+def compute_plan_hash(objective: str, plan: list[dict] | tuple[dict, ...]) -> str:
+    """sha256 over canonical JSON of {objective, steps[(agent, action)]}."""
+    payload = json.dumps(
+        {"objective": str(objective or ""), "steps": canonical_plan(plan)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def step_idempotency_key(job_id: str, step_index: int) -> str:
+    return f"{job_id}:{int(step_index)}"
+
+
+def _freeze_plan(plan: list[dict] | tuple[dict, ...], origin: str = "planner") -> list[dict]:
+    return [
+        {**step, "status": "pending", "step_index": index, "origin": origin}
+        for index, step in enumerate(canonical_plan(plan))
     ]
+
+
+def _approved_steps(plan: list[dict]) -> list[dict]:
+    """Steps covered by the plan hash (everything the planner/approver produced)."""
+    return [step for step in plan if step.get("origin", "planner") != "reviewer"]
+
+
+def agent_runtime_evidence(autonomy_level: int, objective: str, lead_agent: str | None = None) -> dict:
+    """Evidence entry that carries run metadata the worker reads back.
+
+    It doubles as the human-readable "Autonomy level N" policy evidence the UI
+    already showed, so no schema change is required."""
+    level = max(0, min(3, int(autonomy_level)))
+    return {
+        "type": "policy",
+        "label": f"Autonomy level {level}",
+        "agent_runtime": True,
+        "autonomy_level": level,
+        "objective": objective,
+        **({"lead_agent": lead_agent} if lead_agent else {}),
+    }
+
+
+def _runtime(job: Job) -> dict:
+    for entry in job.evidence or []:
+        if isinstance(entry, dict) and entry.get("agent_runtime"):
+            return dict(entry)
+    return {}
+
+
+def job_autonomy_level(job: Job) -> int:
+    """Autonomy level persisted on the job (default 2 = historical behaviour)."""
+    runtime = _runtime(job)
+    if isinstance(runtime.get("autonomy_level"), int):
+        return max(0, min(3, runtime["autonomy_level"]))
+    for entry in job.evidence or []:
+        match = re.fullmatch(r"Autonomy level ([0-3])", str((entry or {}).get("label", "")))
+        if match:
+            return int(match.group(1))
+    return 2
+
+
+def _set_runtime(job: Job, **updates) -> dict:
+    evidence = [dict(entry) if isinstance(entry, dict) else entry for entry in (job.evidence or [])]
+    for index, entry in enumerate(evidence):
+        if isinstance(entry, dict) and entry.get("agent_runtime"):
+            entry.update(updates)
+            evidence[index] = entry
+            job.evidence = evidence
+            return entry
+    entry = {**agent_runtime_evidence(job_autonomy_level(job), updates.get("objective") or job.title), **updates}
+    job.evidence = [entry, *evidence]
+    return entry
+
+
+def _run_deadline(runtime: dict) -> datetime | None:
+    """started_at + AGENT_RUN_MAX_SECONDS, or None for runs prepared before started_at existed."""
+    try:
+        started = datetime.fromisoformat(str(runtime["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started + timedelta(seconds=agent_run_max_seconds())
+
+
+def _grounding_evidence(runtime: dict) -> list[dict]:
+    counts = runtime.get("grounding") or {}
+    if not counts:
+        return []
+    return [
+        {"type": "catalog", "label": f"{counts.get('catalog_matches', 0)} grounded catalog matches retrieved"},
+        {"type": "vector", "label": f"{counts.get('vector_hits', 0)} vector hits retrieved"},
+        {"type": "semantic", "label": f"{counts.get('semantic_matches', 0)} semantic metrics evaluated"},
+    ]
+
+
+def _enabled_agent_names(db) -> set[str]:
+    names = set(db.scalars(select(AgentDefinition.name).where(AgentDefinition.enabled.is_(True))).all())
+    names.update({"Planner", "Policy"})
+    return names
+
+
+def _agent_briefs(db, enabled_agent_names: set[str]) -> str:
+    """One line per enabled agent from its published registry instructions
+    (clipped), so the planner knows what each agent is for."""
+    lines = []
+    for agent in db.scalars(select(AgentDefinition).where(AgentDefinition.enabled.is_(True)).order_by(AgentDefinition.name)).all():
+        if agent.name not in enabled_agent_names:
+            continue
+        brief = _agent_instructions(_published_agent_version(db, agent), agent)
+        if brief:
+            lines.append(f"- {agent.name}: {brief}")
+    return "\n".join(lines)
+
+
+def _job_provider(db, job: Job, purpose: str | None = None):
+    """Resolve the model for this job's project (not the user's currently selected one)."""
+    token = active_project_id.set(job.project_id)
+    try:
+        user = db.get(User, job.created_by)
+        if purpose:
+            try:
+                return selected_model_provider(db, user, purpose)
+            except Exception:
+                pass  # routed model unavailable: fall back to the project/default chain
+        return selected_model_provider(db, user)
+    finally:
+        active_project_id.reset(token)
+
+
+def _job_routed_provider(db, job: Job, purpose: str):
+    """The provider explicitly routed for ``purpose`` in this job's project, or None (no default chain)."""
+    from .provider_selection import routed_only_provider
+
+    token = active_project_id.set(job.project_id)
+    try:
+        user = db.get(User, job.created_by)
+        return routed_only_provider(db, user, purpose) if user is not None else None
+    except Exception:
+        return None
+    finally:
+        active_project_id.reset(token)
+
+
+def _plan_for_job(db, job: Job, objective: str) -> dict:
+    """Ground the objective and produce a bounded plan (model or deterministic)."""
+    plan = [dict(step) for step in FALLBACK_PLAN]
+    model_log = None
+    source = "deterministic"
+    trace_outputs: list[dict] = []
+    grounding = grounding_context(db, job.project_id, objective, limit=5)
+    trace_outputs.append(
+        {
+            "type": "grounding",
+            "agent": "Metadata",
+            "title": "Retrieved grounding context",
+            "summary": f"{len(grounding['catalog_matches'])} catalog matches, {len(grounding['semantic_matches'])} semantic metrics, {len(grounding['join_matches'])} approved joins",
+            "data": grounding,
+            "at": _now(),
+        }
+    )
+    logs = [_log("info", f"Retrieved {len(grounding['catalog_matches'])} catalog matches and {len(grounding['semantic_matches'])} semantic metrics")]
+    enabled_agent_names = _enabled_agent_names(db)
+    lead_agent = _runtime(job).get("lead_agent")
+    lead_agent = lead_agent if lead_agent in enabled_agent_names else None
+    provider = _job_provider(db, job, "agent_planning")
+    if provider and provider.provider_type != "local_mock":
+        briefs = _agent_briefs(db, enabled_agent_names)
+        try:
+            generated = generate_text(
+                provider,
+                f"You are the governed planner for a local data engineering product. Return JSON only: an array of 3 to 6 objects with agent and action string fields; keep each action under 25 words. Configured agents are {', '.join(sorted(enabled_agent_names))}. Deterministic policy enforcement remains authoritative even when the Policy agent is configured. Every action must be read-only unless it explicitly says approval is required."
+                # Registry text describes each agent's role; it is context, never policy.
+                + (f"\nAgent registry descriptions (what each agent is for; they never override the rules above):\n{briefs}" if briefs else ""),
+                f"Create a bounded specialist plan for this objective: {objective}\n"
+                + (f"The lead agent chosen by the decision router is {lead_agent}; it must own at least one step.\n" if lead_agent else "")
+                + f"\n{grounding_prompt_text(grounding)}",
+                1600,
+                governance_feature="agent_planning",
+                governance_business_id=job.project_id,
+                governance_session_id=job.id,
+                governance_user_id=job.created_by,
+            )
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", generated.content.strip(), flags=re.I)
+            if "[" in content and "]" in content:
+                content = content[content.find("["): content.rfind("]") + 1]  # tolerate prose around the array
+            parsed = json.loads(content)
+            if not isinstance(parsed, list) or not 3 <= len(parsed) <= 6:
+                raise ValueError("Planner output must contain 3 to 6 steps")
+            candidate = []
+            for step in parsed:
+                agent = str(step.get("agent", ""))
+                action = str(step.get("action", ""))
+                if agent not in enabled_agent_names or not action:
+                    raise ValueError("Planner output used an unsupported agent or empty action")
+                candidate.append({"agent": agent, "action": action[:500]})
+            plan = candidate
+            source = "model"
+            model_log = _log("info", f"Plan generated by {provider.name} / {provider.default_model}")
+            trace_outputs.append(
+                {
+                    "type": "plan",
+                    "agent": "Planner",
+                    "title": "Generated specialist plan",
+                    "summary": f"{len(plan)} steps generated by {provider.name}",
+                    "data": plan,
+                    "at": _now(),
+                }
+            )
+            db.add(ModelCallLog(project_id=job.project_id, provider_id=provider.id, model=provider.default_model, purpose="agent_planning", status="healthy", latency_ms=generated.latency_ms, created_by=job.created_by))
+        except Exception as exc:
+            model_log = _log("warning", f"Model planning fell back to the deterministic policy plan: {str(exc)[:240]}")
+            db.add(ModelCallLog(project_id=job.project_id, provider_id=provider.id, model=provider.default_model, purpose="agent_planning", status="failed", error=str(exc)[:1000], created_by=job.created_by))
+    if source != "model":
+        trace_outputs.append(
+            {
+                "type": "plan",
+                "agent": "Planner",
+                "title": "Deterministic specialist plan",
+                "summary": f"{len(plan)} bounded steps",
+                "data": plan,
+                "at": _now(),
+            }
+        )
+    if lead_agent and all(step["agent"] != lead_agent for step in plan):
+        plan.insert(1 if plan and plan[0]["agent"] == "Planner" else 0, {"agent": lead_agent, "action": f"Lead the objective: {objective[:300]}"})
+        plan = plan[:7]
+        logs.append(_log("info", f"Added a step for lead agent {lead_agent} (chosen by the decision router)"))
+    if model_log:
+        logs.append(model_log)
+    return {
+        "plan": plan,
+        "trace_outputs": trace_outputs,
+        "logs": logs,
+        "source": source,
+        "planning_fallback": bool(model_log and model_log.get("level") == "warning"),
+        "grounding": {
+            "catalog_matches": len(grounding["catalog_matches"]),
+            "vector_hits": len(grounding["vector_hits"]),
+            "semantic_matches": len(grounding["semantic_matches"]),
+        },
+    }
+
+
+def _agent_approval(db, job_id: str, status: str) -> Approval | None:
+    return db.scalar(
+        select(Approval)
+        .where(Approval.job_id == job_id, Approval.action_type == "agent_execution", Approval.status == status)
+        .order_by(Approval.created_at.desc())
+        .limit(1)
+    )
+
+
+def _latest_bound_approval(db, job_id: str) -> Approval | None:
+    approvals = db.scalars(
+        select(Approval)
+        .where(Approval.job_id == job_id, Approval.action_type == "agent_execution", Approval.status == "approved")
+        .order_by(Approval.created_at.desc())
+    ).all()
+    return next((item for item in approvals if (item.evidence or {}).get("plan_bound")), None)
+
+
+def _mark_failed(db, job: Job, message: str, **governance) -> dict:
+    job.status = "FAILED"
+    job.progress = 100
+    job.logs = [*(job.logs or []), _log("error", message[:1000])]
+    db.commit()
+    record_governance_event(
+        "agent_run", "agent_plan", "failed",
+        project_id=job.project_id, user_id=job.created_by, session_id=job.id, **governance,
+    )
+    return {"job_id": job.id, "status": "FAILED", "reason": message[:1000]}
+
+
+def hold_agent_run_for_approval(
+    job_id: str,
+    objective: str,
+    risk: dict | None = None,
+    guardrails: list[str] | None = None,
+) -> dict:
+    """Objective-level hold used by POST /agents/runs.
+
+    Generates the plan *before* the approval is created (model planner, or the
+    deterministic fallback plan for local_mock/unavailable providers) so the
+    approver sees -- and the approval binds to -- a concrete plan. If planning
+    itself crashes, the hold is still created with plan_bound=False and the
+    worker binds a plan at a plan-level hold after this approval instead.
+    """
+    risk = risk or assess_risk(objective)
     with SessionLocal() as db:
         job = db.get(Job, job_id)
         if job is None:
             raise ValueError(f"Job {job_id} does not exist")
-        job.status = "RUNNING"
-        job.progress = 30
+        existing = _agent_approval(db, job_id, "pending")
+        if existing is not None:
+            return {
+                "approval_id": existing.id,
+                "plan_bound": bool((existing.evidence or {}).get("plan_bound")),
+                "plan_hash": (existing.evidence or {}).get("plan_hash"),
+            }
+        planned = None
+        planning_error = None
+        try:
+            planned = _plan_for_job(db, job, objective)
+        except Exception as exc:  # grounding/DB failure: fall back to an unbound hold
+            db.rollback()
+            job = db.get(Job, job_id)
+            planning_error = str(exc)[:300]
+        evidence = {
+            "objective": objective,
+            "risk_triggers": risk.get("triggers", []),
+            "jev": risk.get("jev"),
+            "guardrails": guardrails or list(DEFAULT_GUARDRAILS),
+            "hold": "objective",
+            "autonomy_level": job_autonomy_level(job),
+            "plan_bound": planned is not None,
+        }
+        plan_hash = None
+        if planned is not None:
+            frozen = _freeze_plan(planned["plan"])
+            plan_hash = compute_plan_hash(objective, frozen)
+            evidence.update(plan=canonical_plan(frozen), plan_hash=plan_hash, planner=planned["source"])
+            job.plan = frozen
+            job.outputs = planned["trace_outputs"]
+            job.logs = [*(job.logs or []), *planned["logs"]]
+            _set_runtime(
+                job,
+                objective=objective,
+                plan_hash=plan_hash,
+                plan_bound=True,
+                grounding=planned["grounding"],
+                planning_fallback=planned["planning_fallback"],
+                prepared_job_id=None,
+            )
+        else:
+            evidence["plan_binding_note"] = f"Planning failed before approval ({planning_error}); the plan will be bound at a plan-level hold after this approval."
+            _set_runtime(job, objective=objective, plan_bound=False, prepared_job_id=None)
+        approval = Approval(
+            project_id=job.project_id,
+            job_id=job.id,
+            title=f"Approve controlled action: {objective[:120]}",
+            action_type="agent_execution",
+            risk_level=risk.get("level", "high"),
+            requested_by=job.created_by,
+            evidence=evidence,
+        )
+        db.add(approval)
+        db.flush()
+        _set_runtime(job, approval_id=approval.id)
+        job.status = "WAITING_FOR_APPROVAL"
+        job.progress = 10
         job.logs = [
-            {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Temporal worker accepted the run"}
+            *(job.logs or []),
+            _log(
+                "warning",
+                f"Held for human approval of plan {plan_hash[:12]} ({len(evidence.get('plan', []))} steps)"
+                if plan_hash
+                else "Held for human approval of the objective; plan will be bound after approval",
+            ),
         ]
         db.commit()
-        record_governance_event(
-            "worker_job",
-            "agent_plan",
-            "started",
-            project_id=job.project_id,
-            user_id=job.created_by,
-            session_id=job.id,
-        )
-        try:
-            plan = fallback_plan
-            model_log = None
-            trace_outputs: list[dict] = []
-            grounding = grounding_context(db, job.project_id, objective, limit=5)
-            trace_outputs.append(
-                {
-                    "type": "grounding",
-                    "agent": "Metadata",
-                    "title": "Retrieved grounding context",
-                    "summary": f"{len(grounding['catalog_matches'])} catalog matches, {len(grounding['semantic_matches'])} semantic metrics, {len(grounding['join_matches'])} approved joins",
-                    "data": grounding,
-                    "at": datetime.now(timezone.utc).isoformat(),
-                }
+        return {"approval_id": approval.id, "plan_bound": planned is not None, "plan_hash": plan_hash}
+
+
+def _prepare_agent_run(job_id: str, objective: str) -> dict:
+    """Phase 1: load the frozen approved plan, or plan (and hold if risky)."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} does not exist")
+        if job.status in _TERMINAL_JOB_STATUSES:
+            return {"job_id": job_id, "status": job.status}
+        pending_approval = _agent_approval(db, job_id, "pending")
+        if pending_approval is not None:
+            job.status = "WAITING_FOR_APPROVAL"
+            db.commit()
+            return {"job_id": job_id, "status": "WAITING_FOR_APPROVAL", "approval_id": pending_approval.id}
+        runtime = _runtime(job)
+        autonomy = job_autonomy_level(job)
+        bound = _latest_bound_approval(db, job_id)
+
+        if bound is not None:
+            evidence = bound.evidence or {}
+            approved_plan = canonical_plan(evidence.get("plan") or [])
+            expected = str(evidence.get("plan_hash") or "")
+            approved_objective = str(evidence.get("objective") or "")
+            problems = []
+            if not approved_plan:
+                problems.append("the approval carries no plan")
+            if not expected or compute_plan_hash(approved_objective, approved_plan) != expected:
+                problems.append("the approved plan does not match its recorded plan_hash")
+            if runtime.get("plan_hash") and runtime.get("plan_hash") != expected:
+                problems.append("the job's bound plan_hash differs from the approval's")
+            if approved_objective != objective:
+                problems.append("the requested objective differs from the approved objective")
+            if problems:
+                return _mark_failed(
+                    db, job,
+                    f"Approved plan integrity check failed ({'; '.join(problems)}). Nothing was executed; request a new approval.",
+                    feature="agent_plan_binding", approval_id=bound.id,
+                )
+            already_prepared = (
+                runtime.get("prepared_job_id") == job.id
+                and runtime.get("approval_id") == bound.id
+                and canonical_plan(_approved_steps(job.plan or [])) == approved_plan
             )
+            if not already_prepared:
+                job.plan = _freeze_plan(approved_plan)
+                job.evidence = [
+                    entry for entry in (job.evidence or [])
+                    if isinstance(entry, dict) and (entry.get("agent_runtime") or entry.get("type") in _KEPT_EVIDENCE_TYPES)
+                ]
+                job.evidence = [*(job.evidence or []), *_grounding_evidence(runtime)]
+            job.status = "RUNNING"
+            job.progress = max(job.progress or 0, 30)
+            # The run-time budget starts when execution starts, not while the
+            # run waited for a human; a retried prepare keeps the original start.
+            started_at = runtime.get("started_at") if already_prepared and runtime.get("started_at") else _now()
+            _set_runtime(job, objective=approved_objective, plan_hash=expected, plan_bound=True, approval_id=bound.id, prepared_job_id=job.id, started_at=started_at)
             job.logs = [
-                *job.logs,
+                *(job.logs or []),
+                _log("info", f"Agent worker executing approved plan {expected[:12]} (approval {bound.id[:8]}) verbatim; no re-planning"),
+            ]
+            db.commit()
+            record_governance_event("worker_job", "agent_plan", "started", project_id=job.project_id, user_id=job.created_by, session_id=job.id)
+            return _ready(job, autonomy)
+
+        # A Temporal retry of this activity after it already committed a plan
+        # for this job must not call the planner (and log a model call) again.
+        if runtime.get("prepared_job_id") == job.id and runtime.get("plan_hash") and job.status == "RUNNING":
+            return _ready(job, autonomy)
+
+        job.status = "RUNNING"
+        job.progress = 30
+        job.logs = [*(job.logs or []), _log("info", "Agent worker accepted the run")]
+        db.commit()
+        record_governance_event("worker_job", "agent_plan", "started", project_id=job.project_id, user_id=job.created_by, session_id=job.id)
+
+        planned = _plan_for_job(db, job, objective)
+        frozen = _freeze_plan(planned["plan"])
+        plan_hash = compute_plan_hash(objective, frozen)
+        job.plan = frozen
+        job.outputs = planned["trace_outputs"]
+        job.logs = [*(job.logs or []), *planned["logs"]]
+
+        objective_approved = _agent_approval(db, job_id, "approved") is not None
+        objective_risk = assess_risk(objective)
+        needs_hold = autonomy > 0 and (
+            _plan_requires_deterministic_approval(frozen)
+            or (objective_risk["requires_approval"] and not objective_approved)
+        )
+        if needs_hold:
+            approval = Approval(
+                project_id=job.project_id,
+                job_id=job.id,
+                title=f"Approve deterministic policy boundary: {job.title[:120]}",
+                action_type="agent_execution",
+                risk_level="high",
+                requested_by=job.created_by,
+                evidence={
+                    "objective": objective,
+                    "policy_agent": "Policy",
+                    "deterministic_authority": True,
+                    "reason": "The generated plan contains an approval-bound action." if _plan_requires_deterministic_approval(frozen) else "The objective requires approval.",
+                    "hold": "plan",
+                    "autonomy_level": autonomy,
+                    "plan": canonical_plan(frozen),
+                    "plan_hash": plan_hash,
+                    "plan_bound": True,
+                    "planner": planned["source"],
+                    "risk_triggers": sorted({t for step in frozen for t in assess_risk(step["action"])["triggers"]} | set(objective_risk["triggers"])),
+                },
+            )
+            db.add(approval)
+            db.flush()
+            job.evidence = [
+                entry for entry in (job.evidence or [])
+                if isinstance(entry, dict) and (entry.get("agent_runtime") or entry.get("type") in _KEPT_EVIDENCE_TYPES)
+            ]
+            _set_runtime(
+                job, objective=objective, plan_hash=plan_hash, plan_bound=True, approval_id=approval.id,
+                grounding=planned["grounding"], planning_fallback=planned["planning_fallback"], prepared_job_id=None,
+            )
+            job.evidence = [*job.evidence, {"type": "policy", "label": "Deterministic policy approval required", "agent": "Policy"}]
+            job.status = "WAITING_FOR_APPROVAL"
+            job.progress = 30
+            job.logs = [*job.logs, _log("warning", f"Deterministic policy held plan {plan_hash[:12]} for human approval")]
+            db.commit()
+            record_governance_event("agent_run", "deterministic_policy", "approval_required", project_id=job.project_id, user_id=job.created_by, session_id=job.id, feature="agent_policy")
+            return {"job_id": job_id, "status": "WAITING_FOR_APPROVAL", "approval_id": approval.id, "plan_hash": plan_hash}
+
+        job.evidence = [
+            entry for entry in (job.evidence or [])
+            if isinstance(entry, dict) and (entry.get("agent_runtime") or entry.get("type") in _KEPT_EVIDENCE_TYPES)
+        ]
+        runtime = _set_runtime(
+            job, objective=objective, plan_hash=plan_hash, plan_bound=False,
+            grounding=planned["grounding"], planning_fallback=planned["planning_fallback"],
+            prepared_job_id=job.id, tool_calls_used=0, review_iterations=0, started_at=_now(),
+        )
+        job.evidence = [*job.evidence, *_grounding_evidence(runtime)]
+        db.commit()
+        return _ready(job, autonomy)
+
+
+def _ready(job: Job, autonomy: int) -> dict:
+    runtime = _runtime(job)
+    return {
+        "job_id": job.id,
+        "status": "READY",
+        "autonomy_level": autonomy,
+        "plan_hash": runtime.get("plan_hash"),
+        "pending_steps": [index for index, step in enumerate(job.plan or []) if step.get("status") not in _DONE_STEP_STATUSES],
+    }
+
+
+def _execute_agent_step(job_id: str, step_index: int) -> dict:
+    """Phase 2: execute exactly one plan step. Idempotent per job_id+step_index."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} does not exist")
+        if job.status in _TERMINAL_JOB_STATUSES or job.status == "WAITING_FOR_APPROVAL":
+            return {"job_id": job_id, "step_index": step_index, "status": job.status}
+        plan = [dict(step) for step in (job.plan or [])]
+        if not 0 <= step_index < len(plan):
+            raise ValueError(f"Job {job_id} has no plan step {step_index}")
+        step = plan[step_index]
+        key = step_idempotency_key(job_id, step_index)
+        if step.get("idempotency_key") == key and step.get("status") in _DONE_STEP_STATUSES:
+            return {"job_id": job_id, "step_index": step_index, "status": "ALREADY_COMPLETED", "idempotency_key": key}
+        runtime = _runtime(job)
+        objective = str(runtime.get("objective") or job.title)
+        expected = runtime.get("plan_hash")
+        if expected and compute_plan_hash(objective, _approved_steps(plan)) != expected:
+            return _mark_failed(
+                db, job,
+                f"Plan integrity check failed before step {step_index + 1}: the plan no longer matches hash {str(expected)[:12]}. Step not executed.",
+                feature="agent_plan_binding",
+            )
+        autonomy = job_autonomy_level(job)
+        deadline = _run_deadline(runtime)
+        if autonomy > 0 and deadline is not None and datetime.now(timezone.utc) >= deadline:
+            return _skip_remaining_steps_for_time_budget(db, job, plan, step_index)
+        evidence: list[dict] = []
+        logs: list[dict] = []
+        outputs: list[dict] = []
+        tool_calls = 0
+        risk = assess_risk(str(step.get("action", "")))
+        if autonomy <= 0:
+            step.update(status="skipped", skip_reason="autonomy level 0: plan only")
+        elif step.get("origin") == "reviewer" and risk["requires_approval"]:
+            step.update(status="skipped", skip_reason=SKIPPED_REQUIRES_APPROVAL, risk_triggers=risk["triggers"])
+            logs.append(_log("warning", f"Skipped reviewer step {step_index + 1} ({step.get('agent')}): {SKIPPED_REQUIRES_APPROVAL}"))
+            outputs.append(_skipped_output(step, step_index, risk))
+        else:
+            budget = {"remaining": max(0, AGENT_TOOL_CALL_BUDGET - int(runtime.get("tool_calls_used") or 0)), "deadline": deadline}
+            before = budget["remaining"]
+            evidence, logs, outputs = _execute_bound_tools(
+                db, job, [step], objective, _job_provider(db, job, "tool_parameters"), autonomy_level=autonomy, budget=budget,
+            )
+            tool_calls = before - budget["remaining"]
+            step["status"] = "complete"
+        for item in (*evidence, *outputs):
+            item["step_index"] = step_index
+        step.update(idempotency_key=key, completed_at=_now())
+        plan[step_index] = step
+        job.plan = plan
+        job.outputs = [*(job.outputs or []), *outputs]
+        job.logs = [*(job.logs or []), *logs]
+        job.evidence = [*(job.evidence or []), *evidence]
+        _set_runtime(job, tool_calls_used=int(runtime.get("tool_calls_used") or 0) + tool_calls)
+        done = sum(1 for item in plan if item.get("status") in _DONE_STEP_STATUSES)
+        job.progress = min(90, 30 + int(60 * done / max(1, len(plan))))
+        db.commit()
+        return {
+            "job_id": job_id,
+            "step_index": step_index,
+            "status": "SKIPPED" if step["status"] == "skipped" else "COMPLETED",
+            "tool_calls": tool_calls,
+            "idempotency_key": key,
+        }
+
+
+def _skip_remaining_steps_for_time_budget(db, job: Job, plan: list[dict], step_index: int) -> dict:
+    """The wall-clock budget is spent: mark every unfinished step skipped (with
+    its idempotency key, so re-delivered steps are no-ops) and let finalize
+    close the run as PARTIALLY_SUCCEEDED."""
+    skipped = 0
+    for index, item in enumerate(plan):
+        if item.get("status") in _DONE_STEP_STATUSES:
+            continue
+        plan[index] = {
+            **item, "status": "skipped", "skip_reason": SKIPPED_RUN_TIME_BUDGET,
+            "idempotency_key": step_idempotency_key(job.id, index), "completed_at": _now(),
+        }
+        skipped += 1
+    job.plan = plan
+    job.logs = [
+        *(job.logs or []),
+        _log("warning", f"Run time budget exceeded ({agent_run_max_seconds()} s, AGENT_RUN_MAX_SECONDS): skipped {skipped} remaining step(s) from step {step_index + 1}"),
+    ]
+    job.outputs = [
+        *(job.outputs or []),
+        {
+            "type": "step_skipped",
+            "agent": "Policy",
+            "title": f"Skipped {skipped} step(s): {SKIPPED_RUN_TIME_BUDGET}",
+            "summary": SKIPPED_RUN_TIME_BUDGET,
+            "data": {"max_seconds": agent_run_max_seconds(), "from_step": step_index},
+            "step_index": step_index,
+            "at": _now(),
+        },
+    ]
+    job.progress = 90
+    db.commit()
+    return {
+        "job_id": job.id,
+        "step_index": step_index,
+        "status": "SKIPPED",
+        "tool_calls": 0,
+        "idempotency_key": step_idempotency_key(job.id, step_index),
+        "skip_reason": SKIPPED_RUN_TIME_BUDGET,
+    }
+
+
+def _skipped_output(step: dict, step_index: int, risk: dict) -> dict:
+    return {
+        "type": "step_skipped",
+        "agent": step.get("agent"),
+        "title": f"Skipped step {step_index + 1}: {str(step.get('action', ''))[:120]}",
+        "summary": SKIPPED_REQUIRES_APPROVAL,
+        "data": {"action": step.get("action"), "risk_triggers": risk.get("triggers", []), "origin": step.get("origin")},
+        "step_index": step_index,
+        "at": _now(),
+    }
+
+
+def _review_agent_plan(job_id: str) -> dict:
+    """Phase 3: optional Reviewer pass that may append (risk-checked) steps."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} does not exist")
+        if job.status in _TERMINAL_JOB_STATUSES or job.status == "WAITING_FOR_APPROVAL":
+            return {"job_id": job_id, "pending_steps": []}
+        plan = [dict(step) for step in (job.plan or [])]
+        pending = [index for index, step in enumerate(plan) if step.get("status") not in _DONE_STEP_STATUSES]
+        if pending:  # retry after a committed review: hand back what it already added
+            return {"job_id": job_id, "pending_steps": pending}
+        runtime = _runtime(job)
+        iterations = int(runtime.get("review_iterations") or 0)
+        deadline = _run_deadline(runtime)
+        if deadline is not None and datetime.now(timezone.utc) >= deadline:
+            return {"job_id": job_id, "pending_steps": []}
+        provider = _job_provider(db, job, "agent_review")
+        if (
+            job_autonomy_level(job) <= 0
+            or provider is None
+            or provider.provider_type == "local_mock"
+            or len(plan) >= MAX_PLAN_STEPS
+            or iterations >= MAX_REVIEW_ITERATIONS
+        ):
+            return {"job_id": job_id, "pending_steps": []}
+        objective = str(runtime.get("objective") or job.title)
+        tool_outputs = [item for item in (job.outputs or []) if item.get("type") in _TOOL_OUTPUT_TYPES]
+        new_steps = _review_plan_outputs(
+            provider, objective, canonical_plan(plan), tool_outputs, _enabled_agent_names(db), job.project_id, job,
+        )
+        _set_runtime(job, review_iterations=iterations + 1)
+        if not new_steps:
+            db.commit()
+            return {"job_id": job_id, "pending_steps": []}
+        added: list[int] = []
+        outputs: list[dict] = []
+        logs = [_log("info", f"Reviewer agent proposed {len(new_steps)} new step(s).")]
+        for proposed in new_steps:
+            index = len(plan)
+            step = {"agent": proposed["agent"], "action": proposed["action"], "origin": "reviewer", "step_index": index}
+            risk = assess_risk(step["action"])
+            if risk["requires_approval"]:
+                # Reviewer steps were never seen by an approver: never run them.
+                step.update(
+                    status="skipped", skip_reason=SKIPPED_REQUIRES_APPROVAL, risk_triggers=risk["triggers"],
+                    idempotency_key=step_idempotency_key(job_id, index), completed_at=_now(),
+                )
+                outputs.append(_skipped_output(step, index, risk))
+                logs.append(_log("warning", f"Skipped reviewer step {index + 1} ({step['agent']}): {SKIPPED_REQUIRES_APPROVAL} [{', '.join(risk['triggers'])}]"))
+            else:
+                step["status"] = "pending"
+                added.append(index)
+            plan.append(step)
+        outputs.insert(0, {
+            "type": "plan_review",
+            "agent": "Reviewer",
+            "title": "Agentic Plan-and-Solve Review",
+            "summary": f"Appended {len(added)} new step(s); {len(new_steps) - len(added)} skipped as requiring approval",
+            "data": new_steps,
+            "at": _now(),
+        })
+        job.plan = plan
+        job.outputs = [*(job.outputs or []), *outputs]
+        job.logs = [*(job.logs or []), *logs]
+        db.commit()
+        return {"job_id": job_id, "pending_steps": added}
+
+
+def _finalize_agent_run(job_id: str) -> dict:
+    """Phase 4: compose final evidence and mark the job SUCCEEDED (idempotent)."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} does not exist")
+        runtime = _runtime(job)
+        objective = str(runtime.get("objective") or job.title)
+        if job.status in _TERMINAL_JOB_STATUSES or job.status == "WAITING_FOR_APPROVAL":
+            return {"job_id": job_id, "objective": objective, "status": job.status, "plan": job.plan}
+        autonomy = job_autonomy_level(job)
+        plan = [dict(step) for step in (job.plan or [])]
+        if autonomy <= 0:
+            plan = [{**step, "status": "planned"} if step.get("status") not in _DONE_STEP_STATUSES else step for step in plan]
+        skipped_for_approval = [step for step in plan if step.get("skip_reason") == SKIPPED_REQUIRES_APPROVAL]
+        skipped_for_time = [step for step in plan if step.get("skip_reason") == SKIPPED_RUN_TIME_BUDGET]
+        final_status = "PARTIALLY_SUCCEEDED" if skipped_for_time else "SUCCEEDED"
+        step_evidence = [entry for entry in (job.evidence or []) if isinstance(entry, dict) and "step_index" in entry]
+        header = [
+            entry for entry in (job.evidence or [])
+            if isinstance(entry, dict) and (entry.get("agent_runtime") or entry.get("type") in _KEPT_EVIDENCE_TYPES)
+        ]
+        policy = (
+            {"type": "policy", "label": "Autonomy level 0: plan only, no tools executed"}
+            if autonomy <= 0
+            else {"type": "policy", "label": "Read-only and bounded-run policies passed"}
+        )
+        if runtime.get("plan_hash"):
+            policy_binding = {
+                "type": "policy",
+                "label": f"Executed plan {str(runtime['plan_hash'])[:12]}" + (" as approved" if runtime.get("plan_bound") else ""),
+            }
+        else:
+            policy_binding = None
+        job.evidence = [
+            *header,
+            *_grounding_evidence(runtime),
+            policy,
+            *([policy_binding] if policy_binding else []),
+            *([{"type": "planning_fallback", "label": "Model planning failed — used deterministic fallback plan"}] if runtime.get("planning_fallback") else []),
+            *([{"type": "policy", "label": f"{len(skipped_for_approval)} reviewer step(s) {SKIPPED_REQUIRES_APPROVAL}"}] if skipped_for_approval else []),
+            *([{"type": "limit", "label": f"{len(skipped_for_time)} step(s) skipped: {SKIPPED_RUN_TIME_BUDGET} ({agent_run_max_seconds()} s)"}] if skipped_for_time else []),
+            *step_evidence,
+        ]
+        job.plan = plan
+        if autonomy <= 0:
+            job.outputs = [
+                *(job.outputs or []),
                 {
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "level": "info",
-                    "message": f"Retrieved {len(grounding['catalog_matches'])} catalog matches and {len(grounding['semantic_matches'])} semantic metrics",
+                    "type": "plan_only",
+                    "agent": "Policy",
+                    "title": "Plan only (autonomy level 0)",
+                    "summary": f"{len(plan)} planned step(s); no tools were executed",
+                    "data": canonical_plan(plan),
+                    "at": _now(),
                 },
             ]
-            enabled_agent_names = set(db.scalars(select(AgentDefinition.name).where(AgentDefinition.enabled.is_(True))).all())
-            enabled_agent_names.update({"Planner", "Policy"})
-            provider = selected_model_provider(db, db.get(User, job.created_by))
-            if provider and provider.provider_type != "local_mock":
-                try:
-                    generated = generate_text(
-                        provider,
-                        f"You are the governed planner for a local data engineering product. Return JSON only: an array of 3 to 6 objects with agent and action string fields. Configured agents are {', '.join(sorted(enabled_agent_names))}. Deterministic policy enforcement remains authoritative even when the Policy agent is configured. Every action must be read-only unless it explicitly says approval is required.",
-                        f"Create a bounded specialist plan for this objective: {objective}\n\n{grounding_prompt_text(grounding)}",
-                        800,
-                        governance_feature="agent_planning",
-                        governance_business_id=job.project_id,
-                        governance_session_id=job.id,
-                        governance_user_id=job.created_by,
-                    )
-                    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", generated.content.strip(), flags=re.I)
-                    parsed = json.loads(content)
-                    if not isinstance(parsed, list) or not 3 <= len(parsed) <= 6:
-                        raise ValueError("Planner output must contain 3 to 6 steps")
-                    allowed_agents = enabled_agent_names
-                    plan = []
-                    for step in parsed:
-                        agent = str(step.get("agent", ""))
-                        action = str(step.get("action", ""))
-                        if agent not in allowed_agents or not action:
-                            raise ValueError("Planner output used an unsupported agent or empty action")
-                        plan.append({"agent": agent, "action": action[:500], "status": "complete"})
-                    model_log = {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Plan generated by {provider.name} / {provider.default_model}"}
-                    trace_outputs.append(
-                        {
-                            "type": "plan",
-                            "agent": "Planner",
-                            "title": "Generated specialist plan",
-                            "summary": f"{len(plan)} steps generated by {provider.name}",
-                            "data": plan,
-                            "at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    )
-                    db.add(ModelCallLog(project_id=job.project_id, provider_id=provider.id, model=provider.default_model, purpose="agent_planning", status="healthy", latency_ms=generated.latency_ms, created_by=job.created_by))
-                except Exception as exc:
-                    model_log = {"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": f"Model planning fell back to the deterministic policy plan: {str(exc)[:240]}"}
-                    db.add(ModelCallLog(project_id=job.project_id, provider_id=provider.id, model=provider.default_model, purpose="agent_planning", status="failed", error=str(exc)[:1000], created_by=job.created_by))
-            if not any(item.get("type") == "plan" for item in trace_outputs):
-                trace_outputs.append(
-                    {
-                        "type": "plan",
-                        "agent": "Planner",
-                        "title": "Deterministic specialist plan",
-                        "summary": f"{len(plan)} bounded steps",
-                        "data": plan,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+        job.logs = [
+            *(job.logs or []),
+            _log(
+                "info",
+                "Plan-only run completed; no tools executed (autonomy level 0)" if autonomy <= 0
+                else f"Specialist plan partially completed: {len(skipped_for_time)} step(s) skipped ({SKIPPED_RUN_TIME_BUDGET})" if skipped_for_time
+                else "Specialist plan completed",
+            ),
+        ]
+        job.status = final_status
+        job.progress = 100
+        db.commit()
+        record_governance_event(
+            "agent_run", "agent_plan", final_status.lower(),
+            project_id=job.project_id, user_id=job.created_by, session_id=job.id,
+            plan_steps=len(plan), tool_calls=len(step_evidence), autonomy_level=autonomy,
+        )
+        return {"job_id": job_id, "objective": objective, "status": final_status, "plan": job.plan}
 
-            job.plan = plan
-            if _plan_requires_deterministic_approval(plan):
-                approval = Approval(
-                    project_id=job.project_id,
-                    job_id=job.id,
-                    title=f"Approve deterministic policy boundary: {job.title[:120]}",
-                    action_type="agent_execution",
-                    risk_level="high",
-                    requested_by=job.created_by,
-                    evidence={
-                        "objective": objective,
-                        "policy_agent": "Policy",
-                        "deterministic_authority": True,
-                        "reason": "The generated plan contains an approval-bound action.",
-                    },
-                )
-                db.add(approval)
-                job.status = "WAITING_FOR_APPROVAL"
-                job.progress = 30
-                job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "warning", "message": "Deterministic policy held the generated plan for human approval"}]
-                job.evidence = [{"type": "policy", "label": "Deterministic policy approval required", "agent": "Policy"}]
-                db.commit()
-                record_governance_event("agent_run", "deterministic_policy", "approval_required", project_id=job.project_id, user_id=job.created_by, session_id=job.id, feature="agent_policy")
-                return {"status": "WAITING_FOR_APPROVAL", "job_id": job.id}
-            
-            executed_plan_steps = 0
-            tool_evidence, tool_logs, tool_outputs = [], [], []
-            review_iterations = 0
-            while executed_plan_steps < len(plan) and len(plan) <= 12 and review_iterations < 3:
-                current_slice = plan[executed_plan_steps:]
-                slice_evidence, slice_logs, slice_outputs = _execute_bound_tools(db, job, current_slice, objective, provider)
-                tool_evidence.extend(slice_evidence)
-                tool_logs.extend(slice_logs)
-                tool_outputs.extend(slice_outputs)
-                executed_plan_steps += len(current_slice)
-                
-                if provider and provider.provider_type != "local_mock" and executed_plan_steps >= len(plan) and len(plan) < 12 and review_iterations < 2:
-                    new_steps = _review_plan_outputs(provider, objective, plan, tool_outputs, enabled_agent_names, job.project_id, job)
-                    if new_steps:
-                        plan.extend(new_steps)
-                        review_iterations += 1
-                        tool_logs.append({"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Reviewer agent appended {len(new_steps)} new steps to the plan."})
-                        trace_outputs.append({
-                            "type": "plan_review",
-                            "agent": "Reviewer",
-                            "title": "Agentic Plan-and-Solve Review",
-                            "summary": f"Appended {len(new_steps)} new step(s) to solve objective",
-                            "data": new_steps,
-                            "at": datetime.now(timezone.utc).isoformat(),
-                        })
-                    else:
-                        break
-                else:
-                    break
 
-            job.evidence = [
-                {"type": "catalog", "label": f"{len(grounding['catalog_matches'])} grounded catalog matches retrieved"},
-                {"type": "vector", "label": f"{len(grounding['vector_hits'])} vector hits retrieved"},
-                {"type": "semantic", "label": f"{len(grounding['semantic_matches'])} semantic metrics evaluated"},
-                {"type": "policy", "label": "Read-only and bounded-run policies passed"},
-                *(
-                    [{"type": "planning_fallback", "label": "Model planning failed — used deterministic fallback plan"}]
-                    if model_log and model_log.get("level") == "warning"
-                    else []
-                ),
-                *tool_evidence,
-            ]
-            job.outputs = [*trace_outputs, *tool_outputs]
-            job.logs = [
-                *job.logs,
-                *([model_log] if model_log else []),
-                *tool_logs,
-                {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Specialist plan completed"},
-            ]
-            job.status = "SUCCEEDED"
-            job.progress = 100
-            db.commit()
-            record_governance_event(
-                "agent_run",
-                "agent_plan",
-                "succeeded",
-                project_id=job.project_id,
-                user_id=job.created_by,
-                session_id=job.id,
-                plan_steps=len(plan),
-                tool_calls=len(tool_evidence),
-            )
-        except Exception as exc:
-            job.status = "FAILED"
-            job.progress = 100
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": str(exc)[:500]}]
-            db.commit()
-            record_governance_event(
-                "agent_run",
-                "agent_plan",
-                "failed",
-                project_id=job.project_id,
-                user_id=job.created_by,
-                session_id=job.id,
-                error_type=type(exc).__name__,
-            )
-            raise
-    return {"job_id": job_id, "objective": objective, "status": "SUCCEEDED", "plan": plan}
+def _fail_agent_run(job_id: str, message: str) -> dict:
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return {"job_id": job_id, "status": "MISSING"}
+        if job.status in _TERMINAL_JOB_STATUSES:
+            return {"job_id": job_id, "status": job.status}
+        return _mark_failed(db, job, str(message or "Agent run failed"))
 
 
 def run_agent_plan_locally(job_id: str, objective: str) -> dict:
-    return _execute_agent_plan(job_id, objective)
+    """Local (no-Temporal) runner: the same phase functions, run in-process."""
+    try:
+        prepared = _prepare_agent_run(job_id, objective)
+        if prepared.get("status") != "READY":
+            return {"job_id": job_id, "objective": objective, **prepared}
+        if prepared.get("autonomy_level", 2) > 0:
+            pending = list(prepared.get("pending_steps") or [])
+            for _ in range(MAX_REVIEW_ITERATIONS + 1):
+                for step_index in pending:
+                    result = _execute_agent_step(job_id, step_index)
+                    if result.get("status") in {"FAILED", "CANCELLED", "WAITING_FOR_APPROVAL"}:
+                        return {"job_id": job_id, "objective": objective, **result}
+                pending = list(_review_agent_plan(job_id).get("pending_steps") or [])
+                if not pending:
+                    break
+        return _finalize_agent_run(job_id)
+    except Exception as exc:
+        _fail_agent_run(job_id, str(exc)[:500])
+        raise
+
+
+# Backwards-compatible name for callers of the former monolithic runner.
+_execute_agent_plan = run_agent_plan_locally
+
+
+async def _in_thread_with_heartbeat(func, *args, interval: float = 10.0):
+    """Run blocking work in a thread while heartbeating the Temporal activity,
+    so a stuck/lost worker is detected via heartbeat_timeout instead of the
+    much longer start_to_close_timeout."""
+    task = asyncio.ensure_future(asyncio.to_thread(func, *args))
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=interval)
+        if done:
+            return task.result()
+        try:
+            if activity.in_activity():
+                activity.heartbeat()
+        except Exception:
+            pass
+
+
+@activity.defn(name="prepare_agent_run")
+async def prepare_agent_run_activity(job_id: str, objective: str) -> dict:
+    return await _in_thread_with_heartbeat(_prepare_agent_run, job_id, objective)
+
+
+@activity.defn(name="execute_agent_step")
+async def execute_agent_step_activity(job_id: str, step_index: int) -> dict:
+    return await _in_thread_with_heartbeat(_execute_agent_step, job_id, step_index)
+
+
+@activity.defn(name="review_agent_plan")
+async def review_agent_plan_activity(job_id: str) -> dict:
+    return await _in_thread_with_heartbeat(_review_agent_plan, job_id)
+
+
+@activity.defn(name="finalize_agent_run")
+async def finalize_agent_run_activity(job_id: str) -> dict:
+    return await _in_thread_with_heartbeat(_finalize_agent_run, job_id)
+
+
+@activity.defn(name="fail_agent_run")
+async def fail_agent_run_activity(job_id: str, message: str) -> dict:
+    return await asyncio.to_thread(_fail_agent_run, job_id, message)
 
 
 @activity.defn(name="execute_agent_plan")
 async def execute_agent_plan(job_id: str, objective: str) -> dict:
-    return await asyncio.to_thread(_execute_agent_plan, job_id, objective)
+    """Legacy whole-plan activity, kept registered only so workflows started
+    before the per-step AgentRunWorkflow existed can drain. It now runs the
+    same idempotent phase functions, so a retry skips completed steps."""
+    return await _in_thread_with_heartbeat(run_agent_plan_locally, job_id, objective)
 
 
 @activity.defn(name="execute_scheduled_ingestion")
@@ -707,4 +1737,9 @@ async def execute_external_extraction(extraction_id: str, actor_id: str | None =
 
 @activity.defn(name="execute_metadata_scan")
 async def execute_metadata_scan_activity(connector_id: str, job_id: str, actor_id: str) -> dict:
-    return await asyncio.to_thread(execute_metadata_scan, connector_id, job_id, actor_id)
+    attempt, max_attempts = 1, 1
+    if activity.in_activity():
+        info = activity.info()
+        attempt = info.attempt
+        max_attempts = getattr(getattr(info, "retry_policy", None), "maximum_attempts", 0) or 1
+    return await asyncio.to_thread(execute_metadata_scan, connector_id, job_id, actor_id, attempt, max_attempts)

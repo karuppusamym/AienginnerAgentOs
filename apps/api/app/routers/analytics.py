@@ -118,8 +118,11 @@ from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
 
-from .. import main
-from ..main import (
+from ..superset_client import superset_availability
+from ..charts import infer_column_types
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -144,10 +147,10 @@ from ..main import (
     QueryTool, QueryToolCreate, QueryToolGrant, QueryToolGrantCreate, QueryToolInvoke,
     QueryToolWizardPreview, RedTeamSuiteCreate, Request, RetentionPolicy,
     RetentionPolicySave, SECURITY_CATEGORIES, SECURITY_CATEGORY_LABELS,
-    SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache, SQLRequest, SupersetPublishRequest,
-    ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate, SemanticJoinPolicy,
-    SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate, Session,
-    SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
+    SECURITY_SEVERITIES, SQLExecutionRequest, SQLQueryCache, SQLRequest,
+    SupersetPublishRequest, ScheduleCreate, SchemaDriftEvent, SchemaMappingCreate,
+    SemanticJoinPolicy, SemanticJoinPolicyCreate, SemanticMetric, SemanticMetricCreate,
+    Session, SessionLocal, StreamingResponse, SupersetProjectDashboard, ToolDefinition,
     ToolDefinitionCreate, ToolDefinitionUpdate, ToolExecuteRequest, ToolExecution,
     ToolRuntimeError, ToolVersion, ToolVersionCreate, UPLOAD_DIR, UploadFile, User,
     UserCreate, UserFeedback, UserUpdate, _asset_relation_sql, _build_delivery_plan,
@@ -161,37 +164,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -290,6 +293,10 @@ def request_sql_publication(
 
     if not _safe_read_only_sql(sql):
         raise HTTPException(status_code=400, detail="Only one read-only SELECT statement can be published")
+    availability = superset_availability()
+    if not availability["available"]:
+        # Fail before creating an approval that could never be fulfilled.
+        raise HTTPException(status_code=503, detail=f"Superset is unavailable: {availability['reason']}")
     try:
         preview = execute_read_only(engine, sql, 1)
     except Exception as exc:
@@ -332,7 +339,11 @@ def request_sql_publication(
     db.add(approval)
     audit(db, user, "analytics.publication_requested", "artifact", artifact.id, {"approval_id": approval.id, "version": latest.version})
     db.commit()
-    return {"approval_id": approval.id, "job_id": job.id, "status": "awaiting_approval"}
+    from .. import auto_approval
+
+    review = auto_approval.review_approval(db, project, approval, "on_create")
+    auto_approved = review["decision"] == "approved"
+    return {"approval_id": approval.id, "job_id": job.id, "status": "auto_approved" if auto_approved else "awaiting_approval", "auto_review": review}
 
 
 @router.get("/analytics/queries/{artifact_id}")
@@ -357,7 +368,8 @@ def get_query_analytics(
         )
     )
     if state is None:
-        return {"published": False, "artifact_id": artifact.id}
+        pending = _pending_publication(db, project.id, artifact.id)
+        return {"published": False, "artifact_id": artifact.id, "pending_approval_id": pending.id if pending else None}
     return {
         "published": True,
         "artifact_id": artifact.id,
@@ -405,6 +417,12 @@ def analytics_query_guest_token(
         "sql": state.sql,
     }
     dashboard_key = f"query-{artifact.id}"
+    if all(str(column.get("type", "text")) == "text" for column in dataset["columns"]):
+        # Published before types were inferred: re-sample so charts use measures and time axes.
+        try:
+            dataset["columns"] = infer_column_types(execute_read_only(engine, state.sql, 200)) or dataset["columns"]
+        except Exception:
+            pass
     try:
         config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
         token = create_guest_token(project.name, project.slug, dataset, user.id, user.email, user.name, dashboard_key)
@@ -419,4 +437,189 @@ def analytics_query_guest_token(
         "embedded_id": config["embedded_id"],
         "superset_domain": config["superset_domain"],
         "dashboard_title": config.get("dashboard_title", state.dashboard_title),
+        "dataset_relation": config.get("dataset_relation"),
+        "chart_count": config.get("chart_count"),
+        "access_mode": config.get("access_mode"),
     }
+
+
+@router.get("/analytics/status")
+def analytics_status(_: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Whether embedded analytics (Superset) is reachable, with guidance when it is not."""
+    return superset_availability()
+
+
+@router.get("/analytics/dashboards")
+def analytics_dashboards(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Everything the current project can show in embedded analytics, in one list.
+
+    Scope is the project: every entry belongs to the current project and is
+    embedded with a guest token limited to that one dashboard. Entries are
+    grouped by where the data comes from: the project's primary dashboard,
+    approved published queries, and catalogued local datasets (by source).
+    """
+    from ..services.superset import local_analytics_datasets
+
+    project = require_current_project(db, user)
+    primary = db.scalar(select(SupersetProjectDashboard).where(SupersetProjectDashboard.project_id == project.id))
+    try:
+        default_dataset = resolve_superset_dataset(db, project)
+        default_relation = f"{default_dataset['schema_name']}.{default_dataset['table_name']}"
+    except ValueError:
+        default_relation = None
+    published = db.execute(
+        select(SupersetQueryDashboard, Artifact)
+        .join(Artifact, Artifact.id == SupersetQueryDashboard.artifact_id)
+        .where(SupersetQueryDashboard.project_id == project.id)
+        .order_by(SupersetQueryDashboard.updated_at.desc())
+    ).all()
+    datasets = local_analytics_datasets(db, project)
+    return {
+        "scope": "project",
+        "project": {"id": project.id, "name": project.name},
+        "superset": superset_availability(),
+        "primary": {
+            "key": "project",
+            "title": (primary.dashboard_title if primary and primary.dashboard_title else f"{project.name} analytics"),
+            "dataset_relation": default_relation,
+            "chart_count": len(primary.chart_ids or []) if primary else None,
+            "updated_at": primary.updated_at.isoformat() if primary and primary.updated_at else None,
+            "available": default_relation is not None,
+        },
+        "published": [
+            {
+                "key": f"query:{artifact.id}",
+                "artifact_id": artifact.id,
+                "title": artifact.name,
+                "artifact_type": artifact.artifact_type,
+                "artifact_version": state.artifact_version,
+                "columns": [str(column.get("name")) for column in state.columns or []],
+                "chart_count": len(state.chart_ids or []),
+                "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+            }
+            for state, artifact in published
+        ],
+        "datasets": [
+            {
+                "key": f"dataset:{asset.id}",
+                "asset_id": asset.id,
+                "relation": f"{asset.schema_name}.{asset.table_name}",
+                "source": asset.source_name,
+                "asset_type": asset.asset_type,
+                "row_count": asset.row_count,
+                "column_count": len(asset.columns or []),
+                "sensitivity": asset.sensitivity,
+                "is_default": f"{asset.schema_name}.{asset.table_name}" == default_relation,
+                "restricted": asset.sensitivity == "restricted" and user.role != "admin",
+            }
+            for asset in sorted(datasets, key=lambda item: (item.source_name, item.schema_name, item.table_name))
+        ],
+    }
+
+
+@router.post("/analytics/datasets/{asset_id}/guest-token")
+def analytics_dataset_guest_token(asset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Embed a dashboard built directly on one catalogued local dataset of the current project.
+
+    Same trust model as the project dashboard (which is also built from a
+    catalogued dataset without approval): project membership, local data only,
+    no DataPilot metadata tables, restricted datasets for admins only, and
+    PII-named columns left out of the charts.
+    """
+    from ..services.superset import dataset_dashboard_payload, local_analytics_datasets
+
+    project = require_current_project(db, user)
+    asset = next((item for item in local_analytics_datasets(db, project) if item.id == asset_id), None)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Dataset is not a local, queryable dataset of this project")
+    if asset.sensitivity == "restricted" and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Restricted datasets can only be charted by an admin")
+    availability = superset_availability()
+    if not availability["available"]:
+        raise HTTPException(status_code=503, detail=f"Superset is unavailable: {availability['reason']}")
+    dataset = dataset_dashboard_payload(asset, project)
+    if not dataset["columns"]:
+        raise HTTPException(status_code=422, detail="Dataset has no chartable columns")
+    dashboard_key = f"asset-{asset.id}"
+    try:
+        config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
+        token = create_guest_token(project.name, project.slug, dataset, user.id, user.email, user.name, dashboard_key)
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=503, detail=f"Embedded analytics is unavailable: {exc}") from exc
+    audit(db, user, "analytics.dataset_dashboard_opened", "data_asset", asset.id, {"dashboard_id": config.get("dashboard_id")})
+    db.commit()
+    return {
+        "token": token["token"],
+        "embedded_id": config["embedded_id"],
+        "superset_domain": config["superset_domain"],
+        "dashboard_title": config.get("dashboard_title"),
+        "dataset_relation": config.get("dataset_relation"),
+        "chart_count": config.get("chart_count"),
+        "access_mode": config.get("access_mode"),
+    }
+
+
+class MessagePublishRequest(BaseModel):
+    message_id: str = Field(min_length=1, max_length=36)
+    name: str | None = Field(default=None, max_length=160)
+
+
+def _pending_publication(db: Session, project_id: str, artifact_id: str) -> Approval | None:
+    for approval in db.scalars(
+        select(Approval).where(Approval.project_id == project_id, Approval.action_type == "publish_superset_query", Approval.status == "pending")
+    ).all():
+        if str((approval.evidence or {}).get("artifact_id")) == artifact_id:
+            return approval
+    return None
+
+
+@router.post("/analytics/publish-message", status_code=202)
+def publish_answer_to_superset(
+    payload: MessagePublishRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """One click from a chat answer to Superset.
+
+    Saves the answer's SQL as an immutable SQL artifact version (the same
+    governed object SQL workspace users save by hand) and requests
+    publication, which still goes through the ``publish_superset_query``
+    approval. Idempotent per answer: a second click reports the pending
+    approval or the published dashboard instead of creating duplicates.
+    """
+    require_workspace_editor(user, db)
+    project = require_current_project(db, user)
+    message = db.get(ConversationMessage, payload.message_id)
+    conversation = db.get(Conversation, message.conversation_id) if message is not None else None
+    if message is None or conversation is None or conversation.project_id != project.id or message.role != "assistant":
+        raise HTTPException(status_code=404, detail="Answer not found in this project")
+    structured = dict(message.structured or {})
+    sql = str(structured.get("sql") or "").strip()
+    source = structured.get("source") or {}
+    if not sql or (structured.get("execution") or {}).get("error"):
+        raise HTTPException(status_code=422, detail="This answer has no successfully executed SQL to publish")
+    if structured.get("dialect", "postgres") != "postgres" or (source.get("connector_type") not in (None, "local_files")):
+        raise HTTPException(status_code=422, detail="Only answers from the local workspace can be published to Superset; stage connector data first")
+
+    artifact = db.get(Artifact, structured.get("superset_artifact_id")) if structured.get("superset_artifact_id") else None
+    if artifact is not None and artifact.project_id == project.id:
+        if db.scalar(select(SupersetQueryDashboard).where(SupersetQueryDashboard.project_id == project.id, SupersetQueryDashboard.artifact_id == artifact.id)):
+            return {"status": "published", "artifact_id": artifact.id}
+        pending = _pending_publication(db, project.id, artifact.id)
+        if pending is not None:
+            return {"status": "awaiting_approval", "artifact_id": artifact.id, "approval_id": pending.id, "job_id": pending.job_id}
+    else:
+        name = (payload.name or structured.get("question") or conversation.title or "Analysis result")[:160]
+        artifact = Artifact(project_id=project.id, name=name, artifact_type="sql", created_by=user.id)
+        db.add(artifact)
+        db.flush()
+        db.add(ArtifactVersion(
+            artifact_id=artifact.id, version=1, content=sql,
+            artifact_metadata={"dialect": "postgres", "source": "analysis_answer", "message_id": message.id, "conversation_id": conversation.id},
+            created_by=user.id,
+        ))
+        message.structured = {**structured, "superset_artifact_id": artifact.id}
+        audit(db, user, "artifact.version_saved", "artifact", artifact.id, {"version": 1, "artifact_type": "sql", "from_message": message.id})
+        db.flush()
+    result = request_sql_publication(SupersetPublishRequest(artifact_id=artifact.id, name=payload.name or artifact.name), user, db)
+    return {**result, "artifact_id": artifact.id}

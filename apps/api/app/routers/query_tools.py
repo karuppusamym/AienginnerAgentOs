@@ -116,9 +116,17 @@ from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_meta
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
 
-from .. import main
-from ..main import (
+from ..governance import record_governance_event
+from ..pagination import Page, contains, facet_counts, page_params, paginate_items, paginate_query
+from ..schemas import ExternalClientRotate
+from ..services.query_tools import enforce_external_rate_limit
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,40 +168,61 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_permission, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor, require_permission,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
+
+
+def _external_client_view(client: ExternalClient) -> dict[str, Any]:
+    """external_client_output plus token-lifecycle fields (expiry, last use)."""
+    expires_at = client.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return {
+        **external_client_output(client),
+        "expires_at": expires_at,
+        "last_used_at": client.last_used_at,
+        "expired": bool(expires_at is not None and expires_at <= datetime.now(timezone.utc)),
+    }
+
+
+def _expiry_from_days(days: int | None) -> datetime | None:
+    return datetime.now(timezone.utc) + timedelta(days=days) if days else None
+
+
+def _grant_output(grant: QueryToolGrant) -> dict[str, Any]:
+    return as_dict(grant, ["id", "project_id", "query_tool_id", "external_client_id", "enabled", "daily_quota", "created_at"])
 
 
 @router.get("/query-tools/relation-options")
@@ -283,19 +312,19 @@ def preview_query_tool_wizard(
 def list_external_clients(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     project = require_current_project(db, admin)
     clients = db.scalars(select(ExternalClient).where(ExternalClient.default_project_id == project.id).order_by(ExternalClient.created_at.desc())).all()
-    return [external_client_output(client) for client in clients]
+    return [_external_client_view(client) for client in clients]
 
 @router.post("/external-clients", status_code=201)
 def create_external_client(payload: ExternalClientCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     project = require_current_project(db, admin)
     client_id = f"dp_{secrets.token_hex(8)}"
     secret = secrets.token_urlsafe(32)
-    client = ExternalClient(name=payload.name, client_id=client_id, secret_hash=hash_password(secret), scopes=list(dict.fromkeys(payload.scopes)), default_project_id=project.id, created_by=admin.id)
+    client = ExternalClient(name=payload.name, client_id=client_id, secret_hash=hash_password(secret), scopes=list(dict.fromkeys(payload.scopes)), default_project_id=project.id, created_by=admin.id, expires_at=_expiry_from_days(payload.expires_in_days))
     db.add(client)
     db.flush()
-    audit(db, admin, "external_client.created", "external_client", client.id, {"scopes": client.scopes})
+    audit(db, admin, "external_client.created", "external_client", client.id, {"scopes": client.scopes, "expires_in_days": payload.expires_in_days})
     db.commit()
-    return {**external_client_output(client), "token": f"{client_id}.{secret}"}
+    return {**_external_client_view(client), "token": f"{client_id}.{secret}"}
 
 @router.put("/external-clients/{client_id}")
 def update_external_client(client_id: str, payload: ExternalClientUpdate, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -307,25 +336,68 @@ def update_external_client(client_id: str, payload: ExternalClientUpdate, admin:
     client.scopes = list(dict.fromkeys(payload.scopes))
     audit(db, admin, "external_client.updated", "external_client", client.id, {"active": client.active, "scopes": client.scopes})
     db.commit()
-    return external_client_output(client)
+    return _external_client_view(client)
 
 @router.post("/external-clients/{client_id}/rotate")
-def rotate_external_client(client_id: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+def rotate_external_client(client_id: str, payload: ExternalClientRotate | None = None, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
     project = require_current_project(db, admin)
     client = db.get(ExternalClient, client_id)
     if client is None or client.default_project_id != project.id:
         raise HTTPException(status_code=404, detail="External client not found")
     secret = secrets.token_urlsafe(32)
     client.secret_hash = hash_password(secret)
-    audit(db, admin, "external_client.rotated", "external_client", client.id)
+    expires_in_days = payload.expires_in_days if payload else None
+    if expires_in_days:
+        # Without expires_in_days the current expiry is kept; an expired client
+        # needs a new lifetime to become usable again.
+        client.expires_at = _expiry_from_days(expires_in_days)
+    audit(db, admin, "external_client.rotated", "external_client", client.id, {"expires_in_days": expires_in_days})
     db.commit()
-    return {**external_client_output(client), "token": f"{client.client_id}.{secret}"}
+    return {**_external_client_view(client), "token": f"{client.client_id}.{secret}"}
+
+def _registry_tools(db: Session, project_id: str, q: str, data_source: str, line_of_business: str, status: str) -> list[QueryTool]:
+    """Admin registry filters: text search as in external discovery; source/LOB/status match exactly (grouped views)."""
+    statement = select(QueryTool).where(QueryTool.project_id == project_id)
+    if status:
+        statement = statement.where(QueryTool.status == status)
+    tools = _filter_registry_tools(db.scalars(statement.order_by(QueryTool.updated_at.desc())).all(), q)
+    return [
+        tool for tool in tools
+        if (not data_source or ((tool.data_source or "").strip() or "Unassigned") == data_source)
+        and (not line_of_business or ((tool.line_of_business or "").strip() or "Unassigned") == line_of_business)
+    ]
+
 
 @router.get("/query-tools")
-def list_query_tools(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_query_tools(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    data_source: str = Query(default="", max_length=160),
+    line_of_business: str = Query(default="", max_length=160),
+    status: str = Query(default="", max_length=32),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    tools = db.scalars(select(QueryTool).where(QueryTool.project_id == project.id).order_by(QueryTool.updated_at.desc())).all()
-    return [query_tool_output(tool) for tool in tools]
+    tools = _registry_tools(db, project.id, q, data_source, line_of_business, status)
+    return [query_tool_output(tool) for tool in paginate_items(tools, response, page)]
+
+
+@router.get("/query-tools/facets")
+def query_tool_facets(
+    q: str = Query(default="", max_length=200),
+    status: str = Query(default="", max_length=32),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Tool counts per data source, line of business and status (drives the grouped registry)."""
+    project = require_current_project(db, user)
+    tools = _registry_tools(db, project.id, q, "", "", status)
+    return {
+        "total": len(tools),
+        "data_source": facet_counts(tool.data_source for tool in tools),
+        "line_of_business": facet_counts(tool.line_of_business for tool in tools),
+        "status": facet_counts(tool.status for tool in tools),
+    }
 
 @router.get("/query-tools/summary")
 def query_tool_registry_summary(
@@ -353,6 +425,25 @@ def query_tool_analytics(
     if tool is None or tool.project_id != project.id:
         raise HTTPException(status_code=404, detail="Query tool not found")
     return {"tool": query_tool_output(tool), **query_tool_usage_summary(db, tool)}
+
+class QueryToolDraftRequest(BaseModel):
+    sql: str = Field(default="", max_length=100_000)
+    question: str = Field(default="", max_length=4_000)
+
+
+@router.post("/query-tools/draft")
+def draft_query_tool_metadata(payload: QueryToolDraftRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Draft purpose, description, tags, parameter schema and line of business from SQL or a question. Nothing is saved."""
+    from ..agent_designer import draft_query_tool
+
+    require_permission(user, db, "registry:write", "Registry write permission required")
+    if not payload.sql.strip() and not payload.question.strip():
+        raise HTTPException(status_code=422, detail="Give the SQL template or the question the tool should answer")
+    project = require_current_project(db, user)
+    draft = draft_query_tool(db, user, project.id, payload.sql, payload.question)
+    db.commit()  # keeps the agent_design call log
+    return draft
+
 
 @router.post("/query-tools", status_code=201)
 def create_query_tool(payload: QueryToolCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -413,21 +504,41 @@ def grant_query_tool(tool_id: str, payload: QueryToolGrantCreate, admin: User = 
         raise HTTPException(status_code=404, detail="External client not found")
     grant = db.scalar(select(QueryToolGrant).where(QueryToolGrant.query_tool_id == tool.id, QueryToolGrant.external_client_id == client.id))
     if grant is None:
-        grant = QueryToolGrant(project_id=project.id, query_tool_id=tool.id, external_client_id=client.id, enabled=payload.enabled, created_by=admin.id)
+        grant = QueryToolGrant(project_id=project.id, query_tool_id=tool.id, external_client_id=client.id, enabled=payload.enabled, daily_quota=payload.daily_quota, created_by=admin.id)
         db.add(grant)
     else:
         grant.enabled = payload.enabled
-    audit(db, admin, "query_tool.grant_updated", "query_tool", tool.id, {"external_client_id": client.id, "enabled": grant.enabled})
+        grant.daily_quota = payload.daily_quota
+    audit(db, admin, "query_tool.grant_updated", "query_tool", tool.id, {"external_client_id": client.id, "enabled": grant.enabled, "daily_quota": grant.daily_quota})
     db.commit()
-    return as_dict(grant, ["id", "project_id", "query_tool_id", "external_client_id", "enabled", "created_at"])
+    return _grant_output(grant)
+
+
+@router.get("/query-tools/{tool_id}/grants")
+def list_query_tool_grants(tool_id: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    project = require_current_project(db, admin)
+    tool = db.get(QueryTool, tool_id)
+    if tool is None or tool.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Query tool not found")
+    grants = db.scalars(select(QueryToolGrant).where(QueryToolGrant.query_tool_id == tool.id).order_by(QueryToolGrant.created_at)).all()
+    return [_grant_output(grant) for grant in grants]
 
 @router.post("/query-tools/{tool_id}/test")
 def test_query_tool(tool_id: str, payload: QueryToolInvoke, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     project = require_current_project(db, user)
+    try:
+        # Running a query tool executes SQL against governed data: same bar as SQL generation/execution.
+        main.require_any_permission(user, db, main.QUERY_RUNNERS, "Your role cannot run query tools")
+    except HTTPException:
+        audit(db, user, "query_tool.test_denied", "query_tool", tool_id, {"reason": "missing query-runner permission"})
+        db.commit()
+        record_governance_event("query_tool_test", tool_id, "denied", project_id=project.id, user_id=user.id, feature="query_tool_test")
+        raise
     tool = db.get(QueryTool, tool_id)
     if tool is None or tool.project_id != project.id:
         raise HTTPException(status_code=404, detail="Query tool not found")
     _validate_tool_parameters(tool.parameter_schema, payload.parameters)
+    started = time.perf_counter()
     try:
         if tool.connector_id:
             connector = require_project_resource(db.get(Connector, tool.connector_id), project, "Connector")
@@ -455,7 +566,17 @@ def test_query_tool(tool_id: str, payload: QueryToolInvoke, user: User = Depends
         # class of failure into an informative 422; mirror that here so the
         # Catalog wizard's own "Test" button surfaces an actionable message
         # instead of a dead end.
+        record_governance_event(
+            "query_tool_test", tool.name, "failed", project_id=project.id, user_id=user.id, session_id=tool.id,
+            feature="query_tool_test", query_tool_id=tool.id, error_type=type(exc).__name__,
+            duration_ms=round((time.perf_counter() - started) * 1000),
+        )
         raise HTTPException(status_code=422, detail=f"Query tool test failed: {exc}") from exc
+    record_governance_event(
+        "query_tool_test", tool.name, "succeeded", project_id=project.id, user_id=user.id, session_id=tool.id,
+        feature="query_tool_test", query_tool_id=tool.id, row_count=result["row_count"],
+        duration_ms=round((time.perf_counter() - started) * 1000),
+    )
     audit(db, user, "query_tool.tested", "query_tool", tool.id, {"row_count": result["row_count"]})
     if tool.status == "draft":
         tool.status = "tested"
@@ -474,11 +595,155 @@ def retire_query_tool(tool_id: str, admin: User = Depends(require_admin), db: Se
     db.commit()
     return query_tool_output(tool)
 
+_SECRET_PARAMETER = re.compile(r"password|passwd|secret|token|api[_-]?key|credential|authorization|(^|_)ssn($|_)|card_?number|cvv", re.I)
+_PARAMETER_PREVIEW_CHARS = 200
+
+
+def _redacted_parameters(value: Any, key: str = "") -> Any:
+    """Parameters as shown in history: secret-looking keys masked, long values clipped."""
+    if key and _SECRET_PARAMETER.search(key):
+        return "***"
+    if isinstance(value, dict):
+        return {str(name): _redacted_parameters(item, str(name)) for name, item in list(value.items())[:50]}
+    if isinstance(value, list):
+        return [_redacted_parameters(item) for item in value[:20]] + (["…"] if len(value) > 20 else [])
+    if isinstance(value, str) and len(value) > _PARAMETER_PREVIEW_CHARS:
+        return value[:_PARAMETER_PREVIEW_CHARS] + "…"
+    return value
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    if moment is None:
+        return None
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+
+
+def _invocation_output(item: ExternalInvocation, clients: dict[str, ExternalClient], tools: dict[str, QueryTool]) -> dict[str, Any]:
+    client = clients.get(item.external_client_id)
+    tool = tools.get(item.query_tool_id)
+    metadata = item.result_metadata or {}
+    return {
+        **as_dict(item, ["id", "project_id", "external_client_id", "query_tool_id", "status", "result_metadata", "error", "duration_ms", "created_at"]),
+        "channel": item.channel or "rest",
+        "parameters": _redacted_parameters(item.parameters or {}),
+        "row_count": item.row_count if item.row_count is not None else metadata.get("row_count"),
+        "client_name": client.name if client else "Unknown client",
+        "client_id": client.client_id if client else None,
+        "tool_name": tool.name if tool else "Deleted tool",
+    }
+
+
+def _invocation_lookups(db: Session, items: list[ExternalInvocation]) -> tuple[dict[str, ExternalClient], dict[str, QueryTool]]:
+    client_ids = {item.external_client_id for item in items}
+    tool_ids = {item.query_tool_id for item in items}
+    clients = {client.id: client for client in db.scalars(select(ExternalClient).where(ExternalClient.id.in_(client_ids))).all()} if client_ids else {}
+    tools = {tool.id: tool for tool in db.scalars(select(QueryTool).where(QueryTool.id.in_(tool_ids))).all()} if tool_ids else {}
+    return clients, tools
+
+
 @router.get("/external-invocations")
-def list_external_invocations(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_external_invocations(
+    response: Response,
+    page: Page = Depends(page_params),
+    client_id: str = Query(default="", max_length=36),
+    tool_id: str = Query(default="", max_length=36),
+    tool: str = Query(default="", max_length=160),
+    status: str = Query(default="", max_length=32),
+    channel: str = Query(default="", max_length=16),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    admin: User = Depends(require_admin), db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Gateway call history, newest first. ``client_id``/``tool_id`` are row ids; ``tool`` matches the tool name."""
     project = require_current_project(db, admin)
-    invocations = db.scalars(select(ExternalInvocation).where(ExternalInvocation.project_id == project.id).order_by(ExternalInvocation.created_at.desc()).limit(200)).all()
-    return [as_dict(item, ["id", "project_id", "external_client_id", "query_tool_id", "status", "parameters", "result_metadata", "error", "duration_ms", "created_at"]) for item in invocations]
+    statement = select(ExternalInvocation).where(ExternalInvocation.project_id == project.id)
+    if client_id:
+        statement = statement.where(ExternalInvocation.external_client_id == client_id)
+    if tool_id:
+        statement = statement.where(ExternalInvocation.query_tool_id == tool_id)
+    if tool.strip():
+        named = select(QueryTool.id).where(QueryTool.project_id == project.id, func.lower(QueryTool.name).like(contains(tool), escape="\\"))
+        statement = statement.where(ExternalInvocation.query_tool_id.in_(named))
+    if status:
+        statement = statement.where(ExternalInvocation.status == status)
+    if channel:
+        statement = statement.where(ExternalInvocation.channel == channel)
+    if since is not None:
+        statement = statement.where(ExternalInvocation.created_at >= _aware(since))
+    if until is not None:
+        statement = statement.where(ExternalInvocation.created_at < _aware(until))
+    items = list(paginate_query(db, statement.order_by(ExternalInvocation.created_at.desc()), response, page, default_limit=200))
+    clients, tools = _invocation_lookups(db, items)
+    return [_invocation_output(item, clients, tools) for item in items]
+
+
+def _invocation_window(db: Session, project_id: str, since: datetime, clients: dict[str, ExternalClient], tools: dict[str, QueryTool]) -> dict[str, Any]:
+    rows = db.execute(
+        select(
+            ExternalInvocation.external_client_id, ExternalInvocation.query_tool_id, ExternalInvocation.status, ExternalInvocation.channel,
+            func.count(), func.sum(ExternalInvocation.duration_ms), func.count(ExternalInvocation.duration_ms), func.sum(ExternalInvocation.row_count),
+        )
+        .where(ExternalInvocation.project_id == project_id, ExternalInvocation.created_at >= since)
+        .group_by(ExternalInvocation.external_client_id, ExternalInvocation.query_tool_id, ExternalInvocation.status, ExternalInvocation.channel)
+    ).all()
+    total = sum(row[4] for row in rows)
+    succeeded = sum(row[4] for row in rows if row[2] == "succeeded")
+    failed = sum(row[4] for row in rows if row[2] == "failed")
+    timed = sum(row[6] or 0 for row in rows)
+
+    def breakdown(index: int, label: Any) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            bucket = buckets.setdefault(row[index] or "", {"id": row[index], "name": label(row[index]), "count": 0, "failed": 0})
+            bucket["count"] += row[4]
+            bucket["failed"] += row[4] if row[2] == "failed" else 0
+        return sorted(buckets.values(), key=lambda item: (-item["count"], str(item["name"]).lower()))
+
+    return {
+        "since": since,
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "success_rate": round(100 * succeeded / total, 2) if total else None,
+        "avg_latency_ms": round(sum(row[5] or 0 for row in rows) / timed, 1) if timed else None,
+        "rows_returned": int(sum(row[7] or 0 for row in rows if row[2] == "succeeded")),
+        "by_client": breakdown(0, lambda key: clients[key].name if key in clients else "Unknown client"),
+        "by_tool": breakdown(1, lambda key: tools[key].name if key in tools else "Deleted tool"),
+        "by_status": breakdown(2, lambda key: key or "unknown"),
+        "by_channel": breakdown(3, lambda key: key or "rest"),
+    }
+
+
+@router.get("/external-invocations/summary")
+def external_invocation_summary(admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Counts by client / tool / status / channel for the last 24 hours and 7 days."""
+    project = require_current_project(db, admin)
+    now = datetime.now(timezone.utc)
+    clients = {client.id: client for client in db.scalars(select(ExternalClient).where(ExternalClient.default_project_id == project.id)).all()}
+    tools = {tool.id: tool for tool in db.scalars(select(QueryTool).where(QueryTool.project_id == project.id)).all()}
+    return {
+        "generated_at": now,
+        "windows": {
+            "24h": _invocation_window(db, project.id, now - timedelta(hours=24), clients, tools),
+            "7d": _invocation_window(db, project.id, now - timedelta(days=7), clients, tools),
+        },
+    }
+
+
+@router.get("/external-invocations/{invocation_id}")
+def get_external_invocation(invocation_id: str, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = require_current_project(db, admin)
+    item = db.get(ExternalInvocation, invocation_id)
+    if item is None or item.project_id != project.id:
+        raise HTTPException(status_code=404, detail="Invocation not found")
+    clients, tools = _invocation_lookups(db, [item])
+    tool = tools.get(item.query_tool_id)
+    client = clients.get(item.external_client_id)
+    return {
+        **_invocation_output(item, clients, tools),
+        "tool": {**_registry_metadata(tool), "id": tool.id, "name": tool.name, "status": tool.status, "row_limit": tool.row_limit} if tool else None,
+        "client": {"id": client.id, "name": client.name, "client_id": client.client_id, "active": client.active, "scopes": client.scopes} if client else None,
+    }
 
 @router.get("/external/v1/query-tools")
 def search_external_query_tools(
@@ -491,10 +756,13 @@ def search_external_query_tools(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     client = _external_client_from_header(authorization, db, "tools:list")
+    enforce_external_rate_limit(db, client, "list")
     tools = _filter_registry_tools(
         _granted_query_tools(db, client), q, data_source, line_of_business, tag
     )[:limit]
-    return {"tools": [_external_query_tool_output(tool) for tool in tools], "count": len(tools)}
+    output = {"tools": [_external_query_tool_output(tool) for tool in tools], "count": len(tools)}
+    db.commit()  # persists last_used_at
+    return output
 
 @router.get("/external/v1/query-tools/{tool_name}")
 def get_external_query_tool(
@@ -503,10 +771,13 @@ def get_external_query_tool(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     client = _external_client_from_header(authorization, db, "tools:list")
+    enforce_external_rate_limit(db, client, "get", tool_name)
     tool = next((item for item in _granted_query_tools(db, client) if item.name == tool_name), None)
     if tool is None:
         raise HTTPException(status_code=404, detail="Published query tool not found")
-    return _external_query_tool_output(tool)
+    output = _external_query_tool_output(tool)
+    db.commit()  # persists last_used_at
+    return output
 
 @router.post("/external/v1/query-tools/{tool_name}/invoke")
 def invoke_external_query_tool(tool_name: str, payload: QueryToolInvoke, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -538,14 +809,39 @@ def external_openapi(authorization: str | None = Header(default=None), db: Sessi
 def mcp_metadata() -> dict[str, Any]:
     return {"name": "DataPilot governed query tools", "protocolVersion": "2025-03-26", "transport": {"type": "streamable-http", "url": "/mcp"}, "authentication": {"type": "bearer"}}
 
-@router.post("/mcp")
-def mcp_endpoint(payload: MCPRequest, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict[str, Any]:
+MCP_PROTOCOL_VERSION = "2025-03-26"
+
+
+def _mcp_error(request_id: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _mcp_dispatch(message: Any, authorization: str | None, db: Session) -> dict[str, Any] | None:
+    """Handle one JSON-RPC message; None for a notification (no response is sent)."""
+    if not isinstance(message, dict):
+        return _mcp_error(None, -32600, "Invalid Request")
+    is_notification = "id" not in message
     try:
-        if payload.method == "initialize":
+        payload = MCPRequest.model_validate(message)
+    except Exception:
+        raw_id = message.get("id")
+        return None if is_notification else _mcp_error(raw_id if isinstance(raw_id, (str, int)) else None, -32600, "Invalid Request")
+    if is_notification:
+        # notifications/initialized, notifications/cancelled, ...: acknowledged, never answered.
+        return None
+    try:
+        if payload.method == "ping":
+            result: dict[str, Any] = {}
+        elif payload.method == "initialize":
             _external_client_from_header(authorization, db, "tools:list")
-            result: dict[str, Any] = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "DataPilot", "version": "1.0.0"}}
+            db.commit()  # persists last_used_at
+            result = {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "DataPilot", "version": "1.0.0"}}
         elif payload.method == "tools/list":
             client = _external_client_from_header(authorization, db, "tools:list")
+            enforce_external_rate_limit(db, client, "list")
             tools = _filter_registry_tools(
                 _granted_query_tools(db, client),
                 str(payload.params.get("q") or payload.params.get("query") or ""),
@@ -562,18 +858,49 @@ def mcp_endpoint(payload: MCPRequest, authorization: str | None = Header(default
                 "annotations": {"readOnlyHint": True, "destructiveHint": False},
                 "_meta": {"com.datapilot.registry": _registry_metadata(tool)},
             } for tool in tools]}
+            db.commit()  # persists last_used_at
         elif payload.method == "tools/call":
             client = _external_client_from_header(authorization, db, "tools:invoke")
             name = str(payload.params.get("name", ""))
             tool = db.scalar(select(QueryTool).where(QueryTool.project_id == client.default_project_id, QueryTool.name == name))
             if tool is None:
                 raise HTTPException(status_code=404, detail="Published query tool not found")
-            invoked = _invoke_external_query_tool(db, client, tool, payload.params.get("arguments", {}))
+            arguments = payload.params.get("arguments", {})
+            if not isinstance(arguments, dict):
+                return _mcp_error(payload.id, -32602, "Invalid params: arguments must be an object")
+            invoked = _invoke_external_query_tool(db, client, tool, arguments, channel="mcp")
             result = {"content": [{"type": "text", "text": json.dumps(invoked, default=str)}], "structuredContent": invoked, "isError": False}
-        elif payload.method == "notifications/initialized":
-            return {"jsonrpc": "2.0", "result": {}}
         else:
-            return {"jsonrpc": "2.0", "id": payload.id, "error": {"code": -32601, "message": "Method not found"}}
+            return _mcp_error(payload.id, -32601, "Method not found")
         return {"jsonrpc": "2.0", "id": payload.id, "result": result}
     except HTTPException as exc:
-        return {"jsonrpc": "2.0", "id": payload.id, "error": {"code": -32000, "message": str(exc.detail), "data": {"http_status": exc.status_code}}}
+        db.rollback()
+        return _mcp_error(payload.id, -32000, str(exc.detail), {"http_status": exc.status_code})
+
+
+def _mcp_handle(body: Any, authorization: str | None, db: Session) -> Response:
+    if isinstance(body, list):
+        if not body:
+            return JSONResponse(_mcp_error(None, -32600, "Invalid Request: empty batch"))
+        responses = [response for response in (_mcp_dispatch(message, authorization, db) for message in body) if response is not None]
+        return JSONResponse(jsonable_encoder(responses)) if responses else Response(status_code=202)
+    response = _mcp_dispatch(body, authorization, db)
+    return JSONResponse(jsonable_encoder(response)) if response is not None else Response(status_code=202)
+
+
+@router.post("/mcp")
+async def mcp_endpoint(request: Request, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> Response:
+    """Streamable-HTTP MCP endpoint (POST): single messages, batches and notifications.
+
+    - A request gets its JSON-RPC response; ``ping`` answers an empty result.
+    - A notification (no ``id``) or a batch made only of notifications gets
+      HTTP 202 with no body, as the transport requires.
+    - A batch gets an array holding one response per request, in order.
+    - Unknown methods answer JSON-RPC error -32601; unparsable JSON -32700.
+    """
+    try:
+        body = json.loads(await request.body() or b"null")
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(_mcp_error(None, -32700, "Parse error"))
+    # Database work is synchronous: keep it off the event loop.
+    return await run_in_threadpool(_mcp_handle, body, authorization, db)

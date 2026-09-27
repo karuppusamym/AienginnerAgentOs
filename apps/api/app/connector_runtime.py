@@ -14,6 +14,7 @@ import httpx
 
 from .database import engine
 from .staging import execute_parameterized_read_only
+from .sql_guard import is_read_only
 from .models import Connector
 from .governance import record_governance_event
 from .pii import annotate_columns, protect_rows
@@ -38,8 +39,15 @@ class MetadataDiscovery:
 
 
 def resolve_credentials(secret_reference: str | None) -> dict[str, Any]:
+    from .model_runtime import secret_name_allowed
+
+    if secret_reference and secret_reference.startswith("env:") and not secret_name_allowed(secret_reference[4:]):
+        raise ConnectorRuntimeError("That environment variable is reserved for platform secrets and cannot be used as a connector credential")
     if not secret_reference or not secret_reference.startswith("env:"):
-        raise ConnectorRuntimeError("An env: secret reference is required")
+        raise ConnectorRuntimeError(
+            "This connector has no credentials configured. Add an env:VARIABLE_NAME secret reference "
+            "in Admin > Connectors to run live previews; the SQL was still generated and validated."
+        )
     variable = secret_reference[4:].strip()
     raw = os.getenv(variable, "")
     if not variable or not raw:
@@ -199,7 +207,8 @@ def list_mcp_tools(connector: Connector, timeout_seconds: int = 15) -> list[dict
     return [item for item in tools if isinstance(item, dict)]
 
 
-def _mcp_schema_columns(schema: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _mcp_schema_columns(schema: dict[str, Any] | None, role: str = "output") -> list[dict[str, Any]]:
+    """Schema properties as catalog columns. ``role`` says whether they are result columns or tool parameters."""
     if not isinstance(schema, dict):
         return []
     properties = schema.get("properties")
@@ -209,14 +218,32 @@ def _mcp_schema_columns(schema: dict[str, Any] | None) -> list[dict[str, Any]]:
     columns: list[dict[str, Any]] = []
     for name, prop in properties.items():
         prop_type = prop.get("type") if isinstance(prop, dict) else None
-        columns.append(
-            {
-                "name": str(name),
-                "type": str(prop_type or "object"),
-                "nullable": str(name) not in required,
-            }
-        )
+        column = {
+            "name": str(name),
+            "type": str(prop_type or "object"),
+            "nullable": str(name) not in required,
+            "role": role,
+        }
+        described = str(prop.get("description") or "").strip() if isinstance(prop, dict) else ""
+        if role == "parameter":
+            column["description"] = f"Input parameter ({'required' if str(name) in required else 'optional'})" + (f": {described}" if described else "")
+        elif described:
+            column["description"] = described
+        columns.append(column)
     return columns
+
+
+def _mcp_description(tool: dict[str, Any], parameters: list[dict[str, Any]], has_output_schema: bool) -> str | None:
+    """The server's own tool description plus what the catalog can and cannot know about its shape."""
+    description = str(tool.get("description") or "").strip()
+    parts = [description] if description else []
+    if parameters:
+        parts.append("Parameters: " + ", ".join(f"{item['name']} ({item['type']}{'' if item['nullable'] else ', required'})" for item in parameters) + ".")
+    else:
+        parts.append("Takes no parameters.")
+    if not has_output_schema:
+        parts.append("The MCP server does not publish output columns; they are known only when the tool runs.")
+    return " ".join(parts)
 
 
 def discover_mcp_metadata(connector: Connector, timeout_seconds: int = 20) -> MetadataDiscovery:
@@ -240,9 +267,16 @@ def discover_mcp_metadata(connector: Connector, timeout_seconds: int = 20) -> Me
             continue
         output_schema = tool.get("outputSchema") if isinstance(tool.get("outputSchema"), dict) else None
         input_schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else None
-        columns = _mcp_schema_columns(output_schema) or _mcp_schema_columns(input_schema)
-        tags = ["mcp-tool"]
-        tags.append("has-output-schema" if output_schema else "input-schema-only")
+        output_columns = _mcp_schema_columns(output_schema)
+        parameters = _mcp_schema_columns(input_schema, role="parameter")
+        # Without an output schema the parameters are the only structure the server declares.
+        columns = output_columns or parameters
+        tags = ["mcp-tool", "has-output-schema" if output_columns else "no-output-schema"]
+        if parameters:
+            tags.append("parameterized")
+        annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
+        if annotations.get("readOnlyHint") is True:
+            tags.append("read-only-hint")
         tags.extend(_classify_columns(columns))
         assets.append(
             {
@@ -251,7 +285,9 @@ def discover_mcp_metadata(connector: Connector, timeout_seconds: int = 20) -> Me
                 "columns": columns,
                 "tags": tags,
                 "row_count": None,
-                "description_hint": str(tool.get("description") or "").strip() or None,
+                "description_hint": _mcp_description(tool, parameters, bool(output_columns)),
+                # Earlier scans stored the bare tool description; it may be replaced by the richer hint.
+                "source_description": str(tool.get("description") or "").strip() or None,
             }
         )
     return MetadataDiscovery(
@@ -274,11 +310,30 @@ def _normalize_mcp_result(result: dict[str, Any], limit: int, started: float) ->
             for item in result.get("content", [])
             if isinstance(item, dict) and item.get("type") == "text"
         ]
-        text_value = "\n".join(part for part in text_parts if part)
-        try:
-            value = json.loads(text_value) if text_value else []
-        except json.JSONDecodeError:
-            value = {"result": text_value}
+        # MCP Toolbox commonly returns one JSON object per text content item
+        # rather than one JSON array. Joining those objects with newlines
+        # turns a perfectly good result set into one opaque string row, which
+        # prevents external agents and the UI from rendering database results
+        # as a table. Parse each content item independently first, while still
+        # supporting a single JSON array/object and plain text responses.
+        non_empty_parts = [part for part in text_parts if part]
+        parsed_parts: list[Any] = []
+        for part in non_empty_parts:
+            try:
+                parsed_parts.append(json.loads(part))
+            except json.JSONDecodeError:
+                parsed_parts = []
+                break
+        if len(parsed_parts) > 1:
+            value = parsed_parts
+        elif len(parsed_parts) == 1:
+            value = parsed_parts[0]
+        else:
+            text_value = "\n".join(non_empty_parts)
+            try:
+                value = json.loads(text_value) if text_value else []
+            except json.JSONDecodeError:
+                value = {"result": text_value}
     if isinstance(value, dict) and isinstance(value.get("rows"), list):
         rows = value["rows"]
         columns = value.get("columns") or (
@@ -337,7 +392,17 @@ def _required(credentials: dict[str, Any], key: str, alternative: str | None = N
     return str(value)
 
 
-def _group_columns(rows: list[tuple[Any, ...]]) -> MetadataDiscovery:
+def _view_definitions(cursor: Any, sql: str) -> dict[tuple[str, str], str]:
+    """(schema, view) -> definition. Best-effort: a role that can't read view
+    definitions still gets a normal table/column scan."""
+    try:
+        cursor.execute(sql)
+        return {(str(schema), str(name)): str(definition or "") for schema, name, definition in cursor.fetchall()}
+    except Exception:
+        return {}
+
+
+def _group_columns(rows: list[tuple[Any, ...]], views: dict[tuple[str, str], str] | None = None) -> MetadataDiscovery:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for schema_name, table_name, column_name, data_type, nullable, *_ in rows:
         grouped[(str(schema_name), str(table_name))].append(
@@ -353,17 +418,18 @@ def _group_columns(rows: list[tuple[Any, ...]]) -> MetadataDiscovery:
             "table_name": table,
             "columns": annotate_columns(columns),
             "tags": _classify_columns(columns),
+            **({"asset_type": "view", "view_definition": views[(schema, table)]} if views and (schema, table) in views else {}),
         }
         for (schema, table), columns in grouped.items()
     ]
-    return MetadataDiscovery(
-        assets=assets,
-        summary={
-            "schemas": len({asset["schema_name"] for asset in assets}),
-            "tables": len(assets),
-            "columns": sum(len(asset["columns"]) for asset in assets),
-        },
-    )
+    summary = {
+        "schemas": len({asset["schema_name"] for asset in assets}),
+        "tables": len(assets),
+        "columns": sum(len(asset["columns"]) for asset in assets),
+    }
+    if views is not None:
+        summary["views"] = sum(1 for asset in assets if asset.get("asset_type") == "view")
+    return MetadataDiscovery(assets=assets, summary=summary)
 
 
 def _classify_columns(columns: list[dict[str, Any]]) -> list[str]:
@@ -411,7 +477,18 @@ def _sql_server(connector: Connector, credentials: dict[str, Any], scan: bool) -
                 ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
                 """
             )
-            return _group_columns(list(cursor.fetchall()))
+            rows = list(cursor.fetchall())
+            views = _view_definitions(
+                cursor,
+                """
+                SELECT TOP 1000 s.name, v.name, m.definition
+                FROM sys.views v
+                JOIN sys.schemas s ON s.schema_id = v.schema_id
+                LEFT JOIN sys.sql_modules m ON m.object_id = v.object_id
+                WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA')
+                """,
+            )
+            return _group_columns(rows, views)
     finally:
         connection.close()
 
@@ -447,7 +524,19 @@ def _postgres(connector: Connector, credentials: dict[str, Any], scan: bool) -> 
                 LIMIT 5000
                 """
             )
-            return _group_columns(list(cursor.fetchall()))
+            rows = list(cursor.fetchall())
+            # pg_views, not information_schema.views: the latter hides the
+            # definition of views the scanning role doesn't own.
+            views = _view_definitions(
+                cursor,
+                """
+                SELECT schemaname, viewname, definition
+                FROM pg_catalog.pg_views
+                WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                LIMIT 1000
+                """,
+            )
+            return _group_columns(rows, views)
     finally:
         connection.close()
 
@@ -591,6 +680,8 @@ def _validate_read_only_query(sql: str) -> str:
         raise ConnectorRuntimeError("Exactly one read-only SELECT statement is required")
     if FORBIDDEN_SQL.search(normalized):
         raise ConnectorRuntimeError("The query contains a prohibited operation")
+    if not is_read_only(normalized):
+        raise ConnectorRuntimeError("The query is not a single read-only SELECT in any supported dialect")
     return normalized
 
 
@@ -688,15 +779,19 @@ def execute_connector_query(
                     database=_required({"database": connector.database}, "database"),
                     login_timeout=10,
                     timeout=timeout_seconds,
-                    autocommit=True,
+                    autocommit=False,
                 )
                 try:
                     with connection.cursor() as cursor:
+                        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                         cursor.execute(statement, tuple(values))
                         columns = [str(item[0]) for item in cursor.description]
                         rows = list(cursor.fetchmany(limit + 1))
                 finally:
-                    connection.close()
+                    try:
+                        connection.rollback()
+                    finally:
+                        connection.close()
             elif connector.connector_type == "postgres":
                 import psycopg
 

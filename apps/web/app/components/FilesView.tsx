@@ -1,113 +1,34 @@
 import {
-  Activity,
-  AlertCircle,
-  Archive,
-  Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
-  ChevronDown,
   ChevronRight,
   CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
   Database,
   FileSpreadsheet,
   FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
   Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, SessionUser } from "../lib/api";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
-  SecurityCategoryKey,
-  SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
-  Job,
-  Approval,
   IngestedFile,
   MappingColumn,
   LoadMode,
   IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { scopes, useDebouncedValue, useInvalidate, usePagedQuery, usePagination, useQueryErrorToast } from "../lib/queries";
+import { StatusPill, EmptyState, LoadingBlock, Pagination } from "./shared";
+
+const NO_FILES: IngestedFile[] = [];
 
 
 export function FilesView({ notify, currentUser }: { notify: (message: string, tone?: "ok" | "error") => void; currentUser: SessionUser }) {
-  const [files, setFiles] = useState<IngestedFile[]>([]);
+  const [search, setSearch] = useState("");
+  const q = useDebouncedValue(search.trim());
+  const pagination = usePagination(q, 25);
+  const filesQuery = usePagedQuery<IngestedFile>(scopes.files, "/files", { q }, pagination, { staleTime: 0 });
+  useQueryErrorToast(filesQuery.error, notify, "Files could not be loaded");
+  const files = filesQuery.data?.items ?? NO_FILES;
+  const invalidate = useInvalidate();
   const [selected, setSelected] = useState<IngestedFile | null>(null);
   const [uploading, setUploading] = useState(false);
   const [staging, setStaging] = useState(false);
@@ -116,8 +37,7 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
   const [loadMode, setLoadMode] = useState<LoadMode>("versioned");
   const [keyColumn, setKeyColumn] = useState("");
   
-  const load = useCallback(() => api<IngestedFile[]>("/files").then((fileData) => setFiles(fileData)), []);
-  useEffect(() => { load(); }, [load]);
+  const load = useCallback(() => invalidate(scopes.files), [invalidate]);
   useEffect(() => {
     if (!selected || selected.profile.kind !== "structured") {
       setMappingColumns([]);
@@ -203,9 +123,9 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
 
       <div className="two-column file-columns">
         <section className="surface">
-          <div className="section-heading compact"><div><span className="eyebrow">INGESTED FILES</span><h3>Recent uploads</h3></div></div>
+          <div className="section-heading compact"><div><span className="eyebrow">INGESTED FILES</span><h3>Recent uploads</h3></div><div className="toolbar-search"><Search size={14} /><input placeholder="Search files..." value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Search files" /></div></div>
           {files.length === 0 ? (
-            <EmptyState icon={<FileSpreadsheet size={24} />} title="No local files yet" body="Upload CSV, Excel, Parquet, JSON, or PDF to create a profile." />
+            filesQuery.isPending ? <LoadingBlock label="Loading files" /> : q ? <EmptyState icon={<Search size={24} />} title="No matching files" body="Try a different file name." /> : <EmptyState icon={<FileSpreadsheet size={24} />} title="No local files yet" body="Upload CSV, Excel, Parquet, JSON, or PDF to create a profile." />
           ) : (
             <div className="file-list">
               {files.map((file) => (
@@ -218,6 +138,7 @@ export function FilesView({ notify, currentUser }: { notify: (message: string, t
               ))}
             </div>
           )}
+          <Pagination state={pagination} total={filesQuery.data?.total ?? 0} count={files.length} busy={filesQuery.isFetching} label="files" />
         </section>
         <section className="surface profile-panel">
           {selected ? (

@@ -15,7 +15,9 @@ export type NavKey =
   | "agents"
   | "semantic"
   | "evaluations"
-  | "admin";
+  | "learning"
+  | "admin"
+  | "architecture";
 
 export type Overview = {
   counts: { data_assets: number; connectors: number; jobs: number; pending_approvals: number };
@@ -80,7 +82,9 @@ export type Dataset = {
   freshness_sla_hours?: number | null;
   metadata_status?: string;
   connector_id?: string | null;
-  source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string };
+  source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string; connection_mode?: "direct" | "mcp" };
+  /** False for a profiled-only file: catalogued, but there is no table to query until it is staged. */
+  queryable?: boolean;
 };
 
 export type Connector = {
@@ -110,6 +114,7 @@ export type ModelProvider = {
   enabled: boolean;
   is_default: boolean;
   status: string;
+  capability?: ProviderCapability;
 };
 
 export type Project = {
@@ -134,13 +139,16 @@ export type SemanticJoinPolicy = { id: string; project_id: string; left_asset_id
 export type PipelineDefinition = { id: string; name: string; objective: string; status: string; current_version: number; generated_code: string; definition: { sources?: { asset_id: string; relation: string }[]; target?: { relation: string }; nodes?: { id: string; type: string; label: string }[]; edges?: { source: string; target: string }[]; checks?: string[] }; updated_at: string };
 export type Incident = { id: string; job_id: string; title: string; severity: string; status: string; root_cause: string; evidence: Record<string, unknown>[]; remediation: string[]; retry_job_id?: string; created_at: string };
 
+// status: "pending" | "complete" | "skipped" | "planned" (older runs may carry other values).
+export type JobPlanStep = { agent: string; action: string; status: string; skip_reason?: string; step_index?: number; origin?: string };
+
 export type Job = {
   id: string;
   title: string;
   job_type: string;
   status: string;
   progress: number;
-  plan: { agent: string; action: string; status: string }[];
+  plan: JobPlanStep[];
   evidence: { type: string; label: string }[];
   logs: { at: string; level: string; message: string }[];
   outputs: { type: string; agent?: string; tool?: string; title?: string; summary?: string; data?: unknown; at?: string }[];
@@ -154,7 +162,35 @@ export type Approval = {
   action_type: string;
   risk_level: string;
   status: string;
-  evidence: { summary?: string; checks?: string[]; objective?: string; guardrails?: string[] };
+  evidence: {
+    summary?: string;
+    checks?: string[];
+    objective?: string;
+    guardrails?: string[];
+    // Agent-run approvals freeze the plan they authorise.
+    plan?: { agent: string; action: string }[];
+    plan_hash?: string;
+    plan_bound?: boolean;
+    hold?: "objective" | "plan" | string;
+    autonomy_level?: number;
+    planner?: string;
+    plan_binding_note?: string;
+    // action_type "prompt_activation": a GEPA-optimised prompt waiting to go live.
+    prompt_name?: string;
+    version?: number;
+    instructions?: string;
+    baseline_score?: number | null;
+    best_score?: number | null;
+    optimization_id?: string;
+    // action_type "create_index": DDL that runs only after approval.
+    relation?: string;
+    columns?: string[];
+    statement?: string;
+    occurrences?: number;
+    // Agent-run approvals: why the run was held ("jev:consequential" = escalated by the decision model).
+    risk_triggers?: string[];
+    jev?: { consequential?: number | null; model?: string } | null;
+  };
   created_at: string;
 };
 
@@ -259,6 +295,8 @@ export type SQLExecutionResult = {
   truncated: boolean;
   limit: number;
   error?: string;
+  duration_ms?: number;
+  protected_columns?: string[];
 };
 
 export type SearchResult = {
@@ -330,7 +368,9 @@ export type ConversationMessage = {
   structured: {
     sql?: string;
     dialect?: string;
-    provider?: { name: string; model: string };
+    /** SQL artifact created by "Publish to Superset" from this answer (one click: save + approval request). */
+    superset_artifact_id?: string;
+    provider?: { name: string; model: string; mode?: string; latency_ms?: number };
     cache?: { hit: boolean; cache_key?: string; normalized_question?: string; hit_count?: number };
     grounding?: {
       catalog_matches?: { relation: string; match_type: string; score: number }[];
@@ -340,12 +380,69 @@ export type ConversationMessage = {
     validation?: { status: string; checks: string[] };
     sources?: { asset?: string; term?: string }[];
     execution?: SQLExecutionResult;
-    chart?: { type: "bar" | "line" | "table"; title: string; x?: string; y?: string; data: Record<string, string | number>[] };
+    chart?: ChartSpec;
     source?: { id?: string | null; name: string; database: string; connector_type: string; dialect: string };
     memory?: { prior_messages_used: number; persisted: boolean; summary?: string | null };
+    question?: string;
+    route?: RouteDecision;
+    follow_ups?: string[];
+    learning?: AnswerLearning;
+    ensemble?: AnswerEnsemble;
+    /** Automatic answer reviewer (Reviewer agent): deterministic checks + the answer_review model. */
+    review?: AnswerReview;
   };
+  // Client-only: an optimistic user turn whose request failed.
+  failed?: boolean;
+  // Client-only: the user pressed Stop before the answer arrived.
+  stopped?: boolean;
 };
-export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; token?: string };
+export type ChartType = "kpi" | "line" | "bar" | "grouped_bar" | "stacked_bar" | "pie" | "scatter" | "table";
+export type ChartUnit = "percent" | "fraction" | "currency" | "count" | "number";
+/**
+ * Chart chosen by the API for a result set. Older answers only carry
+ * {type: "bar" | "line" | "table", title, x, y, data}; every other field is optional.
+ */
+export type ChartSpec = {
+  type: ChartType | string;
+  title: string;
+  x?: string | null;
+  y?: string | null;
+  measures?: string[];
+  series?: string | null;
+  data: Record<string, string | number | null>[];
+  alternatives?: (ChartType | string)[];
+  reason?: string;
+  units?: Record<string, ChartUnit | string>;
+};
+/** One filter on the drill path of a result chart (`column = value`, value as displayed). */
+export type ChartDrillFilter = { column: string; value: string };
+/**
+ * Emitted by AnalysisChart's `onDrill` when the clicked mark cannot be drilled
+ * client-side (the result has no finer dimension or time grain): `question` is a
+ * ready-to-ask natural-language follow-up; `filters` is the whole drill path
+ * including the clicked `column = value`.
+ */
+export type ChartDrillRequest = { column: string; value: string; question: string; measure: string | null; filters: ChartDrillFilter[] };
+/** Jev decision-model output attached to a routing decision. */
+export type JevDecision = { model?: string; probabilities?: Record<string, number>; consequential?: number | null; latency_ms?: number | null; cost_usd?: number | null };
+export type RouteKind = "sql_analysis" | "query_tool" | "agent_run" | "clarify";
+export type RouteTarget = { id: string; name: string; description?: string; required_parameters?: string[]; requires_approval?: boolean } | null;
+export type RouteCandidate = { route: RouteKind; target?: RouteTarget; score: number; local_score?: number; reasons: string[] };
+export type RouteDecision = {
+  route: RouteKind;
+  label: string;
+  target?: RouteTarget;
+  confidence: number;
+  candidates: RouteCandidate[];
+  suggested_actions: (RouteCandidate & { label: string })[];
+  risk: { level: "low" | "medium" | "high"; requires_approval: boolean; triggers: string[]; escalated_by?: string };
+  backend: string;
+  policy_version: string;
+  latency_ms: number;
+  jev?: JevDecision | null;
+};
+export type ExternalClient = { id: string; name: string; client_id: string; active: boolean; scopes: string[]; created_at: string; expires_at?: string | null; last_used_at?: string | null; expired?: boolean; token?: string };
+export type QueryToolGrant = { id: string; project_id: string; query_tool_id: string; external_client_id: string; enabled: boolean; daily_quota: number | null; created_at: string };
 export type QueryTool = { id: string; name: string; description: string; purpose: string; data_source: string; line_of_business: string; owner: string; tags: string[]; connector_id?: string; upstream_tool_name?: string | null; sql_template: string; parameter_schema: Record<string, unknown>; result_schema: Record<string, unknown>; allowed_relations: string[]; row_limit: number; timeout_seconds: number; requires_approval: boolean; status: string; version: number; updated_at: string };
 export type QueryToolDraft = Omit<QueryTool, "id" | "status" | "version" | "updated_at">;
 export type RelationOption = { asset_id: string; relation: string; source_name: string; connector_id?: string | null; connector_name: string; columns: Dataset["columns"]; tags: string[] };
@@ -354,5 +451,366 @@ export type QueryToolRegistrySummary = { total: number; published: number; draft
 export type PromptArtifact = { id: string; name: string; status: string; version: number; content: { system_prompt?: string; template?: string; variables?: string[] }; metadata: Record<string, unknown>; updated_at: string };
 export type RetentionPolicy = { id: string; resource_type: string; retention_days: number; enabled: boolean; updated_at: string };
 export type SchemaDrift = { id: string; connector_id: string; relation: string; changes: { kind: string; column: string; from?: string; to?: string; type?: string }[]; status: string; detected_at: string };
-export type ModelUsage = { pricing_configured: boolean; totals: { calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number }; items: { provider_id: string; provider_name: string; model: string; calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number; average_latency_ms: number }[] };
+export type ModelUsage = { pricing_configured: boolean; totals: { calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number }; items: { provider_id: string; provider_name: string; provider_type?: string; capability?: ProviderCapability; purpose?: string | null; model: string; calls: number; input_tokens: number; output_tokens: number; estimated_cost_usd: number; average_latency_ms: number }[] };
 export type LearningSuggestion = { id: string; feedback_id: string; category: string; status: "open" | "accepted" | "dismissed"; title: string; rationale: string; proposed_change: { review_target?: string; context_id?: string; action?: string; recent_signals?: { feedback_id: string; context_id?: string; comment?: string }[]; occurrence_count?: number }; reviewed_by: string | null; review_note: string | null; occurrence_count: number; severity: "normal" | "elevated" | "high"; created_at: string; reviewed_at: string | null };
+
+export type AnswerStage = { stage: string; label: string };
+
+export type ProviderCapability = "generation" | "decision";
+export type ModelRoutingPurpose = {
+  purpose: string;
+  label: string;
+  /** Which provider capability can serve this purpose (older APIs omit it: treat as "generation"). */
+  kind?: "generation" | "decision" | "either";
+  provider_id: string | null;
+  effective_provider: { id: string; name: string; model: string } | null;
+  // Where the effective provider comes from: a project assignment, the platform table, or the default chain.
+  scope?: "project" | "platform" | "default" | string;
+};
+export type ModelRouting = {
+  purposes: ModelRoutingPurpose[];
+  providers: { id: string; name: string; provider_type: string; default_model: string; status: string; enabled: boolean; capability?: ProviderCapability }[];
+};
+
+/** What the learning loop contributed to one answer (all optional; older answers carry none). */
+export type AnswerLearning = {
+  verified_examples?: { id: string; question: string }[];
+  reused_verified_query?: { id: string; question: string } | null;
+  prompt_version?: number | null;
+};
+export type EnsembleCandidate = { model: string; ok: boolean; row_count?: number | null; fingerprint?: string | null; error?: string | null; chosen?: boolean };
+/** Multi-model SQL generation: every candidate and how the winner was picked. */
+export type AnswerEnsemble = {
+  candidates?: EnsembleCandidate[];
+  agreement?: string;
+  strategy?: "result_majority" | "sql_majority" | "single" | string;
+  /** No majority: a decision model picked among the candidates. */
+  tie_break?: { by?: "jev" | string; model?: string; probabilities?: Record<string, number>; chosen?: string } | null;
+  /** SQL_VOTE_MODE used: cascade asks the third model only when the first two disagree. */
+  mode?: "cascade" | "always" | "off" | string;
+  escalated?: boolean;
+  not_needed?: string[];
+};
+
+export type VerifiedQuerySource = "feedback" | "evaluation" | "manual" | "optimization";
+export type VerifiedQueryStatus = "active" | "needs_review" | "retired";
+export type VerifiedQuery = {
+  id: string;
+  question: string;
+  sql: string;
+  dialect: string;
+  connector_id?: string | null;
+  source: VerifiedQuerySource | string;
+  status: VerifiedQueryStatus | string;
+  uses: number;
+  last_used_at?: string | null;
+  created_at: string;
+};
+
+export type PromptOptimizationStatus = "queued" | "running" | "completed" | "failed";
+export type PromptOptimization = {
+  id: string;
+  purpose: string;
+  status: PromptOptimizationStatus | string;
+  baseline_score?: number | null;
+  best_score?: number | null;
+  iterations_done?: number | null;
+  iterations?: number | null;
+  created_at: string;
+  completed_at?: string | null;
+  error?: string | null;
+};
+export type PromptCandidate = {
+  id: string;
+  parent_id?: string | null;
+  instructions: string;
+  mean_score?: number | null;
+  scores?: Record<string, number>;
+  on_pareto_front?: boolean;
+  origin?: "baseline" | "reflection" | string;
+};
+export type PromptOptimizationDetail = PromptOptimization & {
+  candidates?: PromptCandidate[];
+  cases?: { id: string; question: string; source?: string }[];
+  best_candidate_id?: string | null;
+  log?: { at: string; message: string }[];
+};
+
+export type IndexRecommendation = {
+  relation: string;
+  columns: string[];
+  occurrences: number;
+  reason: string;
+  statement: string;
+  exists: boolean;
+  /** "local" or the connector name the queries ran against. */
+  source?: string;
+  dialect?: string;
+  slow_queries?: number;
+  avg_ms?: number | null;
+  max_ms?: number | null;
+  threshold_ms?: number | null;
+  verify_note?: string | null;
+};
+/** Index DDL saved for a DBA to review; DataPilot never runs it itself. */
+export type DdlSuggestion = { id: string; relation: string; columns: string[]; statement: string; rationale?: string | null; dialect?: string; created_at: string; created_by?: string | null };
+
+export type RouterDecisionRecord = {
+  id: string;
+  message_id?: string | null;
+  conversation_id?: string | null;
+  created_at: string;
+  question: string;
+  route: RouteKind | string;
+  confidence: number;
+  backend: string;
+  policy_version?: string;
+  candidates?: RouteCandidate[];
+  risk?: Partial<RouteDecision["risk"]>;
+  outcome?: { feedback?: string | null; [key: string]: unknown } | null;
+};
+
+export type AnswerReviewVerdict = "ok" | "check" | "doubtful" | "unreviewed";
+export type AnswerReviewCheck = { name: string; passed: boolean; detail: string; critical?: boolean };
+export type AnswerReview = {
+  verdict: AnswerReviewVerdict;
+  score: number | null;
+  checks: AnswerReviewCheck[];
+  probabilities?: Record<string, number>;
+  by: "jev" | "llm" | "deterministic" | "none";
+  model?: string | null;
+  latency_ms?: number | null;
+  cost_usd?: number | null;
+  model_error?: string | null;
+  warning?: string | null;
+};
+export type AgentAiDraft = {
+  name: string;
+  purpose: string;
+  instructions: string;
+  autonomy_level: number;
+  tool_names: string[];
+  query_tool_names: string[];
+  rejected_tool_names: string[];
+  tool_choice: { by: string; model?: string | null; probabilities?: Record<string, number>; error?: string | null };
+  by: "llm" | "template";
+  model?: string | null;
+  model_error?: string | null;
+  saved: false;
+};
+export type QueryToolAiDraft = {
+  name: string;
+  description: string;
+  purpose: string;
+  tags: string[];
+  parameter_schema: Record<string, unknown>;
+  line_of_business: string;
+  allowed_relations: string[];
+  sql_template?: string | null;
+  by: "llm" | "template";
+  model?: string | null;
+  model_error?: string | null;
+  saved: false;
+};
+
+// SQL program composition ("Build from business logic"): plan -> build job -> assembled WITH statement.
+export type CompositionColumn = { name: string; meaning?: string };
+export type CompositionStep = {
+  name: string;
+  purpose: string;
+  depends_on: string[];
+  inputs: string[];
+  columns: CompositionColumn[];
+  rules: string[];
+};
+export type CompositionPlan = {
+  title: string;
+  steps: CompositionStep[];
+  final: { purpose: string; depends_on: string[]; inputs?: string[]; columns: CompositionColumn[]; rules: string[] };
+};
+export type CompositionPlanResponse = {
+  plan: CompositionPlan;
+  valid: boolean;
+  errors: string[];
+  dialect: string;
+  executable: boolean;
+  catalog_relations: string[];
+  provider: { id: string; name: string; model: string; mode: string; latency_ms: number };
+};
+export type CompositionStepState = {
+  name: string;
+  purpose?: string;
+  inputs?: string[];
+  sql: string;
+  status: "pending" | "running" | "ok" | "repaired" | "failed" | "skipped" | "fallback";
+  error: string | null;
+  row_count: number | null;
+  columns: string[];
+  attempts: number;
+  repaired_from?: string;
+};
+export type CompositionResult = {
+  status: "completed" | "failed";
+  title: string;
+  dialect: string;
+  sql: string;
+  lines: number;
+  steps: CompositionStepState[];
+  final: CompositionStepState;
+  validation: { status: string; read_only: boolean; row_limit: number; risk_level: string; checks: string[]; errors: string[] };
+  execution: SQLExecutionResult | null;
+  preview: Record<string, string | number>[];
+  lineage: Record<string, string[]>;
+  warnings: string[];
+  stats: { steps: number; model_calls: number; repairs: number; duration_ms: number };
+  provider?: { id: string; name: string; model: string; mode: string; latency_ms: number };
+};
+export type CompositionJob = {
+  id: string;
+  title: string;
+  status: string;
+  progress: number;
+  plan: CompositionPlan | null;
+  result: CompositionResult | null;
+  progress_detail: { phase: string; done: number; total: number; steps: CompositionStepState[] } | null;
+};
+
+/** A recent query at or over the slow-query threshold, grouped by SQL (GET /sql/slow-queries). */
+export type SlowQuery = {
+  sql: string;
+  question?: string | null;
+  dialect: string;
+  connector_id?: string | null;
+  query_run_id: string;
+  last_run_at: string;
+  count: number;
+  avg_ms: number;
+  max_ms: number;
+  threshold_ms: number;
+};
+export type SqlPlanSummary = {
+  format: string;
+  analyzed: boolean;
+  total_cost?: number | null;
+  execution_ms?: number | null;
+  node_counts?: Record<string, number>;
+  nodes: { node: string; relation?: string | null; est_rows?: number | null; actual_rows?: number | null; loops?: number | null; cost?: number | null; time_ms?: number | null }[];
+  flags: string[];
+  error?: string;
+};
+export type SqlTuningAttempt = {
+  attempt: number;
+  sql: string | null;
+  ms: number | null;
+  runs: number[];
+  equivalent: boolean;
+  improved: boolean;
+  plan_summary: SqlPlanSummary | null;
+  rejected_reason: string | null;
+  notes: string;
+};
+/** Plan-guided tuning report: rewrites are kept only when their result equals the original's. */
+export type SqlTuningReport = {
+  status: "improved" | "no_improvement" | "failed" | "running";
+  error?: string;
+  question?: string | null;
+  dialect?: string;
+  engine?: string;
+  plan_support?: string;
+  connector_id?: string | null;
+  original_sql?: string | null;
+  order_sensitive?: boolean;
+  model?: string;
+  baseline?: { ms: number; runs: number[]; row_count: number; columns: string[]; plan_summary: SqlPlanSummary | null };
+  baseline_ms?: number;
+  best_ms?: number | null;
+  speedup_pct?: number | null;
+  winning_sql?: string | null;
+  winning_attempt?: number | null;
+  attempts?: SqlTuningAttempt[];
+  plan_diff?: string[];
+  stopped_reason?: string | null;
+  settings?: { iterations?: number; runs?: number; min_gain_pct?: number; max_rows?: number };
+};
+export type SqlTuningRun = {
+  id: string;
+  status: string;
+  progress: number;
+  created_at: string;
+  updated_at: string;
+  sql: string;
+  question?: string | null;
+  connector_id?: string | null;
+  query_run_id?: string | null;
+  result?: string | null;
+  baseline_ms?: number | null;
+  best_ms?: number | null;
+  speedup_pct?: number | null;
+  error?: string | null;
+};
+export type SqlTuningDetail = SqlTuningRun & {
+  logs: { at: string; level: string; message: string }[];
+  report: SqlTuningReport | null;
+  approval: { id: string; status: string; created_at: string } | null;
+};
+
+/** POST /sql/run: pasted SQL executed read-only; failures carry the failing line/column when known. */
+export type SqlErrorLocation = { message: string; line: number | null; column: number | null; position: number | null; snippet: string | null };
+export type PastedSqlRun = {
+  status: "ok" | "error";
+  stage?: "guard" | "catalog" | "execution";
+  error: SqlErrorLocation | null;
+  sql: string;
+  dialect: string;
+  source?: { name?: string; database?: string; connector_type?: string };
+  lines: number;
+  chars: number;
+  columns: string[];
+  rows: Record<string, string | number | null>[];
+  row_count: number;
+  truncated: boolean;
+  limit: number;
+  timeout_seconds: number;
+  duration_ms: number | null;
+  slow: boolean;
+  slow_threshold_ms: number;
+  protected_columns?: string[];
+};
+export type SqlPerformanceIssue = { kind: string; severity: "high" | "medium" | "low"; title: string; detail: string; relation?: string | null };
+export type SqlPlanOperator = {
+  node: string; relation?: string | null; index?: string | null; est_rows?: number | null; actual_rows?: number | null; loops?: number | null;
+  cost?: number | null; exclusive_cost?: number | null; time_ms?: number | null; share_pct?: number | null; depth?: number | null;
+};
+export type SqlQueryIndexSuggestion = { relation: string; columns: string[]; dialect: string; reason: string; statement: string; exists: boolean; full_scan: boolean; verify_note?: string | null };
+export type SqlCteCost = { name: string; score: number; share_pct: number; basis: "plan" | "structure"; lines: number };
+/** POST /sql/analyze: plan-based diagnosis of one query (nothing is applied). */
+export type SqlPerformanceReport = {
+  engine: string;
+  dialect: string;
+  plan_support: string;
+  plan_format?: string | null;
+  analyzed: boolean;
+  plan_error?: string | null;
+  total_cost?: number | null;
+  execution_ms?: number | null;
+  planning_ms?: number | null;
+  duration_ms?: number | null;
+  slow_threshold_ms: number;
+  slow: boolean;
+  operators: SqlPlanOperator[];
+  flags: string[];
+  issues: SqlPerformanceIssue[];
+  index_suggestions: SqlQueryIndexSuggestion[];
+  cte_costs: SqlCteCost[];
+  lines: number;
+  recommend_rewrite: boolean;
+};
+/** Extra fields the tuner adds for pasted/long queries (piece-wise CTE mode, unified diff). */
+export type SqlTuningReportExtras = {
+  mode?: "whole" | "piecewise";
+  lines?: number;
+  cte_targets?: string[];
+  cte_costs?: SqlCteCost[];
+  diff?: string[];
+  attempts?: (SqlTuningAttempt & { part?: string | null; part_sql?: string | null })[];
+};

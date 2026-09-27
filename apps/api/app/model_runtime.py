@@ -25,12 +25,43 @@ class ProviderGenerationResult:
     latency_ms: int
 
 
+DEFAULT_BASE_URLS = {"openai": "https://api.openai.com/v1", "openrouter": "https://openrouter.ai/api/v1", "jev": "https://openrouter.ai/api/alpha/decisions"}
+
+# Environment variables a provider or connector secret reference may never read.
+# An admin could otherwise point a provider at their own base_url with
+# secret_reference=env:JWT_SECRET and receive the signing key as a Bearer token.
+_DENIED_SECRET_NAMES = {
+    "JWT_SECRET", "DATABASE_URL", "STAGING_DATABASE_URL", "STAGING_READER_PASSWORD", "POSTGRES_PASSWORD",
+    "SUPERSET_SECRET_KEY", "SUPERSET_ADMIN_PASSWORD", "SUPERSET_EDITOR_SSO_SECRET", "SUPERSET_GUEST_TOKEN_SECRET",
+    "AGENTGUARD_SECRET_KEY", "GOVERNANCE_WEBHOOK_SECRET", "REDIS_URL", "SEED_ADMIN_PASSWORD",
+    "PINGFEDERATE_CLIENT_SECRET", "TEMPORAL_TLS_KEY",
+}
+
+
+def secret_name_allowed(name: str) -> bool:
+    if not name or name.upper() in _DENIED_SECRET_NAMES or not name.replace("_", "").isalnum():
+        return False
+    allowlist = [item.strip().upper() for item in os.getenv("SECRET_REFERENCE_ALLOWLIST", "").split(",") if item.strip()]
+    if allowlist:
+        return any(name.upper() == item or (item.endswith("*") and name.upper().startswith(item[:-1])) for item in allowlist)
+    return True
+
+
 def resolve_secret(reference: str | None) -> str | None:
     if not reference:
         return None
-    if reference.startswith("env:"):
+    if reference.startswith("env:") and secret_name_allowed(reference[4:]):
         return os.getenv(reference[4:])
     return None
+
+
+def _openai_headers(provider: ModelProvider, secret: str | None) -> dict[str, str]:
+    headers = {"Authorization": f"Bearer {secret}"}
+    if provider.provider_type == "openrouter":
+        # Optional attribution headers recommended by OpenRouter.
+        headers["HTTP-Referer"] = os.getenv("OPENROUTER_SITE_URL", "http://localhost:3001")
+        headers["X-Title"] = "DataPilot Agent OS"
+    return headers
 
 
 def _message_text(payload: dict) -> str:
@@ -96,9 +127,13 @@ def generate_text(
     governance_business_id: str | None = None,
     governance_session_id: str | None = None,
     governance_user_id: str | None = None,
+    timeout: float | None = None,
 ) -> ProviderGenerationResult:
+    """``timeout`` (seconds) overrides the default 45 s HTTP timeout, e.g. for long SQL rewrites."""
     if provider.provider_type == "local_mock":
         return ProviderGenerationResult(content="", latency_ms=1)
+    if provider.provider_type == "jev":
+        raise ValueError("Jev is a decision model (typed choices with probabilities); route it only to decision purposes")
     secret = resolve_secret(provider.secret_reference)
     if not secret:
         raise ValueError("The selected model provider secret is unavailable")
@@ -110,7 +145,7 @@ def generate_text(
         {"role": "user", "content": user_prompt},
     ])
     try:
-        with httpx.Client(timeout=45.0) as client:
+        with httpx.Client(timeout=float(timeout) if timeout else 45.0) as client:
             if provider.provider_type == "gemini":
                 base_url = (provider.base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
                 response = client.post(
@@ -145,13 +180,13 @@ def generate_text(
                     },
                 )
             else:
-                default_url = "https://api.openai.com/v1" if provider.provider_type == "openai" else ""
+                default_url = DEFAULT_BASE_URLS.get(provider.provider_type, "")
                 base_url = (provider.base_url or default_url).rstrip("/")
                 if not base_url:
                     raise ValueError("The selected provider requires a base URL")
                 response = client.post(
                     f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {secret}"},
+                    headers=_openai_headers(provider, secret),
                     json=_openai_chat_payload(
                         provider.default_model,
                         [
@@ -219,6 +254,14 @@ def test_provider(
         }.items()
         if value is not None
     }
+    if provider.provider_type == "jev":
+        from .jev_client import ask
+
+        probe = ask(provider, {"message": "Please refund my last payment."}, {"refund": {"type": "noul", "instructions": "Does `message` ask for a refund?"}})
+        if not probe["ok"]:
+            return ProviderTestResult("failed", "Jev decision call failed", probe["latency_ms"], probe["error"])
+        value = (probe["answers"].get("refund") or {}).get("noul")
+        return ProviderTestResult("healthy", f"Decision model responded ({probe['model']}): P(refund request)={value}", probe["latency_ms"])
     if provider.provider_type == "local_mock":
         record_model_generation(
             feature="provider_test",
@@ -270,13 +313,13 @@ def test_provider(
                     },
                 )
             else:
-                default_url = "https://api.openai.com/v1" if provider.provider_type == "openai" else ""
+                default_url = DEFAULT_BASE_URLS.get(provider.provider_type, "")
                 base_url = (provider.base_url or default_url).rstrip("/")
                 if not base_url:
                     return ProviderTestResult("configuration_required", "Add the provider base URL")
                 response = client.post(
                     f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {secret}"},
+                    headers=_openai_headers(provider, secret),
                     json=_openai_chat_payload(
                         provider.default_model,
                         [{"role": "user", "content": "Reply with OK only."}],

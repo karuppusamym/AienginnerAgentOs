@@ -34,10 +34,19 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+# Make the terminal demo reliable in the default Windows console as well as
+# UTF-8 terminals. Rich otherwise detects the legacy code page and can fail
+# while rendering the check/warning symbols used by the walkthrough.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 console = Console()
 
 DEFAULT_API = "http://localhost:8000"
-SETUP_FILE  = Path(__file__).parent.parent / "scripts" / ".demo_setup.json"
+# The registration script writes setup state in the repository-level scripts
+# directory. Resolve from this example's directory so the demo works when
+# launched from any current working directory on Windows or Unix.
+SETUP_FILE  = Path(__file__).resolve().parents[2] / "scripts" / ".demo_setup.json"
 
 DEMO_INVOCATIONS = [
     {
@@ -93,7 +102,10 @@ def rest_discover(api: str, token: str) -> list[dict]:
         timeout=15,
     )
     r.raise_for_status()
-    return r.json()
+    payload = r.json()
+    # The external registry intentionally wraps tools with discovery metadata
+    # so ADK/LangGraph clients can use the same response contract.
+    return payload.get("tools", []) if isinstance(payload, dict) else payload
 
 
 def rest_invoke(api: str, token: str, tool_name: str, params: dict) -> dict:

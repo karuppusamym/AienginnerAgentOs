@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import contextvars
+import ipaddress
+import json
 import os
+import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -17,13 +22,26 @@ from .grounding import grounding_context, project_asset_search, semantic_matches
 from .governance import record_governance_event
 from .models import DataAsset, IngestedFile, IngestionMapping, IngestionSchedule, Job, LineageEdge, QualityRule, QualityRun
 from .quality import execute_quality_rule
+from .catalog_scope import queryable_asset_ids
 from .schedule_runtime import run_ingestion_schedule
+from .sql_guard import unknown_relations
 from .sql_generation import generated_catalog_sql
-from .staging import execute_read_only, safe_identifier, stage_rows
+from .staging import execute_parameterized_read_only, safe_identifier, stage_rows
 
 
 class ToolRuntimeError(RuntimeError):
     pass
+
+
+class ToolTimeoutError(ToolRuntimeError):
+    """A built-in handler ran past its tool version's timeout_seconds (never retried)."""
+
+
+# The running tool version's timeout, visible to handlers that can pass it down
+# to the database (sql.preview sets it as the statement timeout).
+_TOOL_TIMEOUT_SECONDS: contextvars.ContextVar[int | None] = contextvars.ContextVar("tool_timeout_seconds", default=None)
+# After a timeout the worker is interrupted; give it this long to unwind before returning.
+_TIMEOUT_GRACE_SECONDS = 2.0
 
 
 def validate_parameters(schema: dict[str, Any], parameters: dict[str, Any]) -> None:
@@ -94,8 +112,26 @@ def _dataset_profile(db: Session, parameters: dict[str, Any], project_id: str, u
     }
 
 
+def _project_relations(db: Session, project_id: str) -> set[str]:
+    """Lower-case "schema.table" names of the project's queryable catalogued assets."""
+    assets = db.scalars(select(DataAsset).where(DataAsset.project_id == project_id)).all()
+    allowed_ids = queryable_asset_ids(db, project_id, list(assets))
+    return {f"{asset.schema_name}.{asset.table_name}".lower() for asset in assets if asset.id in allowed_ids}
+
+
 def _sql_preview(db: Session, parameters: dict[str, Any], project_id: str, user_id: str | None = None) -> dict[str, Any]:
-    return execute_read_only(engine, str(parameters["sql"]), int(parameters.get("limit", 100)))
+    sql = str(parameters["sql"])
+    # Scope reads to the run's project: every relation must be a queryable
+    # catalogued asset of this project (the same rule /sql/generate applies).
+    # The read-only guards in execute_parameterized_read_only still run after.
+    outside = unknown_relations(sql, "postgres", _project_relations(db, project_id))
+    if outside:
+        raise ToolRuntimeError(f"sql.preview can only read this project's catalogued datasets; not allowed: {', '.join(sorted(set(outside)))}")
+    timeout = _TOOL_TIMEOUT_SECONDS.get() or 15
+    try:
+        return execute_parameterized_read_only(engine, sql, {}, int(parameters.get("limit", 100)), max(1, int(timeout)))
+    except ValueError as exc:
+        raise ToolRuntimeError(str(exc)) from exc
 
 
 def _job_inspect(db: Session, parameters: dict[str, Any], project_id: str, user_id: str | None = None) -> dict[str, Any]:
@@ -318,12 +354,63 @@ BUILTIN_HANDLERS: dict[str, Callable[[Session, dict[str, Any], str, str | None],
 }
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _blocked_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _resolve_endpoint(hostname: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, UnicodeError) as exc:
+        raise ToolRuntimeError(f"Tool endpoint host could not be resolved: {hostname}") from exc
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise ToolRuntimeError(f"Tool endpoint host could not be resolved: {hostname}")
+    return addresses
+
+
+def _http_client(timeout_seconds: int) -> httpx.Client:
+    """One place to build the outbound client (tests swap in a MockTransport)."""
+    return httpx.Client(timeout=timeout_seconds, follow_redirects=False, trust_env=False)
+
+
 def _execute_http(
     endpoint: str | None,
     method: str,
     parameters: dict[str, Any],
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    """Call an allowlisted HTTP tool with SSRF and response-size guards.
+
+    1. The hostname must be in TOOL_HTTP_ALLOWLIST (unchanged).
+    2. The host is resolved once; private, loopback, link-local, multicast,
+       reserved and unspecified addresses are refused unless
+       TOOL_HTTP_ALLOW_PRIVATE=true (the host is necessarily allowlisted too).
+    3. The request connects to the vetted IP itself (Host header and TLS SNI /
+       certificate check keep the original hostname), so a second DNS answer
+       cannot swap in an internal address (DNS rebinding).
+    4. The body is streamed and aborted past TOOL_HTTP_MAX_BYTES.
+    """
     if not endpoint:
         raise ToolRuntimeError("HTTP tools require an endpoint")
     parsed = urlparse(endpoint)
@@ -332,16 +419,115 @@ def _execute_http(
         for host in os.getenv("TOOL_HTTP_ALLOWLIST", "localhost,127.0.0.1").split(",")
         if host.strip()
     }
-    if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() not in allowlist:
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or hostname not in allowlist:
         raise ToolRuntimeError("Tool endpoint host is not in TOOL_HTTP_ALLOWLIST")
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
-        response = client.request(method.upper(), endpoint, json=parameters)
-        response.raise_for_status()
-        if "application/json" in response.headers.get("content-type", ""):
-            content: Any = response.json()
-        else:
-            content = response.text[:100_000]
-    return {"status_code": response.status_code, "content": content}
+    if parsed.username or parsed.password:
+        raise ToolRuntimeError("Tool endpoints must not embed credentials in the URL")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ToolRuntimeError("Tool endpoint has an invalid port") from exc
+    allow_private = _env_flag("TOOL_HTTP_ALLOW_PRIVATE")
+    addresses = _resolve_endpoint(hostname, port)
+    blocked = [str(address) for address in addresses if _blocked_address(address)]
+    if blocked and not allow_private:
+        raise ToolRuntimeError(
+            f"Tool endpoint {hostname} resolves to a private or reserved address ({', '.join(blocked)}); "
+            "set TOOL_HTTP_ALLOW_PRIVATE=true to allow allowlisted internal hosts"
+        )
+    target = addresses[0]
+    ip_host = f"[{target}]" if isinstance(target, ipaddress.IPv6Address) else str(target)
+    pinned_url = parsed._replace(netloc=f"{ip_host}:{port}").geturl()
+    default_port = port == (443 if parsed.scheme == "https" else 80)
+    headers = {"Host": hostname if default_port else f"{hostname}:{port}"}
+    extensions = {"sni_hostname": hostname} if parsed.scheme == "https" else {}
+    max_bytes = max(1, int(os.getenv("TOOL_HTTP_MAX_BYTES", "1000000")))
+    with _http_client(timeout_seconds) as client:
+        with client.stream(method.upper(), pinned_url, json=parameters, headers=headers, extensions=extensions) as response:
+            response.raise_for_status()
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ToolRuntimeError(f"Tool response exceeds TOOL_HTTP_MAX_BYTES ({max_bytes} bytes)")
+            chunks: list[bytes] = []
+            received = 0
+            for chunk in response.iter_bytes():
+                received += len(chunk)
+                if received > max_bytes:
+                    raise ToolRuntimeError(f"Tool response exceeds TOOL_HTTP_MAX_BYTES ({max_bytes} bytes)")
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            status_code = response.status_code
+            content_type = response.headers.get("content-type", "")
+            encoding = response.encoding or "utf-8"
+    if "application/json" in content_type:
+        try:
+            content: Any = json.loads(body.decode(encoding, errors="replace") or "null")
+        except ValueError as exc:
+            raise ToolRuntimeError("Tool endpoint returned invalid JSON") from exc
+    else:
+        content = body.decode(encoding, errors="replace")[:100_000]
+    return {"status_code": status_code, "content": content}
+
+
+def _interrupt_session(db: Session) -> None:
+    """Best effort: abort the statement a timed-out handler is running on db's connection."""
+    try:
+        if not db.in_transaction():
+            return
+        raw = db.connection().connection.dbapi_connection
+        if hasattr(raw, "interrupt"):  # sqlite3
+            raw.interrupt()
+        elif hasattr(raw, "cancel"):  # psycopg / psycopg2
+            raw.cancel()
+    except Exception:
+        pass
+
+
+def _run_builtin(
+    handler: Callable[[Session, dict[str, Any], str, str | None], dict[str, Any]],
+    handler_name: str,
+    db: Session,
+    parameters: dict[str, Any],
+    project_id: str,
+    user_id: str | None,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Run a built-in handler under the tool version's timeout.
+
+    The handler runs in a worker thread while this thread waits; the session is
+    never used by both at once. On timeout the session's in-flight statement is
+    interrupted, the worker gets a short grace period to unwind, and a
+    ToolTimeoutError is raised. SQL-running handlers also receive the timeout
+    as a database statement timeout, so the query itself stops too.
+    """
+    if not timeout_seconds or timeout_seconds <= 0:
+        return handler(db, parameters, project_id, user_id)
+    token = _TOOL_TIMEOUT_SECONDS.set(int(timeout_seconds))
+    try:
+        context = contextvars.copy_context()
+    finally:
+        _TOOL_TIMEOUT_SECONDS.reset(token)
+    outcome: dict[str, Any] = {}
+    done = threading.Event()
+
+    def target() -> None:
+        try:
+            outcome["result"] = context.run(handler, db, parameters, project_id, user_id)
+        except BaseException as exc:  # re-raised in the calling thread
+            outcome["error"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=target, name=f"tool-{handler_name}", daemon=True)
+    worker.start()
+    if not done.wait(timeout_seconds):
+        _interrupt_session(db)
+        done.wait(_TIMEOUT_GRACE_SECONDS)
+        raise ToolTimeoutError(f"Built-in tool {handler_name} timed out after {timeout_seconds}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
 
 
 def execute_tool(
@@ -374,7 +560,7 @@ def execute_tool(
                     handler = BUILTIN_HANDLERS.get(handler_name)
                     if handler is None:
                         raise ToolRuntimeError(f"Unknown built-in handler: {handler_name}")
-                    result = handler(db, parameters, project_id, user_id)
+                    result = _run_builtin(handler, handler_name, db, parameters, project_id, user_id, timeout_seconds)
                 elif implementation_type == "http":
                     result = _execute_http(endpoint, http_method, parameters, timeout_seconds)
                 else:
@@ -394,10 +580,15 @@ def execute_tool(
                     duration_ms=duration_ms,
                 )
                 return result, attempts, duration_ms
+            except ToolTimeoutError as exc:
+                last_error = exc
+                break  # the timed-out worker may still be unwinding: never retry on the same session
             except Exception as exc:
                 last_error = exc
                 if attempt < max_retries:
                     time.sleep(min(retry_backoff_seconds * (2**attempt), 10))
+        if isinstance(last_error, ToolTimeoutError):
+            raise last_error
         raise ToolRuntimeError(str(last_error or "Tool execution failed"))
     except Exception:
         record_governance_event(

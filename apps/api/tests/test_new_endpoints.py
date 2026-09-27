@@ -1,5 +1,34 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from uuid import uuid4
+
+# This file previously imported app.main directly with no DATABASE_URL of
+# its own. Run standalone, that meant SQLAlchemy fell through to whatever
+# app/database.py's default resolves to -- on a real dev machine, the
+# checked-out repo's own datapilot.db on a mounted/network filesystem,
+# producing SQLite disk-I/O errors, and even where it happened to work it
+# silently shared state with (and could corrupt) the developer's real local
+# database. It only ever passed in CI because pytest imports test_api.py
+# first in the same process and this file inherited test_api.py's temp
+# DATABASE_URL env var as a side effect of import order, not real isolation.
+# Give this file its own isolated temp SQLite database, same pattern as
+# test_api.py, so it is correct whether run alone or as part of the suite
+# and in any import order.
+database_file = Path(tempfile.gettempdir()) / f"datapilot-test-new-endpoints-{uuid4().hex}.db"
+if database_file.exists():
+    database_file.unlink()
+os.environ["DATABASE_URL"] = f"sqlite:///{database_file.as_posix()}"
+os.environ.setdefault("JWT_SECRET", "test-secret")
+os.environ.setdefault("QDRANT_URL", "")
+os.environ.setdefault("SUPERSET_INTERNAL_URL", "")
+os.environ.setdefault("SUPERSET_ADMIN_PASSWORD", "")
+os.environ.setdefault("SUPERSET_EDITOR_SSO_SECRET", "test-editor-secret")
+os.environ.setdefault("ENABLE_DEMO_DATA", "true")
+
 from fastapi.testclient import TestClient
+from app.database import engine
 from app.main import app, project_permissions
 from app.models import User
 
@@ -18,6 +47,9 @@ class DataPilotEndpointsTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls.client_context.__exit__(None, None, None)
+        engine.dispose()
+        if database_file.exists():
+            database_file.unlink()
 
     def test_semantic_graph_endpoint(self) -> None:
         response = self.client.get("/semantic/graph", headers=self.headers)
@@ -50,12 +82,12 @@ class DataPilotEndpointsTests(unittest.TestCase):
         self.assertIn("catalog:write", perms_with_project_owner)
         self.assertIn("semantic:write", perms_with_project_owner)
 
-        # An engineer globally, but viewer in project -> actually engineer gets catalog:write globally, 
-        # so if the blending is a union, they still have write. 
-        # Wait, the blending is a union in project_permissions.
         user_eng = User(id="u2", role="engineer")
         perms_eng = project_permissions(user_eng, "viewer")
-        self.assertIn("catalog:write", perms_eng)
+        # Changed deliberately (review C2): the project role is authoritative, so
+        # a global engineer who is only a viewer here no longer keeps write access.
+        self.assertNotIn("catalog:write", perms_eng)
+        self.assertEqual(project_permissions(User(id="u3", role="admin"), "viewer"), {"*"})
 
     def test_agentic_self_healing_reflection(self) -> None:
         from app.temporal_activities import _reflect_on_tool_error

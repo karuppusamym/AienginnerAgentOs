@@ -21,6 +21,14 @@ import sys
 import time
 from pathlib import Path
 
+# The setup script is commonly launched from Windows PowerShell, where the
+# default console encoding is still CP1252. Keep the human-readable progress
+# output (arrows/checkmarks) usable without requiring callers to set an env var.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import httpx
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -318,7 +326,7 @@ def main():
     test_params = [
         {"status": "active"},   # customers.list
         {"status": "settled"},  # mcp.sqlserver.payments.by_status
-        {"status": None},       # postgres.orders.recent
+        {"status": ""},        # postgres.orders.recent (optional filter)
         {},                     # mcp.postgres.payments.summary
     ]
     for i, tool_id in enumerate(tool_ids):

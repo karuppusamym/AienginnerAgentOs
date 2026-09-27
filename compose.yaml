@@ -63,6 +63,11 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg://datapilot:${POSTGRES_PASSWORD:-datapilot-local}@postgres:5432/datapilot
+      # User/model SQL runs through a SELECT-only role (created by the API on
+      # first start because the Compose Postgres user may create roles).
+      STAGING_DATABASE_URL: postgresql+psycopg://datapilot_reader:${STAGING_READER_PASSWORD:-reader-local-change-me}@postgres:5432/datapilot
+      STAGING_READER_ROLE: datapilot_reader
+      STAGING_READER_PASSWORD: ${STAGING_READER_PASSWORD:-reader-local-change-me}
       JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-before-shared-use}
       CORS_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:3002
       UPLOAD_DIR: /data/uploads
@@ -80,6 +85,10 @@ services:
       SUPERSET_EDITOR_SSO_SECRET: ${SUPERSET_EDITOR_SSO_SECRET:-datapilot-local-editor-sso-secret-change-me}
       ENABLE_DEMO_DATA: ${ENABLE_DEMO_DATA:-false}
       TOOL_HTTP_ALLOWLIST: ${TOOL_HTTP_ALLOWLIST:-localhost,127.0.0.1,superset,mcp-toolbox}
+      # Compose services resolve to private IPs; the allowlist above still limits which hosts HTTP tools may call.
+      TOOL_HTTP_ALLOW_PRIVATE: ${TOOL_HTTP_ALLOW_PRIVATE:-true}
+      SQL_VOTE_MODE: ${SQL_VOTE_MODE:-cascade}
+      APPROVAL_SEPARATION_OF_DUTIES: ${APPROVAL_SEPARATION_OF_DUTIES:-false}
       SQLSERVER_DEMO_CREDENTIALS: ${SQLSERVER_DEMO_CREDENTIALS:-{"server":"sqlserver-demo,1433","database":"DemoDB","username":"sa","password":"DataPilot#2026!"}}
       POSTGRES_DEMO_CREDENTIALS: ${POSTGRES_DEMO_CREDENTIALS:-{"host":"postgres-demo","port":5432,"database":"demodb","username":"demouser","password":"DemoPass#2026!"}}
       OTEL_ENABLED: ${OTEL_ENABLED:-false}
@@ -112,6 +121,11 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg://datapilot:${POSTGRES_PASSWORD:-datapilot-local}@postgres:5432/datapilot
+      # User/model SQL runs through a SELECT-only role (created by the API on
+      # first start because the Compose Postgres user may create roles).
+      STAGING_DATABASE_URL: postgresql+psycopg://datapilot_reader:${STAGING_READER_PASSWORD:-reader-local-change-me}@postgres:5432/datapilot
+      STAGING_READER_ROLE: datapilot_reader
+      STAGING_READER_PASSWORD: ${STAGING_READER_PASSWORD:-reader-local-change-me}
       TEMPORAL_ADDRESS: temporal:7233
       QDRANT_URL: http://qdrant:6333
       UPLOAD_DIR: /data/uploads
@@ -244,7 +258,7 @@ services:
   mcp-toolbox:
     image: us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:latest
     restart: unless-stopped
-    command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000"]
+    command: ["--config", "/config/toolbox.yaml", "--address", "0.0.0.0", "--port", "5000", "--allowed-hosts", "localhost,127.0.0.1,mcp-toolbox", "--allowed-origins", "http://localhost:3000,http://localhost:8000"]
     environment:
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-DataPilot#2026!}
       POSTGRES_DEMO_PASSWORD: ${POSTGRES_DEMO_PASSWORD:-DemoPass#2026!}
@@ -257,8 +271,13 @@ services:
         condition: service_healthy
       postgres-demo:
         condition: service_healthy
+    # The official Toolbox image is shell-less, so CMD-SHELL probes always
+    # fail with "/bin/sh: no such file or directory" even when the MCP
+    # server is ready. Use the image's executable as a shell-free liveness
+    # probe; the API and external-agent smoke tests perform the actual MCP
+    # initialize/tools-list/tools-call readiness validation.
     healthcheck:
-      test: ["CMD-SHELL", "cat /dev/null > /dev/tcp/localhost/5000 && echo ok || exit 1"]
+      test: ["CMD", "/toolbox", "--help"]
       interval: 10s
       timeout: 5s
       retries: 12

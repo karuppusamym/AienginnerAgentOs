@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import ast
+import multiprocessing
+import os
+import pickle
 import time
 from typing import Any
 
@@ -61,9 +64,81 @@ ALLOWED_NODES = (
 )
 
 
+MAX_POWER_EXPONENT = 64
+MAX_REPEAT = 100_000
+PYTHON_CELL_TIMEOUT_SECONDS = float(os.getenv("NOTEBOOK_PYTHON_TIMEOUT_SECONDS", "5"))
+
+
+def _check_resource_bounds(node: ast.AST) -> None:
+    """Reject expressions that can pin the CPU or exhaust memory before they run."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+        exponent = node.right
+        if not (isinstance(exponent, ast.Constant) and isinstance(exponent.value, (int, float)) and abs(exponent.value) <= MAX_POWER_EXPONENT):
+            raise ValueError(f"Exponents must be numeric literals no larger than {MAX_POWER_EXPONENT}")
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        sides = (node.left, node.right)
+        if any(isinstance(side, (ast.List, ast.Tuple, ast.ListComp)) or (isinstance(side, ast.Constant) and isinstance(side.value, str)) for side in sides):
+            count = next((side for side in sides if isinstance(side, ast.Constant) and isinstance(side.value, int)), None)
+            if count is None or count.value > MAX_REPEAT:
+                raise ValueError(f"Sequence repetition needs a literal count no larger than {MAX_REPEAT}")
+
+
+def _run_python_child(source: str, variables: dict[str, Any], channel: Any) -> None:
+    try:
+        output = _execute_python_inline(source, variables)
+        channel.put(("ok", repr(output) if output is not None else None, {k: v for k, v in variables.items() if _picklable(v)}))
+    except Exception as exc:  # pragma: no cover - reported to the parent
+        channel.put(("error", f"{type(exc).__name__}: {exc}"[:2000], {}))
+
+
+def _picklable(value: Any) -> bool:
+    try:
+        pickle.dumps(value)
+        return True
+    except Exception:
+        return False
+
+
 def _execute_python(source: str, variables: dict[str, Any]) -> Any:
+    """Validate in-process, then evaluate in a child process with a hard timeout.
+
+    The AST allowlist blocks imports and attribute access, but pure arithmetic
+    can still hold the GIL for minutes; a separate process can be killed.
+    Set NOTEBOOK_PYTHON_ISOLATION=inline to evaluate in-process (tests/dev).
+    """
+    _validate_python(source)
+    if os.getenv("NOTEBOOK_PYTHON_ISOLATION", "process").lower() == "inline":
+        return _execute_python_inline(source, variables)
+    context = multiprocessing.get_context("spawn")
+    channel = context.Queue()
+    child = context.Process(target=_run_python_child, args=(source, dict(variables), channel), daemon=True)
+    child.start()
+    child.join(PYTHON_CELL_TIMEOUT_SECONDS)
+    if child.is_alive():
+        child.terminate()
+        child.join(1)
+        raise ValueError(f"Python cell exceeded the {PYTHON_CELL_TIMEOUT_SECONDS:g}s limit and was stopped")
+    try:
+        status, value, updated = channel.get(timeout=1)
+    except Exception as exc:
+        raise ValueError("Python cell ended without a result") from exc
+    if status != "ok":
+        raise ValueError(value)
+    variables.update(updated)
+    return _ReprValue(value) if value is not None else None
+
+
+class _ReprValue(str):
+    """Already-rendered repr from the child process; repr() returns it unchanged."""
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+def _validate_python(source: str) -> ast.Module:
     tree = ast.parse(source, mode="exec")
     for node in ast.walk(tree):
+        _check_resource_bounds(node)
         if not isinstance(node, ALLOWED_NODES):
             raise ValueError(f"Python notebook operation is not allowed: {type(node).__name__}")
         if isinstance(node, ast.Call) and (
@@ -72,7 +147,11 @@ def _execute_python(source: str, variables: dict[str, Any]) -> Any:
             raise ValueError("Only approved analytical functions can be called")
         if isinstance(node, ast.Name) and node.id.startswith("__"):
             raise ValueError("Private Python names are not allowed")
+    return tree
 
+
+def _execute_python_inline(source: str, variables: dict[str, Any]) -> Any:
+    tree = _validate_python(source)
     last_expression = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
     statements = tree.body[:-1] if last_expression else tree.body
     scope = {**ALLOWED_BUILTINS, **variables}

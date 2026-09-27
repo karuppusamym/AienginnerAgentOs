@@ -115,10 +115,19 @@ from ..temporal_activities import run_agent_plan_locally
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
-from .. import main
-from ..main import (
+from ..pagination import Page, contains, page_params, paginate_query
+
+from ..superset_client import describe_superset_error
+from ..charts import infer_column_types
+
+from .. import learning
+from ..index_advisor import create_index
+from starlette.concurrency import run_in_threadpool
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,37 +169,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_permission, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor, require_permission,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -198,15 +207,25 @@ router = APIRouter()
 
 @router.get("/approvals")
 def list_approvals(
+    response: Response,
+    page: Page = Depends(page_params),
     status: str | None = Query(default=None),
+    action_type: str = Query(default="", max_length=64),
+    q: str = Query(default="", max_length=200),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
     statement = select(Approval).where(Approval.project_id == project.id).order_by(Approval.created_at.desc())
-    if status:
+    if status == "decided":  # everything no longer awaiting a decision
+        statement = statement.where(Approval.status != "pending")
+    elif status:
         statement = statement.where(Approval.status == status.lower())
-    approvals = db.scalars(statement).all()
+    if action_type:
+        statement = statement.where(Approval.action_type == action_type)
+    if q.strip():
+        statement = statement.where(func.lower(Approval.title).like(contains(q), escape="\\") | func.lower(Approval.action_type).like(contains(q), escape="\\"))
+    approvals = paginate_query(db, statement, response, page)
     return [
         as_dict(
             approval,
@@ -226,6 +245,10 @@ def list_approvals(
         for approval in approvals
     ]
 
+# High-impact actions that need a second person when APPROVAL_SEPARATION_OF_DUTIES=true.
+SEPARATE_APPROVER_ACTIONS = {"agent_execution", "create_index", "prompt_activation", "publish_superset_query", "tool_execution", "deploy_pipeline", "apply_retention", "sql_rewrite_activation"}
+
+
 @router.post("/approvals/{approval_id}/decision")
 async def decide_approval(
     approval_id: str,
@@ -238,28 +261,92 @@ async def decide_approval(
     approval = require_project_resource(db.get(Approval, approval_id), project, "Approval")
     if approval.status != "pending":
         raise HTTPException(status_code=409, detail="Approval has already been decided")
-    approval.status = payload.decision
-    approval.decision_note = payload.note
-    approval.decided_by = user.id
+    if (
+        payload.decision == "approved"
+        and approval.requested_by == user.id
+        and approval.action_type in SEPARATE_APPROVER_ACTIONS
+        and os.getenv("APPROVAL_SEPARATION_OF_DUTIES", "false").strip().lower() in {"1", "true", "yes", "on"}
+    ):
+        # Two-person rule: the requester may withdraw (reject) but not approve their own high-impact request.
+        raise HTTPException(status_code=403, detail="A different person must approve this request (separation of duties is enabled)")
+    job, schedule = apply_approval_decision(db, project, approval, payload.decision, payload.note, user)
+    workflow_id = None
+    approval_evidence = approval.evidence or {}
+    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query", "prompt_activation", "create_index", "sql_rewrite_activation"}:
+        # Plan-bound approvals (review finding H5): the worker loads the plan
+        # frozen in approval.evidence, re-verifies plan_hash and executes it
+        # verbatim -- it never re-plans, and a hash mismatch fails the job
+        # without executing anything. The restart is keyed by this approval so
+        # a duplicate start is rejected rather than run twice.
+        objective = str(approval_evidence.get("objective") or job.title)
+        if approval_evidence.get("plan_hash"):
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Approved plan {str(approval_evidence['plan_hash'])[:12]} by {user.email}"}]
+            db.commit()
+        try:
+            workflow_id = await start_agent_workflow(job.id, objective, run_key=f"approval-{approval.id}")
+        except Exception as exc:
+            job.status = "FAILED"
+            job.progress = 100
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
+        if workflow_id:
+            # The worker may already have moved the job on; never clobber its state.
+            db.refresh(job)
+            if job.status == "PLANNING":
+                job.status = "QUEUED"
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started after approval"}]
+        elif job.status != "FAILED":
+            await run_in_threadpool(run_agent_plan_locally, job.id, objective)
+            db.refresh(job)
+            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local approval fallback"}]
+        db.commit()
+    return {
+        "status": approval.status,
+        "job_status": job.status if job else None,
+        "workflow_id": workflow_id,
+        "schedule_enabled": schedule.enabled if schedule else None,
+        "plan_hash": approval_evidence.get("plan_hash"),
+    }
+
+
+def apply_approval_decision(
+    db: Session,
+    project: Project,
+    approval: Approval,
+    decision: str,
+    note: str | None,
+    actor: User,
+    *,
+    auto_policy: dict[str, Any] | None = None,
+) -> tuple[Job | None, IngestionSchedule | None]:
+    """Record a decision and run its side effects, then commit.
+
+    ``actor`` is the identity the approved action runs as. A decision taken by
+    the auto-approval policy (``auto_policy`` set) runs as the requester, leaves
+    ``decided_by`` empty and is audited as the policy's, never as a person's.
+    Agent-run restarts stay in the async route: the policy never approves them.
+    """
+    approval.status = decision
+    approval.decision_note = note
+    approval.decided_by = None if auto_policy else actor.id
     approval.decided_at = datetime.now(timezone.utc)
     job = db.get(Job, approval.job_id)
     if job:
-        job.status = "PLANNING" if payload.decision == "approved" else "CANCELLED"
-        job.progress = 10 if payload.decision == "approved" else 100
+        job.status = "PLANNING" if decision == "approved" else "CANCELLED"
+        job.progress = 10 if decision == "approved" else 100
     schedule = None
     if approval.action_type == "enable_ingestion_schedule":
         schedule_id = str(approval.evidence.get("schedule_id", ""))
         schedule = db.get(IngestionSchedule, schedule_id)
-        if schedule and payload.decision == "approved":
+        if schedule and decision == "approved":
             schedule.enabled = True
             schedule.next_run_at = next_run_at(schedule.cron)
         if job:
-            job.status = "SUCCEEDED" if payload.decision == "approved" else "CANCELLED"
+            job.status = "SUCCEEDED" if decision == "approved" else "CANCELLED"
             job.progress = 100
-            job.plan = [{**step, "status": "complete" if payload.decision == "approved" else "cancelled"} for step in job.plan]
+            job.plan = [{**step, "status": "complete" if decision == "approved" else "cancelled"} for step in job.plan]
     if approval.action_type == "deploy_pipeline":
         pipeline = db.get(PipelineDefinition, str(approval.evidence.get("pipeline_id", "")))
-        if pipeline and payload.decision == "approved":
+        if pipeline and decision == "approved":
             version = db.scalar(select(PipelineVersion).where(PipelineVersion.pipeline_id == pipeline.id, PipelineVersion.version == pipeline.current_version))
             if version is None:
                 raise HTTPException(status_code=409, detail="Pipeline version not found")
@@ -299,7 +386,7 @@ async def decide_approval(
             pipeline.status = "draft"
     if approval.action_type == "tool_execution":
         execution = db.get(ToolExecution, str(approval.evidence.get("tool_execution_id", "")))
-        if execution and payload.decision == "approved":
+        if execution and decision == "approved":
             tool = db.get(ToolDefinition, execution.tool_id)
             version = db.scalar(select(ToolVersion).where(ToolVersion.tool_id == execution.tool_id, ToolVersion.version == execution.tool_version))
             if tool is None or version is None:
@@ -317,7 +404,7 @@ async def decide_approval(
                     version.timeout_seconds,
                     version.max_retries,
                     version.retry_backoff_seconds,
-                    user_id=user.id,
+                    user_id=actor.id,
                     session_id=job.id if job else execution.id,
                 )
                 execution.status = "SUCCEEDED"
@@ -339,7 +426,7 @@ async def decide_approval(
         elif execution:
             execution.status = "CANCELLED"
             execution.completed_at = datetime.now(timezone.utc)
-    if approval.action_type == "quality_remediation" and payload.decision == "approved":
+    if approval.action_type == "quality_remediation" and decision == "approved":
         source_run = db.get(QualityRun, str(approval.evidence.get("quality_run_id", "")))
         if source_run is None or source_run.project_id != project.id:
             raise HTTPException(status_code=409, detail="Quality run no longer exists")
@@ -358,7 +445,7 @@ async def decide_approval(
             asset = db.get(DataAsset, rule.asset_id) if rule else None
             if rule is None or asset is None or rule.project_id != project.id:
                 raise HTTPException(status_code=409, detail="Quality rule or dataset no longer exists")
-            rerun = QualityRun(project_id=project.id, rule_id=rule.id, status="running", created_by=user.id)
+            rerun = QualityRun(project_id=project.id, rule_id=rule.id, status="running", created_by=actor.id)
             db.add(rerun)
             db.flush()
             result = execute_quality_rule(engine, asset.schema_name, asset.table_name, rule.name, rule.rule_type, rule.column_name, rule.config, rerun.id)
@@ -370,7 +457,7 @@ async def decide_approval(
             job.status = "SUCCEEDED"
             job.progress = 100
             job.plan = [{**step, "status": "complete"} for step in job.plan]
-    if approval.action_type == "apply_retention" and payload.decision == "approved":
+    if approval.action_type == "apply_retention" and decision == "approved":
         policy = db.get(RetentionPolicy, str(approval.evidence.get("policy_id", "")))
         if policy is None or policy.project_id != project.id:
             raise HTTPException(status_code=409, detail="Retention policy no longer exists")
@@ -382,7 +469,37 @@ async def decide_approval(
             job.progress = 100
             job.evidence = [*job.evidence, {"type": "deleted_records", "label": str(deleted_count)}]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
-    if approval.action_type == "publish_superset_query" and payload.decision == "approved":
+    if approval.action_type == "sql_rewrite_activation":
+        # A tuned, result-equivalent rewrite becomes the verified query for its question.
+        from ..query_tuner import apply_rewrite_decision
+
+        apply_rewrite_decision(db, approval, decision, actor)
+    if approval.action_type == "prompt_activation":
+        if decision == "approved":
+            learning.activate_runtime_prompt(db, str(approval.evidence.get("artifact_id", "")), int(approval.evidence.get("version", 0)))
+            audit(db, actor, "prompt.activated", "artifact", str(approval.evidence.get("artifact_id", "")), {"version": approval.evidence.get("version")})
+        if job:
+            job.status = "SUCCEEDED" if decision == "approved" else "CANCELLED"
+            job.progress = 100
+    if approval.action_type == "create_index":
+        if job:
+            job.status, job.progress = ("CANCELLED", 100)
+        if decision == "approved":
+            try:
+                statement = create_index(engine, db, project.id, str(approval.evidence.get("relation", "")), [str(column) for column in approval.evidence.get("columns", [])])
+                if job:
+                    job.status = "SUCCEEDED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Executed: {statement}"}]
+                audit(db, actor, "index.created", "approval", approval.id, {"statement": statement})
+            except PermissionError as exc:
+                if job:
+                    job.status = "CANCELLED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": str(exc)}]
+            except Exception as exc:
+                if job:
+                    job.status = "FAILED"
+                    job.logs = [*(job.logs or []), {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Index creation failed: {str(exc)[:400]}"}]
+    if approval.action_type == "publish_superset_query" and decision == "approved":
         artifact_id = str(approval.evidence.get("artifact_id", ""))
         artifact_version = int(approval.evidence.get("artifact_version", 0) or 0)
         artifact = db.get(Artifact, artifact_id)
@@ -405,11 +522,12 @@ async def decide_approval(
         if not sql or not _safe_read_only_sql(sql):
             raise HTTPException(status_code=409, detail="The approved source is no longer a safe read-only query")
         try:
-            preview = execute_read_only(engine, sql, 1)
+            preview = execute_read_only(engine, sql, 200)
             query_name = safe_identifier(
                 f"dp_query_{artifact.id[:8]}_v{artifact_version}", "datapilot_query"
             )
-            columns = [{"name": column, "type": "text"} for column in preview["columns"]]
+            # Real types from sampled values so Superset gets measures, categories and time axes right.
+            columns = infer_column_types(preview)
             dataset = {
                 "project_id": project.id,
                 "project_slug": project.slug,
@@ -428,10 +546,11 @@ async def decide_approval(
             dashboard_key = f"query-{artifact.id}"
             config = main.get_embed_configuration(project.name, project.slug, dataset, dashboard_key)
             state = main.save_superset_query_dashboard_state(
-                db, project, artifact, artifact_version, sql.strip().rstrip(";"), columns, config, user.id
+                db, project, artifact, artifact_version, sql.strip().rstrip(";"), columns, config, actor.id
             )
-        except (RuntimeError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=503, detail=f"Superset publication failed: {exc}") from exc
+        except (RuntimeError, httpx.HTTPError, OSError) as exc:
+            # Raised before commit, so the approval stays pending and can be approved again once Superset is up.
+            raise HTTPException(status_code=503, detail=f"Superset publication failed: {describe_superset_error(exc)} The approval is still pending.") from exc
         if job:
             job.status = "SUCCEEDED"
             job.progress = 100
@@ -442,37 +561,82 @@ async def decide_approval(
             ]
             job.plan = [{**step, "status": "complete"} for step in job.plan]
             job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Published Superset virtual dataset {query_name}"}]
-    audit(db, user, f"approval.{payload.decision}", "approval", approval.id)
+    if auto_policy:
+        db.add(AuditEvent(project_id=project.id, actor_id=None, event_type=f"approval.auto_{decision}", entity_type="approval", entity_id=approval.id, details=auto_policy))
+        record_audit_event(f"approval.auto_{decision}", "approval", approval.id, project_id=project.id, details={"reason": auto_policy.get("reason", "")})
+    else:
+        audit(db, actor, f"approval.{decision}", "approval", approval.id)
     main.record_governance_event(
         "approval_decision",
         approval.action_type,
-        payload.decision,
+        decision,
         project_id=project.id,
-        user_id=user.id,
+        user_id=None if auto_policy else actor.id,
         session_id=job.id if job else approval.id,
         risk_level=approval.risk_level,
         approval_id=approval.id,
+        decided_by="auto_approval_policy" if auto_policy else "human",
     )
     db.commit()
-    workflow_id = None
-    if job and payload.decision == "approved" and approval.action_type not in {"enable_ingestion_schedule", "deploy_pipeline", "tool_execution", "quality_remediation", "apply_retention", "publish_superset_query"}:
-        try:
-            workflow_id = await start_agent_workflow(job.id, job.title)
-        except Exception as exc:
-            job.status = "FAILED"
-            job.progress = 100
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "error", "message": f"Temporal workflow start failed: {str(exc)[:500]}"}]
-        if workflow_id:
-            job.status = "QUEUED"
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": f"Temporal workflow {workflow_id} started after approval"}]
-        elif job.status != "FAILED":
-            run_agent_plan_locally(job.id, job.title)
-            db.refresh(job)
-            job.logs = [*job.logs, {"at": datetime.now(timezone.utc).isoformat(), "level": "info", "message": "Executed bounded local approval fallback"}]
-        db.commit()
+    return job, schedule
+
+
+class AutoApprovalSettings(BaseModel):
+    enabled: bool
+
+
+def _auto_approval_output(project: Project) -> dict[str, Any]:
+    from .. import auto_approval
+
     return {
-        "status": approval.status,
-        "job_status": job.status if job else None,
-        "workflow_id": workflow_id,
-        "schedule_enabled": schedule.enabled if schedule else None,
+        "project_id": project.id,
+        "enabled": auto_approval.auto_approval_enabled(project),
+        "policy_version": auto_approval.POLICY_VERSION,
+        "auto_approvable_actions": sorted(auto_approval.AUTO_APPROVABLE_ACTIONS),
+        "manual_only": auto_approval.MANUAL_ONLY_REASONS,
+        "separation_of_duties": auto_approval.separation_of_duties(),
+    }
+
+
+@router.get("/approvals/auto-approval")
+def current_auto_approval(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _auto_approval_output(require_current_project(db, user))
+
+
+@router.get("/projects/{project_id}/auto-approval")
+def project_auto_approval(project_id: str, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _auto_approval_output(project)
+
+
+@router.put("/projects/{project_id}/auto-approval")
+def update_project_auto_approval(project_id: str, payload: AutoApprovalSettings, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, Any]:
+    from .. import auto_approval
+
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    auto_approval.set_auto_approval(project, payload.enabled)
+    db.add(AuditEvent(project_id=project.id, actor_id=admin.id, event_type="project.auto_approval_updated", entity_type="project", entity_id=project.id, details={"enabled": payload.enabled}))
+    db.commit()
+    return _auto_approval_output(project)
+
+
+@router.post("/approvals/auto-review")
+def run_auto_review(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Run the auto-approval policy over this project's pending approvals now."""
+    from .. import auto_approval
+
+    require_permission(user, db, "jobs:write", "Running the approval policy requires jobs:write permission")
+    project = require_current_project(db, user)
+    if not auto_approval.auto_approval_enabled(project):
+        return {"enabled": False, "approved": 0, "manual": 0, "results": []}
+    results = auto_approval.review_pending(db, project, "manual_run")
+    return {
+        "enabled": True,
+        "approved": sum(1 for item in results if item["decision"] == "approved"),
+        "manual": sum(1 for item in results if item["decision"] == "manual"),
+        "results": results,
     }

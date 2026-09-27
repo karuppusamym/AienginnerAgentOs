@@ -1,0 +1,46 @@
+/* Result-chart interaction: drill toolbar, breadcrumb, legend toggles, brush zoom, expanded view.
+   Colors come from globals.css tokens so dark mode follows. */
+
+.viz-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; margin: 0 0 8px; min-height: 26px; font-size: 11px; color: var(--muted); }
+.viz-tools { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: auto; }
+.viz-tool { display: inline-flex; align-items: center; gap: 4px; min-height: 24px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 2px 7px; color: var(--text-2); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.viz-tool:hover { border-color: var(--line-strong); color: var(--text); }
+.viz-tool:focus-visible, .viz-crumbs button:focus-visible, .viz-legend-toggle:focus-visible, .viz-legend-drill:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+.viz-hint { color: var(--muted); font-size: 11px; }
+.viz-grain { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
+.viz-grain select { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 2px 4px; color: var(--text); font: inherit; font-size: 11px; }
+
+.viz-crumbs { display: inline-flex; min-width: 0; align-items: center; gap: 6px; }
+.viz-crumbs ol { display: flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.viz-crumbs li { display: inline-flex; min-width: 0; align-items: center; gap: 2px; }
+.viz-crumbs li button { border: 0; border-radius: 4px; background: none; padding: 1px 4px; color: var(--blue); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.viz-crumbs li button:hover { background: var(--blue-soft); }
+.viz-crumbs li span[aria-current] { max-width: 160px; overflow: hidden; padding: 1px 4px; color: var(--text); font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+
+.viz-hit--drill { cursor: pointer; }
+.viz-slice--drill { cursor: pointer; }
+.viz-brush { fill: var(--blue); fill-opacity: 0.12; stroke: var(--blue); stroke-width: 1; pointer-events: none; }
+.viz-tooltip-hint { color: var(--muted); font-size: 10px; font-style: italic; }
+
+.viz-legend--interactive li { gap: 2px; }
+.viz-legend--list.viz-legend--interactive li { display: flex; }
+.viz-legend-toggle { display: inline-flex; min-width: 0; flex: 1 1 auto; align-items: center; gap: 6px; border: 0; border-radius: 4px; background: none; padding: 1px 3px; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.viz-legend-toggle:hover { background: var(--surface-2); }
+.viz-legend-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.viz-legend-toggle b { margin-left: auto; color: var(--text); font-variant-numeric: tabular-nums; }
+.viz-legend li.is-off .viz-legend-toggle { opacity: 0.45; text-decoration: line-through; }
+.viz-legend li.active .viz-legend-toggle span { color: var(--text); font-weight: 700; }
+.viz-legend-drill { display: inline-grid; place-items: center; width: 18px; height: 18px; flex: 0 0 auto; border: 1px solid transparent; border-radius: 4px; background: none; padding: 0; color: var(--muted); cursor: pointer; }
+.viz-legend-drill:hover { border-color: var(--line-strong); color: var(--text); }
+
+.viz-overlay { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; background: var(--overlay); padding: 24px; }
+.viz-overlay-panel { width: min(1200px, 100%); max-height: calc(100vh - 48px); overflow: auto; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); padding: 16px 20px; }
+.viz-overlay-panel > h4 { margin: 0 0 8px; font-size: 14px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .viz-bar, .viz-slice { transition: none; }
+}
+@media (max-width: 640px) {
+  .viz-overlay { padding: 8px; }
+  .viz-overlay-panel { padding: 12px; }
+}

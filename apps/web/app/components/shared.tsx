@@ -1,100 +1,17 @@
 import {
-  Activity,
   AlertCircle,
-  Archive,
-  Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
-  Database,
-  FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
-  Search,
-  Send,
-  Server,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
   X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../lib/api";
+import { ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { statusTone } from "../lib/constants";
+import "./pagination.css";
 import type {
-  NavKey,
-  Overview,
-  Recommendation,
   SecurityCategoryKey,
   SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
-  Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
 
 export function StatusPill({ value }: { value: string }) {
@@ -131,12 +48,8 @@ export function EmptyState({
   );
 }
 
-export function AnalysisChart({ chart }: { chart?: ConversationMessage["structured"]["chart"] }) {
-  if (!chart?.data?.length || !chart.x || !chart.y) return <div className="chart-empty">No chartable result</div>;
-  const values = chart.data.map((row) => Number(row[chart.y!] || 0));
-  const maximum = Math.max(...values.map((value) => Math.abs(value)), 1);
-  return <div className="result-chart"><h4>{chart.title}</h4>{chart.data.slice(0, 12).map((row, index) => <div className="chart-row" key={`${String(row[chart.x!])}-${index}`}><span title={String(row[chart.x!])}>{String(row[chart.x!])}</span><i><b style={{ width: `${Math.max(2, Math.abs(Number(row[chart.y!] || 0)) / maximum * 100)}%` }} /></i><strong>{String(row[chart.y!])}</strong></div>)}</div>;
-}
+/** Result charts live in ./charts (kpi, line, bar, grouped/stacked bar, pie, scatter). */
+export { AnalysisChart, ChartTypeSwitcher, chartAlternatives, formatChartValue } from "./charts";
 
 export function Metric({ label, value, detail, icon, tone }: { label: string; value: ReactNode; detail: string; icon: ReactNode; tone: string }) {
   return (
@@ -363,71 +276,185 @@ export function SecurityOverviewPanel({
   );
 }
 
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), iframe, [tabindex]:not([tabindex="-1"])';
+// Only the topmost open dialog reacts to Esc / Tab when dialogs are stacked.
+const modalStack: string[] = [];
+
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-label={title}><div className="modal-header"><h3>{title}</h3><button className="icon-button" onClick={onClose} aria-label="Close"><X size={19} /></button></div>{children}</div></div>;
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  // Captured during the first render, before any autoFocus inside the dialog moves focus.
+  const [opener] = useState<HTMLElement | null>(() => (typeof document === "undefined" ? null : document.activeElement as HTMLElement | null));
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => {
+    const node = dialogRef.current;
+    if (!node) return;
+    modalStack.push(titleId);
+    const focusable = () => Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => element.getClientRects().length > 0);
+    if (!node.contains(document.activeElement)) {
+      const items = focusable();
+      (items.find((element) => !element.classList.contains("modal-close")) || items[0] || node).focus();
+    }
+    function onKey(event: globalThis.KeyboardEvent) {
+      if (modalStack[modalStack.length - 1] !== titleId || !node) return;
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onCloseRef.current(); return; }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) { event.preventDefault(); node.focus(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const inside = node.contains(document.activeElement);
+      if (event.shiftKey && (!inside || document.activeElement === first || document.activeElement === node)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (!inside || document.activeElement === last)) { event.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      const index = modalStack.lastIndexOf(titleId);
+      if (index !== -1) modalStack.splice(index, 1);
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+    };
+  }, [titleId, opener]);
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialogRef} tabIndex={-1}><div className="modal-header"><h3 id={titleId}>{title}</h3><button type="button" className="icon-button modal-close" onClick={onClose} aria-label="Close"><X size={19} /></button></div>{children}</div></div>;
+}
+
+type ConfirmOptions = { title: string; body: ReactNode; confirmLabel?: string; danger?: boolean };
+
+/**
+ * Promise-based replacement for window.confirm rendered with the accessible Modal:
+ * `const [confirm, confirmDialog] = useConfirm(); if (!(await confirm({...}))) return;`
+ * and render `{confirmDialog}` once in the component.
+ */
+export function useConfirm() {
+  const [request, setRequest] = useState<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null);
+  const confirm = useCallback((options: ConfirmOptions) => new Promise<boolean>((resolve) => setRequest({ ...options, resolve })), []);
+  const settle = (ok: boolean) => { request?.resolve(ok); setRequest(null); };
+  const dialog = request ? (
+    <Modal title={request.title} onClose={() => settle(false)}>
+      <div className="modal-form">
+        <p>{request.body}</p>
+        <div className="modal-actions">
+          {/* Destructive confirmations focus Cancel so a stray Enter does not delete. */}
+          <button type="button" autoFocus={request.danger !== false} className="secondary-button" onClick={() => settle(false)}>Cancel</button>
+          <button type="button" autoFocus={request.danger === false} className={request.danger === false ? "primary-button" : "primary-button danger"} onClick={() => settle(true)}>{request.confirmLabel || "Delete"}</button>
+        </div>
+      </div>
+    </Modal>
+  ) : null;
+  return [confirm, dialog] as const;
 }
 
 /**
- * Hotlink target for a saved SQL artifact or notebook cell once it has an
- * approved, dedicated Superset dashboard (see SupersetQueryDashboard /
- * POST|GET /analytics/queries/{artifact_id}). This is deliberately a
- * *separate* dashboard identity from the project's primary SupersetView —
- * publishing one query must never replace what the project dashboard shows.
+ * Formats an evaluation score. The API reports 0–1 fractions (shown as a
+ * percentage, or percentage points for a delta); larger values are shown as-is.
  */
-export function PublishedQueryAnalyticsModal({ artifactId, title, onClose }: { artifactId: string; title: string; onClose: () => void }) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const dashboardRef = useRef<EmbeddedDashboard | null>(null);
-  const [state, setState] = useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = useState("");
+export function formatScore(value?: number | null, delta = false) {
+  if (value == null || Number.isNaN(value)) return "-";
+  if (Math.abs(value) <= 1) return `${(value * 100).toFixed(1)}${delta ? " pp" : "%"}`;
+  return value.toFixed(2);
+}
 
-  useEffect(() => {
-    let active = true;
-    async function mount() {
-      if (!mountRef.current) return;
-      try {
-        const initial = await api<{ token: string; embedded_id: string; superset_domain: string }>(`/analytics/queries/${artifactId}/guest-token`, { method: "POST" });
-        const embedded = await embedDashboard({
-          id: initial.embedded_id,
-          supersetDomain: initial.superset_domain,
-          mountPoint: mountRef.current,
-          fetchGuestToken: async () => (await api<{ token: string }>(`/analytics/queries/${artifactId}/guest-token`, { method: "POST" })).token,
-          dashboardUiConfig: {
-            hideTitle: false,
-            hideTab: true,
-            hideChartControls: false,
-            filters: { visible: true, expanded: false },
-            urlParams: { standalone: 2 },
-          },
-          iframeTitle: "DataPilot governed query analytics",
-          referrerPolicy: "strict-origin-when-cross-origin",
-        });
-        if (!active) {
-          embedded.unmount();
-          return;
-        }
-        dashboardRef.current = embedded;
-        setState("ready");
-      } catch (reason) {
-        if (!active) return;
-        setError(reason instanceof Error ? reason.message : "This published query's analytics dashboard could not be loaded");
-        setState("error");
-      }
-    }
-    mount();
-    return () => {
-      active = false;
-      dashboardRef.current?.unmount();
-      dashboardRef.current = null;
-    };
-  }, [artifactId]);
+/**
+ * Formats a USD amount with enough precision for per-call model costs:
+ * $12.34, $0.0421, $0.000017 (two significant digits below one cent).
+ */
+export function formatUsd(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  if (value === 0) return "$0";
+  const abs = Math.abs(value);
+  if (abs >= 1) return `$${value.toFixed(2)}`;
+  if (abs >= 0.01) return `$${value.toFixed(4)}`;
+  const digits = Math.min(12, Math.ceil(-Math.log10(abs)) + 1);
+  return `$${value.toFixed(digits).replace(/(\.\d*?[1-9])0+$/, "$1")}`;
+}
 
+/** Probability 0-1 as a percentage (one decimal below 10%). */
+export function formatProbability(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  const percent = value * 100;
+  return `${percent.toFixed(percent < 10 && percent > 0 ? 1 : 0)}%`;
+}
+
+/** Shown when a feature's endpoint returns 404/405 on this API build. */
+export function EndpointUnavailable({ feature, endpoint }: { feature: string; endpoint: string }) {
   return (
-    <Modal title={title} onClose={onClose}>
-      <section className="surface analytics-embed-shell">
-        {state === "loading" && <div className="analytics-overlay"><RefreshCw size={20} className="spin" /><strong>Connecting analytics</strong></div>}
-        {state === "error" && <div className="analytics-overlay error"><AlertCircle size={22} /><strong>Analytics unavailable</strong><span>{error}</span></div>}
-        <div ref={mountRef} className="analytics-mount" />
-      </section>
-    </Modal>
+    <div className="endpoint-unavailable" role="note">
+      <AlertCircle size={16} />
+      <span><strong>{feature} is not available from this API yet.</strong><small><code>{endpoint}</code> returned 404. The view will work once the API version that provides it is deployed.</small></span>
+    </div>
+  );
+}
+
+type PagerState = { offset: number; limit: number; setOffset: (offset: number) => void; setLimit: (limit: number) => void };
+
+/**
+ * Server-side pagination footer: "Showing 1–50 of 312", page size, prev/next.
+ * `total`/`count` come from the page (`X-Total-Count`, items returned).
+ */
+export function Pagination({ state, total, count, busy = false, label = "items", sizes = [25, 50, 100, 200], compact = false }: { state: PagerState; total: number; count: number; busy?: boolean; label?: string; sizes?: number[]; compact?: boolean }) {
+  const { offset, limit, setOffset, setLimit } = state;
+  if (!total && !offset) return null;
+  if (compact && total <= limit && !offset) return null;
+  const from = count ? offset + 1 : 0;
+  const to = offset + count;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const pageNumber = Math.floor(offset / limit) + 1;
+  return (
+    <nav className={`pager${compact ? " compact" : ""}`} aria-label={`${label} pages`}>
+      <span className="pager-summary" aria-live="polite">{busy && <RefreshCw size={12} className="spin" />}Showing <strong>{from.toLocaleString()}–{to.toLocaleString()}</strong> of <strong>{total.toLocaleString()}</strong> {label}</span>
+      <span className="pager-controls">
+        {!compact && <label className="pager-size">Per page<select value={limit} onChange={(event) => setLimit(Number(event.target.value))}>{Array.from(new Set([...sizes, limit])).sort((a, b) => a - b).map((size) => <option key={size} value={size}>{size}</option>)}</select></label>}
+        <button type="button" className="icon-button" aria-label="Previous page" disabled={offset <= 0} onClick={() => setOffset(Math.max(0, offset - limit))}><ChevronLeft size={15} /></button>
+        <span className="pager-page">{pageNumber} / {pages}</span>
+        <button type="button" className="icon-button" aria-label="Next page" disabled={to >= total} onClick={() => setOffset(offset + limit)}><ChevronRight size={15} /></button>
+      </span>
+    </nav>
+  );
+}
+
+/** "Group by" segmented control; the first option should be the ungrouped view. */
+export function GroupBySelect<T extends string>({ value, options, onChange, label = "Group by" }: { value: T; options: { value: T; label: string }[]; onChange: (value: T) => void; label?: string }) {
+  return (
+    <div className="group-by" role="group" aria-label={label}>
+      <span>{label}</span>
+      <div className="segmented">{options.map((option) => <button type="button" key={option.value} className={value === option.value ? "active" : ""} aria-pressed={value === option.value} onClick={() => onChange(option.value)}>{option.label}</button>)}</div>
+    </div>
+  );
+}
+
+/** Collapsible list group; children render (and so fetch) only while it is open. */
+export function CollapsibleGroup({ title, count, defaultOpen = false, children }: { title: ReactNode; count: number; defaultOpen?: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const bodyId = useId();
+  return (
+    <section className={`list-group${open ? " open" : ""}`}>
+      <button type="button" className="list-group-header" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
+        {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        <strong>{title}</strong>
+        <span className="list-group-count">{count.toLocaleString()}</span>
+      </button>
+      {open && <div id={bodyId} className="list-group-body">{children}</div>}
+    </section>
+  );
+}
+
+/** Right-hand detail drawer over the page (Esc / backdrop closes it). */
+export function Drawer({ title, subtitle, onClose, children }: { title: ReactNode; subtitle?: ReactNode; onClose: () => void; children: ReactNode }) {
+  const titleId = useId();
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape" && !modalStack.length) onCloseRef.current(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+  return (
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <div className="drawer-header"><div><h3 id={titleId}>{title}</h3>{subtitle && <small>{subtitle}</small>}</div><button type="button" className="icon-button" onClick={onClose} aria-label="Close" autoFocus><X size={18} /></button></div>
+        <div className="drawer-body">{children}</div>
+      </aside>
+    </div>
   );
 }

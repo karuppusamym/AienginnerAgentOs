@@ -1,77 +1,54 @@
 import {
   Activity,
-  AlertCircle,
+  Boxes,
   Archive,
   Bot,
   BookOpen,
-  Boxes,
   Braces,
   Check,
-  ChevronDown,
-  ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
   Code2,
   Database,
-  FileSpreadsheet,
   FileUp,
-  FlaskConical,
   Gauge,
   GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
+  GraduationCap,
   LayoutDashboard,
-  LogOut,
-  Menu,
   MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
-  RefreshCw,
-  Search,
-  Send,
-  Server,
   Settings,
   ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
 import type { NavKey } from "../types";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+// Sidebar information architecture (docs/UX_CONSOLIDATION.md). "tools" and
+// "evaluations" keep their NavKey and route but are not listed: their pages were
+// merged into Agents & tools and Learning, and the routes redirect there (NAV_REDIRECTS).
 export const navItems: { key: NavKey; label: string; icon: typeof LayoutDashboard }[] = [
-  { key: "workspace", label: "Workspace", icon: LayoutDashboard },
+  { key: "workspace", label: "Home", icon: LayoutDashboard },
   { key: "conversations", label: "Analysis", icon: MessageSquare },
+  { key: "superset", label: "Dashboards", icon: Gauge },
   { key: "datasets", label: "Datasets", icon: Database },
   { key: "files", label: "Files", icon: FileUp },
+  { key: "semantic", label: "Semantic layer", icon: Braces },
+  { key: "quality", label: "Quality", icon: ShieldCheck },
   { key: "sql", label: "SQL", icon: Code2 },
   { key: "notebooks", label: "Notebooks", icon: BookOpen },
   { key: "pipelines", label: "Pipelines", icon: GitBranch },
-  { key: "jobs", label: "Jobs", icon: Activity },
   { key: "artifacts", label: "Artifacts", icon: Archive },
-  { key: "quality", label: "Quality", icon: ShieldCheck },
-  { key: "superset", label: "Superset", icon: Gauge },
+  { key: "agents", label: "Agents & tools", icon: Bot },
+  { key: "jobs", label: "Jobs", icon: Activity },
   { key: "approvals", label: "Approvals", icon: Check },
-  { key: "tools", label: "Tool registry", icon: Network },
-  { key: "agents", label: "Agents", icon: Bot },
-  { key: "semantic", label: "Semantic layer", icon: Braces },
-  { key: "evaluations", label: "Evaluations", icon: FlaskConical },
+  { key: "learning", label: "Learning", icon: GraduationCap },
   { key: "admin", label: "Admin", icon: Settings },
+  { key: "architecture", label: "Architecture", icon: Boxes },
 ];
 
+/** Five areas by user job: Analyze · Data · Build · Automate · Govern. */
 export const navGroups: { key: string; label: string; items: NavKey[] }[] = [
-  { key: "overview", label: "Overview", items: ["workspace", "conversations"] },
-  { key: "data", label: "Data workspace", items: ["datasets", "files", "sql", "notebooks"] },
-  { key: "delivery", label: "Build & operate", items: ["pipelines", "jobs", "quality", "artifacts", "approvals"] },
-  { key: "governance", label: "Governance & agents", items: ["semantic", "tools", "agents", "evaluations", "superset"] },
-  { key: "administration", label: "Administration", items: ["admin"] },
+  { key: "analyze", label: "Analyze", items: ["workspace", "conversations", "superset"] },
+  { key: "data", label: "Data", items: ["datasets", "files", "semantic", "quality"] },
+  { key: "build", label: "Build", items: ["sql", "notebooks", "pipelines", "artifacts"] },
+  { key: "automate", label: "Automate", items: ["agents", "jobs"] },
+  { key: "govern", label: "Govern", items: ["approvals", "learning", "admin", "architecture"] },
 ];
 
 export const roleLanding: Record<string, NavKey> = {
@@ -81,12 +58,36 @@ export const roleLanding: Record<string, NavKey> = {
   viewer: "datasets",
 };
 
+/**
+ * Nav items a role sees by default ("all" = everything `canView` allows).
+ * Everything else the role may open stays reachable by URL and appears under
+ * "Show advanced". This is presentation only: `canView` remains the route gate
+ * and the API enforces permissions. Unknown roles see everything they may open.
+ */
+export const roleNav: Record<string, NavKey[] | "all"> = {
+  admin: "all",
+  engineer: [
+    "workspace", "conversations", "superset", "datasets", "files", "semantic", "quality", "sql", "notebooks",
+    "pipelines", "artifacts", "agents", "jobs", "approvals", "learning",
+  ],
+  analyst: ["conversations", "superset", "datasets", "semantic", "sql", "notebooks", "artifacts"],
+  viewer: ["datasets", "semantic", "superset", "artifacts"],
+};
+
+/** True when the item is in the role's default (non-advanced) sidebar. */
+export function isPrimaryNav(view: NavKey, role: string) {
+  const items = roleNav[role];
+  return !items || items === "all" || items.includes(view);
+}
+
+export const NAV_ADVANCED_STORAGE_KEY = "datapilot.nav.showAdvanced";
+
 export const TOUR_STORAGE_KEY = "datapilot_tour_completed_v1";
 
 export const defaultTourSteps: { key: NavKey; title: string; body: string }[] = [
   {
     key: "workspace",
-    title: "Workspace overview",
+    title: "Home overview",
     body: "Start here for system health, recent jobs, recommendations, and a quick way to launch a governed objective.",
   },
   {
@@ -111,6 +112,41 @@ export const defaultTourSteps: { key: NavKey; title: string; body: string }[] = 
   },
 ];
 
+export type ProviderTypeOption = {
+  value: string;
+  label: string;
+  baseUrl: string;
+  modelPlaceholder: string;
+  secretReference: string;
+  secretPlaceholder: string;
+  /** Pre-filled model id (only for providers with a single well-known model). */
+  defaultModel?: string;
+  /** Short note shown under the type selector. */
+  hint?: string;
+  /** "decision" providers return typed choices with probabilities, never text. */
+  capability?: "generation" | "decision";
+};
+
+// Provider types offered when registering a model provider. `baseUrl` and
+// `secretReference` pre-fill the form (empty = API default / nothing pre-filled);
+// `secretPlaceholder` is only a hint.
+export const providerTypeOptions: ProviderTypeOption[] = [
+  { value: "company_gateway", label: "Company gateway", baseUrl: "", modelPlaceholder: "gateway-chat-model", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "gemini", label: "Gemini", baseUrl: "", modelPlaceholder: "gemini-model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openai", label: "OpenAI", baseUrl: "", modelPlaceholder: "openai-model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "claude", label: "Claude", baseUrl: "", modelPlaceholder: "claude-sonnet-5", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openai_compatible", label: "OpenAI compatible", baseUrl: "", modelPlaceholder: "model-name", secretReference: "", secretPlaceholder: "env:MODEL_API_KEY" },
+  { value: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", modelPlaceholder: "anthropic/claude-sonnet-5", secretReference: "env:OPENROUTER_API_KEY", secretPlaceholder: "env:OPENROUTER_API_KEY" },
+  { value: "jev", label: "TypeSafe Jev (decision model)", baseUrl: "https://openrouter.ai/api/alpha/decisions", modelPlaceholder: "typesafe/jev-1.13", defaultModel: "typesafe/jev-1.13", secretReference: "env:OPENROUTER_API_KEY", secretPlaceholder: "env:OPENROUTER_API_KEY", hint: "Decision model: returns typed choices with probabilities, not text", capability: "decision" },
+  { value: "local_mock", label: "Local mock", baseUrl: "", modelPlaceholder: "local-deterministic", secretReference: "", secretPlaceholder: "Not required" },
+];
+
+/** A provider's capability; older APIs omit it, so it is derived from the provider type. */
+export const providerCapability = (provider: { capability?: string | null; provider_type?: string }) =>
+  provider.capability === "decision" || provider.capability === "generation" || provider.capability === "local"
+    ? provider.capability
+    : providerTypeOptions.find((option) => option.value === provider.provider_type)?.capability || "generation";
+
 export const connectorLabels: Record<string, string> = {
   postgres: "PostgreSQL",
   sql_server: "SQL Server",
@@ -131,11 +167,11 @@ export const connectorDialectForType = (connectorType: string) => {
 
 export const statusTone = (status: string) => {
   const normalized = status.toLowerCase();
-  if (["healthy", "succeeded", "approved", "passed", "reachable", "staged"].includes(normalized)) {
+  if (["healthy", "succeeded", "approved", "passed", "reachable", "staged", "completed", "helpful"].includes(normalized)) {
     return "positive";
   }
-  if (["failed", "rejected", "cancelled"].includes(normalized)) return "negative";
-  if (["pending", "waiting_for_approval", "retrying", "configuration_required"].includes(normalized)) {
+  if (["failed", "rejected", "cancelled", "not helpful"].includes(normalized)) return "negative";
+  if (["pending", "waiting_for_approval", "retrying", "configuration_required", "needs_review"].includes(normalized)) {
     return "warning";
   }
   return "neutral";

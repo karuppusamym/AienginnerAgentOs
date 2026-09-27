@@ -117,8 +117,9 @@ from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
 from fastapi import APIRouter
 
-from .. import main
-from ..main import (
+from .. import core as main
+from ..services.relationships import asset_group_key, explorer_asset_detail, explorer_graph
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -160,37 +161,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_permission, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor, require_permission,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -220,21 +221,80 @@ def semantic_graph(
     # noticed live in this project's own graph (two identical "core.accounts"
     # nodes). Disambiguate only the relations that actually collide, so every
     # already-unique relation keeps its plain, familiar label.
-    connector_names = {connector.id: connector.name for connector in db.scalars(select(Connector).where(Connector.project_id == project.id)).all()}
+    connectors_by_id = {connector.id: connector for connector in db.scalars(select(Connector).where(Connector.project_id == project.id)).all()}
+    connector_names = {connector_id: connector.name for connector_id, connector in connectors_by_id.items()}
+
+    def group_key(asset: DataAsset) -> str:
+        # Shared with the relationship explorer so both views agree on which
+        # assets can be joined (see asset_group_key's docstring).
+        return asset_group_key(asset, connectors_by_id)
+
+    def source_label(asset: DataAsset) -> str:
+        return connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
+
     bare_relations = [f"{asset.schema_name}.{asset.table_name}" for asset in assets]
     duplicate_relations = {relation for relation in bare_relations if bare_relations.count(relation) > 1}
     nodes = []
     for asset, bare_relation in zip(assets, bare_relations):
         relation = bare_relation
         if bare_relation in duplicate_relations:
-            source_label = connector_names.get(asset.connector_id, "local catalog") if asset.connector_id else "local catalog"
-            relation = f"{bare_relation} ({source_label})"
-        nodes.append({"id": asset.id, "relation": relation, "columns": column_names_for_asset(asset), "metadata_status": asset.metadata_status})
-    edges = [{"id": policy.id, "source": policy.left_asset_id, "target": policy.right_asset_id, "left_column": policy.left_column, "right_column": policy.right_column, "join_type": policy.join_type, "status": policy.status, "governed": True} for policy in policies]
+            relation = f"{bare_relation} ({source_label(asset)})"
+        nodes.append({
+            "id": asset.id,
+            "relation": relation,
+            "columns": column_names_for_asset(asset),
+            "metadata_status": asset.metadata_status,
+            # New: lets the UI cluster/color nodes by source instead of
+            # rendering every asset from every connector on one flat ring
+            # with no notion of which ones can actually be queried together.
+            "group": group_key(asset),
+            "source_label": source_label(asset),
+        })
+    # validate_semantic_join_policy() (app/main.py) now blocks *creating* a
+    # governed policy across two different connectors, but that guard only
+    # covers policies made from this point forward -- it can't retroactively
+    # fix one that was already approved before the check existed (or, e.g.,
+    # created against the wrong asset because the Join Policy panel's own
+    # dataset picker used to silently collapse two identically-named assets
+    # from different sources into one selectable option -- see
+    # JoinPoliciesPanel in SemanticView.tsx). Rather than let an existing
+    # violation keep rendering identically to a real, executable governed
+    # join with no signal anything is wrong, flag it here so the UI can
+    # visibly distinguish it instead of silently trusting stale data.
+    asset_by_id = {asset.id: asset for asset in assets}
+    edges = []
+    for policy in policies:
+        left_asset = asset_by_id.get(policy.left_asset_id)
+        right_asset = asset_by_id.get(policy.right_asset_id)
+        cross_connector = bool(left_asset and right_asset and group_key(left_asset) != group_key(right_asset))
+        edges.append({
+            "id": policy.id,
+            "source": policy.left_asset_id,
+            "target": policy.right_asset_id,
+            "left_column": policy.left_column,
+            "right_column": policy.right_column,
+            "join_type": policy.join_type,
+            "status": policy.status,
+            "governed": True,
+            "cross_connector": cross_connector,
+        })
     if include_inferred:
         for index, left in enumerate(assets):
             left_columns = set(column_names_for_asset(left))
             for right in assets[index + 1:]:
+                # Only ever suggest an inferred join between assets that
+                # could actually be queried together (see group_key above).
+                # Column-name matching across two unrelated external
+                # connectors (e.g. a Postgres source and a SQL Server
+                # source both happening to have a "customer_id" column)
+                # produced a dense, misleading "everything joins to
+                # everything" mesh in this project's own graph -- every
+                # one of those edges implied a join the query engine can
+                # never actually run. Same-connector and same-local-workspace
+                # matches are unaffected; this only removes the
+                # non-actionable cross-connector noise.
+                if group_key(left) != group_key(right):
+                    continue
                 shared = sorted(left_columns & set(column_names_for_asset(right)))
                 for column in shared:
                     if column.lower() in {"id", "created_at", "updated_at"}:
@@ -243,6 +303,57 @@ def semantic_graph(
                         continue
                     edges.append({"id": f"inferred:{left.id}:{right.id}:{column}", "source": left.id, "target": right.id, "left_column": column, "right_column": column, "join_type": "inner", "status": "suggested", "governed": False})
     return {"project_id": project.id, "nodes": nodes, "edges": edges, "governed_edge_count": sum(1 for edge in edges if edge["governed"]), "inferred_edge_count": sum(1 for edge in edges if not edge["governed"])}
+
+
+@router.get("/semantic/explorer")
+def semantic_explorer(
+    focus: str | None = Query(default=None, max_length=36),
+    depth: int = Query(default=2, ge=1, le=3),
+    scope: Literal["all", "source", "group"] = Query(default="all"),
+    connector_id: str | None = Query(default=None, max_length=36),
+    group: str | None = Query(default=None, max_length=80),
+    include_inferred: bool = Query(default=True),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Typed relationship graph for the explorer.
+
+    Without ``focus`` it is an overview of every asset in scope. With ``focus``
+    it is the bounded neighbourhood: lineage upstream/downstream up to
+    ``depth`` hops (``level`` < 0 / > 0) and join neighbours (``lane`` "join").
+    """
+    project = require_current_project(db, user)
+    require_permission(user, db, "semantic:read", "Project membership required")
+    from ..catalog_scope import queryable_asset_ids
+
+    try:
+        return explorer_graph(
+            db, project.id, focus=focus, depth=depth, scope=scope, connector_id=connector_id, group=group,
+            include_inferred=include_inferred, queryable=queryable_asset_ids(db, project.id),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/semantic/explorer/assets/{asset_id}")
+def semantic_explorer_asset(
+    asset_id: str,
+    include_inferred: bool = Query(default=True),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Everything that defines one asset's context: columns, joins, lineage, metrics,
+    and the exact catalog text SQL generation sends to the model for it."""
+    project = require_current_project(db, user)
+    require_permission(user, db, "semantic:read", "Project membership required")
+    from ..catalog_scope import queryable_asset_ids
+
+    try:
+        return explorer_asset_detail(db, project.id, asset_id, include_inferred=include_inferred, queryable=queryable_asset_ids(db, project.id))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/semantic/metrics")

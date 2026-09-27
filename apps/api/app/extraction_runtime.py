@@ -36,7 +36,7 @@ from .staging import stage_rows
 
 
 def run_external_extraction_now(extraction_id: str, actor_id: str | None = None) -> dict[str, Any]:
-    from . import main  # deferred: see module docstring
+    from . import core as main  # deferred: see module docstring (shared services live in core)
 
     with SessionLocal() as db:
         extraction = db.get(ExternalExtraction, extraction_id)

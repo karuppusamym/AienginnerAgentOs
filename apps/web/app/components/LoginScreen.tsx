@@ -1,52 +1,17 @@
 import {
-  Activity,
   AlertCircle,
-  Archive,
   Bot,
-  BookOpen,
-  Boxes,
-  Braces,
-  Check,
-  ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
   Database,
-  FileSpreadsheet,
-  FileUp,
-  FlaskConical,
-  Gauge,
-  GitBranch,
-  GitCompare,
   KeyRound,
-  Layers3,
   LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
-  Search,
-  Send,
-  Server,
-  Settings,
   ShieldCheck,
-  Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, login, SessionUser } from "../lib/api";
+import { FormEvent, useState } from "react";
+import { login, SessionUser } from "../lib/api";
 
-export function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) => void }) {
+export function LoginScreen({ onLogin, notice }: { onLogin: (user: SessionUser) => void; notice?: string }) {
   const [email, setEmail] = useState("admin@datapilot.local");
   const [password, setPassword] = useState("ChangeMe123!");
   const [error, setError] = useState("");
@@ -88,7 +53,8 @@ export function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) => void 
             Password
             <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required />
           </label>
-          {error && <div className="form-error"><AlertCircle size={16} />{error}</div>}
+          {notice && !error && <div className="form-notice" role="status"><ShieldCheck size={16} />{notice}</div>}
+          {error && <div className="form-error" role="alert"><AlertCircle size={16} />{error}</div>}
           <button className="primary-button wide" disabled={busy}>
             {busy ? <RefreshCw size={17} className="spin" /> : <KeyRound size={17} />}
             Sign in

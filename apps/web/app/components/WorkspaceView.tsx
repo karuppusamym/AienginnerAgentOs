@@ -1,117 +1,45 @@
 import {
   Activity,
-  AlertCircle,
-  Archive,
   Bot,
-  BookOpen,
   Boxes,
-  Braces,
   Check,
-  ChevronDown,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  CalendarClock,
-  Code2,
   Database,
-  FileSpreadsheet,
   FileUp,
-  FlaskConical,
-  Gauge,
   GitBranch,
-  GitCompare,
-  KeyRound,
-  Layers3,
-  LayoutDashboard,
-  LogOut,
-  Menu,
-  MessageSquare,
-  Network,
-  PanelLeftClose,
-  Play,
-  Plus,
   RefreshCw,
-  Search,
   Send,
   Server,
-  Settings,
   ShieldCheck,
   Sparkles,
-  UserPlus,
-  Users,
-  X,
-  XCircle,
 } from "lucide-react";
-import { embedDashboard, EmbeddedDashboard } from "@superset-ui/embedded-sdk";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, SessionUser } from "../lib/api";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
 import type {
   NavKey,
   Overview,
   Recommendation,
-  SecurityCategoryKey,
   SecurityOverview,
-  Dataset,
-  Connector,
-  ModelProvider,
-  Project,
-  AgentVersion,
-  AgentDefinition,
-  ToolVersion,
-  ToolDefinition,
-  SemanticMetric,
-  SemanticJoinPolicy,
-  PipelineDefinition,
-  Incident,
   Job,
-  Approval,
-  IngestedFile,
-  MappingColumn,
-  LoadMode,
-  IngestionMapping,
-  QualityRun,
-  QualityRule,
-  SQLResult,
-  SQLExecutionResult,
-  SearchResult,
-  Artifact,
-  ArtifactVersion,
-  IngestionSchedule,
-  MappingOption,
-  ArtifactComment,
-  EvaluationSet,
-  NotebookCellData,
-  Notebook,
-  Conversation,
-  ConversationMessage,
-  ExternalClient,
-  QueryTool,
-  QueryToolDraft,
-  RelationOption,
-  QueryToolUsage,
-  QueryToolRegistrySummary,
-  PromptArtifact,
-  RetentionPolicy,
-  SchemaDrift,
-  ModelUsage,
 } from "../types";
-import {
-  navItems,
-  TOUR_STORAGE_KEY,
-  defaultTourSteps,
-  connectorLabels,
-  connectorDialectForType,
-  statusTone,
-} from "../lib/constants";
-import { StatusPill, LoadingBlock, EmptyState, Modal, Metric, ControlItem, AnalysisChart, SecurityOverviewPanel } from "./shared";
+import { StatusPill, Metric, ControlItem, SecurityOverviewPanel } from "./shared";
 
 
+/**
+ * Home. The objective box hands the question to Analysis (docs/UX_CONSOLIDATION.md §4.4),
+ * which keeps the conversation and routes to agents itself; "Run as agent" still starts a
+ * bounded agent run directly for roles allowed to (jobs:write: admin, engineer).
+ */
 export function WorkspaceView({
   setActive,
   notify,
+  onAskInAnalysis,
+  canRunAgent = false,
 }: {
   setActive: (key: NavKey) => void;
   notify: (message: string, tone?: "ok" | "error") => void;
+  onAskInAnalysis?: (question: string) => void;
+  canRunAgent?: boolean;
 }) {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [security, setSecurity] = useState<SecurityOverview | null>(null);
@@ -134,18 +62,24 @@ export function WorkspaceView({
 
   useEffect(load, [load]);
 
-  async function runObjective(event: FormEvent) {
+  function askInAnalysis(event: FormEvent) {
     event.preventDefault();
+    if (!objective.trim()) return;
+    if (onAskInAnalysis) onAskInAnalysis(objective.trim());
+    else void runObjective();
+  }
+
+  async function runObjective() {
     if (!objective.trim()) return;
     setRunning(true);
     try {
-      const result = await api<{ status: string; plan: Job["plan"]; approval_id?: string }>("/agents/runs", {
+      const result = await api<{ status: string; plan: Job["plan"]; approval_id?: string; plan_hash?: string; plan_bound?: boolean }>("/agents/runs", {
         method: "POST",
         body: JSON.stringify({ objective, autonomy_level: 2 }),
       });
       setPlan(result.plan);
       notify(
-        result.approval_id ? "Draft complete and sent for approval" : "Bounded agent run completed",
+        result.approval_id ? (result.plan_bound && result.plan_hash ? `Plan ${result.plan_hash.slice(0, 12)} frozen and sent for approval` : "Draft complete and sent for approval") : "Bounded agent run completed",
       );
       load();
     } catch (reason) {
@@ -160,9 +94,9 @@ export function WorkspaceView({
       <section className="command-surface">
         <div className="command-heading">
           <div>
-            <span className="eyebrow">AUTONOMY LEVEL 2 / BOUNDED DRAFT</span>
+            <span className="eyebrow">ASK IN ANALYSIS / AGENT RUNS AT AUTONOMY LEVEL 2</span>
             <h2>What do you want to build or understand?</h2>
-            <p>DataPilot will inspect metadata, select specialists, and return a reviewable plan with evidence.</p>
+            <p>Your question opens in Analysis, which keeps the conversation and routes to the right specialist agents. Use Run as agent for a detached, bounded agent run with a reviewable plan.</p>
           </div>
           <div className="command-model">
             <span className="status-dot" />
@@ -173,7 +107,7 @@ export function WorkspaceView({
             <Bot size={16} />
           </div>
         </div>
-        <form className="command-input" onSubmit={runObjective}>
+        <form className="command-input" onSubmit={askInAnalysis}>
           <Sparkles size={20} />
           <textarea
             value={objective}
@@ -181,12 +115,18 @@ export function WorkspaceView({
             placeholder="Ask about your data, generate SQL, or draft a pipeline..."
             rows={2}
           />
-          <button className="send-button" disabled={running || !objective.trim()} aria-label="Run request">
-            {running ? <RefreshCw size={19} className="spin" /> : <Send size={19} />}
+          <button className="send-button" disabled={running || !objective.trim()} aria-label="Ask in Analysis" title="Ask in Analysis">
+            <Send size={19} />
           </button>
         </form>
+        <div className="command-secondary">
+          <button type="button" className="secondary-button" onClick={() => void runObjective()} disabled={!canRunAgent || running || !objective.trim()} title={canRunAgent ? "Start a bounded agent run (autonomy level 2) and show its plan here" : "Running agents requires jobs:write (engineer or admin)"}>
+            {running ? <RefreshCw size={16} className="spin" /> : <Bot size={16} />}Run as agent
+          </button>
+          {!canRunAgent && <small>Agent runs need engineer or admin permissions.</small>}
+        </div>
         <div className="quick-prompts" aria-label="Catalog-based recommended questions">
-          {recommendations.map((recommendation) => <button key={recommendation.question} title={recommendation.basis} onClick={() => setObjective(recommendation.question)}>{recommendation.question}</button>)}
+          {recommendations.map((recommendation, index) => <button key={`${recommendation.relation}-${index}`} title={recommendation.basis} onClick={() => setObjective(recommendation.question)}>{recommendation.question}</button>)}
         </div>
         <small className="recommendation-basis">Recommended from this project&apos;s catalog metadata.</small>
       </section>
@@ -198,7 +138,7 @@ export function WorkspaceView({
               <span className="eyebrow">LATEST RUN</span>
               <h3>Agent plan and trace</h3>
             </div>
-            <button className="text-button" onClick={() => setActive("jobs")}>Open full trace <ChevronRight size={16} /></button>
+            <button type="button" className="text-button" onClick={() => setActive("jobs")}>Open full trace <ChevronRight size={16} /></button>
           </div>
           <div className="plan-steps">
             {plan.map((step, index) => (
@@ -225,7 +165,7 @@ export function WorkspaceView({
             <span className="eyebrow">TRY THIS FIRST</span>
             <h3>Recommended sample workflow</h3>
           </div>
-          <button className="secondary-button" onClick={() => setActive("files")}>
+          <button type="button" className="secondary-button" onClick={() => setActive("files")}>
             <FileUp size={16} />
             Start with files
           </button>
@@ -237,7 +177,7 @@ export function WorkspaceView({
               <strong>Upload a local file</strong>
               <small>Profile CSV, Excel, JSON, Parquet, or PDF and confirm the source shape.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("files")}>Open Files</button>
+            <button type="button" className="text-button" onClick={() => setActive("files")}>Open Files</button>
           </div>
           <div className="starter-step">
             <span>2</span>
@@ -245,7 +185,7 @@ export function WorkspaceView({
               <strong>Ask a grounded question</strong>
               <small>Use Analysis for a persistent topic that keeps context, SQL, and preview results together.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("conversations")}>Open Analysis</button>
+            <button type="button" className="text-button" onClick={() => setActive("conversations")}>Open Analysis</button>
           </div>
           <div className="starter-step">
             <span>3</span>
@@ -253,7 +193,7 @@ export function WorkspaceView({
               <strong>Inspect generated SQL</strong>
               <small>Review catalog grounding, semantic terms, validation checks, and reuse status before saving.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("sql")}>Open SQL</button>
+            <button type="button" className="text-button" onClick={() => setActive("sql")}>Open SQL</button>
           </div>
           <div className="starter-step">
             <span>4</span>
@@ -261,7 +201,7 @@ export function WorkspaceView({
               <strong>Review the run trace</strong>
               <small>Open Jobs to see plan steps, evidence, outputs, approvals, and operational logs.</small>
             </div>
-            <button className="text-button" onClick={() => setActive("jobs")}>Open Jobs</button>
+            <button type="button" className="text-button" onClick={() => setActive("jobs")}>Open Jobs</button>
           </div>
         </div>
       </section>

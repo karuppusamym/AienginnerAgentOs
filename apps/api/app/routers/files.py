@@ -44,6 +44,7 @@ from ..file_profiles import profile_file, read_structured_rows
 from ..grounding import context_signature, grounding_context, grounding_prompt_text, normalize_query, project_grounding_signature
 from ..model_runtime import generate_text, test_provider as invoke_provider_test
 from ..metadata_scan_runtime import execute_metadata_scan
+from ..metadata_generation import is_unreviewed_description, suggest_dataset_metadata
 from ..models import (
     AgentDefinition,
     AgentVersion,
@@ -117,10 +118,12 @@ from ..extraction_runtime import run_external_extraction_now
 from ..temporal_runtime import cancel_workflow, start_agent_workflow, start_external_extraction_workflow, start_metadata_scan_workflow, start_scheduled_ingestion_workflow
 from ..tool_runtime import ToolRuntimeError, execute_tool
 from ..vector_store import index_document, search_documents
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
-from .. import main
-from ..main import (
+from ..pagination import Page, contains, page_params, paginate_query
+
+from .. import core as main
+from ..core import (
     AGENT_APPROVAL_KEYWORDS, AgentDefinition, AgentDefinitionCreate,
     AgentDefinitionUpdate, AgentRunRequest, AgentVersion, AgentVersionCreate, Any,
     Approval, ApprovalDecision, Artifact, ArtifactComment, ArtifactCommentCreate,
@@ -162,37 +165,37 @@ from ..main import (
     _security_posture, _security_score, _security_text, _sql_cache_key,
     _store_sql_query_cache, _superset_dataset, _validate_connector_contract,
     _validate_query_tool_contract, _validate_tool_parameters,
-    agent_run_requires_approval, analysis_source_output, annotations, app,
-    app_lifespan, as_dict, asynccontextmanager, asyncio, audit,
-    backfill_project_columns, build_exported_package, cancel_workflow,
-    column_names_for_asset, compact_conversation_context, connector_dialect,
-    connector_output, context_signature, conversation_output,
-    conversational_analysis_answer, create_access_token, create_editor_url,
-    create_guest_token, create_package_archive, create_quality_rule_record,
-    dataset_category, datetime, delete, elapsed_ms, emit, emit_pipeline_artifacts,
-    engine, ensure_demo_tables, ensure_project_columns, estimated_model_cost,
-    execute_metadata_scan, execute_notebook, execute_parameterized_read_only,
-    execute_quality_rule, execute_read_only, execute_tool, external_client_output,
-    external_extraction_columns, external_extraction_output, func, generate_text,
-    generated_catalog_sql, generated_sql, get_current_user, get_db, grounding_context,
-    grounding_prompt_text, hash_password, hashlib, httpx, index_document,
-    initial_agent_plan, initialize_governance, initialize_observability, inspect,
-    invoke_provider_test, io, json, next_run_at, normalize_query, observability_status,
-    observe_request, os, pipeline_output, plan_pipeline, profile_file,
-    project_grounding_signature, project_output, quality_rule_output,
-    query_tool_output, query_tool_usage_summary, re, read_structured_rows,
-    record_audit_event, refresh_conversation_summary, request_id, require_admin,
-    require_current_project, require_data_editor, require_project_resource,
-    require_role, require_semantic_maintainer, require_workspace_editor,
-    resolve_superset_dataset, run_agent_evaluation_case, run_agent_plan_locally,
-    run_ingestion_schedule, safe_identifier, save_internal_artifact_version,
-    save_superset_dashboard_state, schedule_output, search_documents, secrets,
-    seed_database, select, selected_model_provider, semantic_join_policy_output,
-    session_user_output, shutil, span, stage_rows, start_agent_workflow,
-    start_metadata_scan_workflow, start_scheduled_ingestion_workflow, startup,
-    test_connection, text, time, timedelta, timezone, unified_diff, uuid4,
-    validate_exported_package, validate_pipeline_artifacts, validate_pipeline_spec,
-    validate_semantic_join_policy, verify_password,
+    agent_run_requires_approval, analysis_source_output, annotations, as_dict,
+    asynccontextmanager, asyncio, audit, backfill_project_columns,
+    build_exported_package, cancel_workflow, column_names_for_asset,
+    compact_conversation_context, connector_dialect, connector_output,
+    context_signature, conversation_output, conversational_analysis_answer,
+    create_access_token, create_editor_url, create_guest_token, create_package_archive,
+    create_quality_rule_record, dataset_category, datetime, delete, elapsed_ms, emit,
+    emit_pipeline_artifacts, engine, ensure_demo_tables, ensure_project_columns,
+    estimated_model_cost, execute_metadata_scan, execute_notebook,
+    execute_parameterized_read_only, execute_quality_rule, execute_read_only,
+    execute_tool, external_client_output, external_extraction_columns,
+    external_extraction_output, func, generate_text, generated_catalog_sql,
+    generated_sql, get_current_user, get_db, grounding_context, grounding_prompt_text,
+    hash_password, hashlib, httpx, index_document, initial_agent_plan,
+    initialize_governance, initialize_observability, inspect, invoke_provider_test, io,
+    json, next_run_at, normalize_query, observability_status, os, pipeline_output,
+    plan_pipeline, profile_file, project_grounding_signature, project_output,
+    quality_rule_output, query_tool_output, query_tool_usage_summary, re,
+    read_structured_rows, record_audit_event, refresh_conversation_summary, request_id,
+    require_admin, require_current_project, require_data_editor,
+    require_project_resource, require_role, require_semantic_maintainer,
+    require_workspace_editor, resolve_superset_dataset, run_agent_evaluation_case,
+    run_agent_plan_locally, run_ingestion_schedule, safe_identifier,
+    save_internal_artifact_version, save_superset_dashboard_state, schedule_output,
+    search_documents, secrets, seed_database, select, selected_model_provider,
+    semantic_join_policy_output, session_user_output, shutil, span, stage_rows,
+    start_agent_workflow, start_metadata_scan_workflow,
+    start_scheduled_ingestion_workflow, test_connection, text, time, timedelta,
+    timezone, unified_diff, uuid4, validate_exported_package,
+    validate_pipeline_artifacts, validate_pipeline_spec, validate_semantic_join_policy,
+    verify_password,
 )
 
 router = APIRouter()
@@ -200,12 +203,19 @@ router = APIRouter()
 
 @router.get("/files")
 def list_files(
+    response: Response,
+    page: Page = Depends(page_params),
+    q: str = Query(default="", max_length=200),
+    status: str = Query(default="", max_length=32),
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[dict[str, Any]]:
     project = require_current_project(db, user)
-    files = db.scalars(
-        select(IngestedFile).where(IngestedFile.project_id == project.id).order_by(IngestedFile.created_at.desc())
-    ).all()
+    statement = select(IngestedFile).where(IngestedFile.project_id == project.id)
+    if status:
+        statement = statement.where(IngestedFile.status == status)
+    if q.strip():
+        statement = statement.where(func.lower(IngestedFile.filename).like(contains(q), escape="\\"))
+    files = paginate_query(db, statement.order_by(IngestedFile.created_at.desc()), response, page)
     return [
         as_dict(
             item,
@@ -262,35 +272,47 @@ def ingest_file(
             item.status = "profiled"
         table_name = staged["table_name"] if staged else safe_identifier(Path(item.filename).stem, f"file_{item.id[:8]}")
         schema_name = staged["schema_name"] if staged else "file_profiles"
-        db.add(
-            DataAsset(
-                project_id=project.id,
-                source_name="Local files",
-                schema_name=schema_name,
-                table_name=table_name,
-                asset_type="staged_file",
-                row_count=profile.get("row_count"),
-                columns=annotate_columns(
-                    (
-                    [
-                        {"name": column["name"], "type": column["type"], "nullable": True}
-                        for column in staged["columns"]
-                    ]
-                    if staged
-                    else [
-                        {
-                            "name": column["name"],
-                            "type": column["inferred_type"],
-                            "nullable": column["null_count"] > 0,
-                        }
-                        for column in profile.get("columns", [])
-                    ]
-                    )
-                ),
-                tags=["local-file", item.status],
-                description=f"Ingested from {item.filename}",
+        annotated_columns = annotate_columns(
+            (
+            [
+                {"name": column["name"], "type": column["type"], "nullable": True}
+                for column in staged["columns"]
+            ]
+            if staged
+            else [
+                {
+                    "name": column["name"],
+                    "type": column["inferred_type"],
+                    "nullable": column["null_count"] > 0,
+                }
+                for column in profile.get("columns", [])
+            ]
             )
         )
+        new_asset = DataAsset(
+            project_id=project.id,
+            source_name="Local files",
+            schema_name=schema_name,
+            table_name=table_name,
+            asset_type="staged_file",
+            row_count=profile.get("row_count"),
+            columns=annotated_columns,
+            tags=["local-file", item.status],
+            description=f"Ingested from {item.filename}",
+        )
+        try:
+            metadata_provider = selected_model_provider(db, user, "metadata_generation")
+        except Exception:
+            metadata_provider = None
+        suggestion = suggest_dataset_metadata(
+            metadata_provider, schema_name, table_name, annotated_columns,
+            governance_business_id=project.id, governance_user_id=user.id,
+        ) if metadata_provider is not None else None
+        if suggestion:
+            new_asset.description = suggestion["description"]
+            new_asset.metadata_status = "ai_suggested"
+            new_asset.columns = [{**column, **suggestion["columns"].get(str(column.get("name", "")), {})} for column in annotated_columns]
+        db.add(new_asset)
     else:
         item.status = "indexed"
     db.add(item)
@@ -608,6 +630,64 @@ def disable_schedule(
     db.commit()
     return schedule_output(schedule, db)
 
+@router.post("/schedules/{schedule_id}/enable", status_code=202)
+def request_schedule_enable(
+    schedule_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Re-enabling a disabled schedule goes through the same approval as creating it; nothing runs until approved."""
+    require_data_editor(user, db)
+    project = require_current_project(db, user)
+    schedule = require_project_resource(db.get(IngestionSchedule, schedule_id), project, "Ingestion schedule")
+    if schedule.enabled:
+        raise HTTPException(status_code=409, detail="The schedule is already enabled")
+    pending = db.scalars(
+        select(Approval).where(
+            Approval.project_id == project.id,
+            Approval.action_type == "enable_ingestion_schedule",
+            Approval.status == "pending",
+        )
+    ).all()
+    if any(str((item.evidence or {}).get("schedule_id", "")) == schedule.id for item in pending):
+        raise HTTPException(status_code=409, detail="An approval to enable this schedule is already pending")
+    mapping = db.get(IngestionMapping, schedule.mapping_id)
+    job = Job(
+        project_id=project.id,
+        title=f"Approve schedule: {schedule.name}",
+        job_type="schedule_creation",
+        status="WAITING_FOR_APPROVAL",
+        progress=70,
+        created_by=user.id,
+        plan=[
+            {"agent": "Pipeline", "action": "Validate mapping and load mode", "status": "complete"},
+            {"agent": "Policy", "action": "Approve re-enabling recurring execution", "status": "waiting"},
+        ],
+        evidence=[
+            {"type": "mapping", "label": mapping.name if mapping else "missing mapping"},
+            {"type": "schedule", "label": schedule.cron},
+        ],
+    )
+    db.add(job)
+    db.flush()
+    approval = Approval(
+        project_id=project.id,
+        job_id=job.id,
+        title=f"Enable ingestion schedule: {schedule.name}",
+        action_type="enable_ingestion_schedule",
+        risk_level="medium",
+        requested_by=user.id,
+        evidence={
+            "summary": f"Re-enable {schedule.name} on {schedule.cron} using {schedule.load_mode}",
+            "checks": ["local execution", "approved mapping", "read-only source", "audited target writes"],
+            "schedule_id": schedule.id,
+        },
+    )
+    db.add(approval)
+    audit(db, user, "schedule.enable_requested", "ingestion_schedule", schedule.id, {"approval_id": approval.id})
+    db.commit()
+    return {**schedule_output(schedule, db), "approval_id": approval.id, "job_id": job.id}
+
 @router.post("/files/{file_id}/schema", status_code=201)
 def save_file_schema(
     file_id: str,
@@ -762,7 +842,24 @@ def stage_file_mapping(
             for column in staged["columns"]
         ]
     asset.tags = ["local-file", "mapped", "staged", payload.load_mode]
-    asset.description = f"Mapped {payload.load_mode} ingestion from {item.filename}"
+    if is_unreviewed_description(asset.description):
+        asset.description = f"Mapped {payload.load_mode} ingestion from {item.filename}"
+    missing_business_names = not any(column.get("business_name") for column in asset.columns)
+    if is_unreviewed_description(asset.description) or missing_business_names:
+        try:
+            metadata_provider = selected_model_provider(db, user, "metadata_generation")
+        except Exception:
+            metadata_provider = None
+        suggestion = suggest_dataset_metadata(
+            metadata_provider, asset.schema_name, asset.table_name, asset.columns,
+            governance_business_id=project.id, governance_user_id=user.id,
+        ) if metadata_provider is not None else None
+        if suggestion:
+            if is_unreviewed_description(asset.description):
+                asset.description = suggestion["description"]
+                asset.metadata_status = "ai_suggested"
+            if missing_business_names:
+                asset.columns = [{**column, **suggestion["columns"].get(str(column.get("name", "")), {})} for column in asset.columns]
     db.flush()
     job = Job(
         project_id=project.id,

@@ -1,0 +1,1671 @@
+{
+  "api": "http://localhost:8000",
+  "started_at": "2026-09-24T04:10:01.378110+00:00",
+  "routing": [
+    {
+      "purpose": "sql_generation",
+      "label": "SQL generation",
+      "provider_id": "acc43b8c-506e-46b0-a2c1-c59837a0594b",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "acc43b8c-506e-46b0-a2c1-c59837a0594b",
+        "name": "Gemini 3.6 Flash",
+        "model": "gemini-3.6-flash"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "sql_repair",
+      "label": "SQL repair after validation or execution errors",
+      "provider_id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+        "name": "OpenRouter Claude Sonnet 5",
+        "model": "anthropic/claude-sonnet-5"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "conversation_summary",
+      "label": "Chat answer narrative",
+      "provider_id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+        "name": "OpenRouter DeepSeek V4.1 Flash",
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "decision_routing",
+      "label": "Decision router (LLM backend)",
+      "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+      "scope": "project",
+      "effective_provider": {
+        "id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13"
+      },
+      "kind": "either"
+    },
+    {
+      "purpose": "agent_planning",
+      "label": "Agent planning",
+      "provider_id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+        "name": "OpenRouter Claude Sonnet 5",
+        "model": "anthropic/claude-sonnet-5"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "agent_review",
+      "label": "Agent plan review",
+      "provider_id": "acc43b8c-506e-46b0-a2c1-c59837a0594b",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "acc43b8c-506e-46b0-a2c1-c59837a0594b",
+        "name": "Gemini 3.6 Flash",
+        "model": "gemini-3.6-flash"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "tool_parameters",
+      "label": "Tool parameter filling",
+      "provider_id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+        "name": "OpenRouter DeepSeek V4.1 Flash",
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "sql_candidate_2",
+      "label": "Second SQL candidate (multi-model vote)",
+      "provider_id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+        "name": "OpenRouter DeepSeek V4.1 Flash",
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "sql_candidate_3",
+      "label": "Third SQL candidate (multi-model vote)",
+      "provider_id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+        "name": "OpenRouter Claude Sonnet 5",
+        "model": "anthropic/claude-sonnet-5"
+      },
+      "kind": "generation"
+    },
+    {
+      "purpose": "risk_check",
+      "label": "Consequential-action check (escalates approvals only)",
+      "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13"
+      },
+      "kind": "decision"
+    },
+    {
+      "purpose": "sql_candidate_judge",
+      "label": "SQL candidate tie-breaker",
+      "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13"
+      },
+      "kind": "decision"
+    },
+    {
+      "purpose": "tool_selection",
+      "label": "Tool choice for each agent step",
+      "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+      "scope": "platform",
+      "effective_provider": {
+        "id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13"
+      },
+      "kind": "decision"
+    }
+  ],
+  "routing_cases": [
+    {
+      "label": "SQL question",
+      "question": "What is the total transaction amount by transaction type?",
+      "decision": {
+        "route": "sql_analysis",
+        "label": "Grounded SQL analysis",
+        "target": null,
+        "confidence": 0.92,
+        "candidates": [
+          {
+            "route": "sql_analysis",
+            "score": 0.92,
+            "reasons": [
+              "5 catalog match(es); best activity.transactions",
+              "semantic metric matched",
+              "analytic intent 1.00"
+            ],
+            "local_score": 0.9
+          },
+          {
+            "route": "clarify",
+            "score": 0.08,
+            "reasons": [
+              "baseline"
+            ],
+            "local_score": 0.12
+          }
+        ],
+        "suggested_actions": [],
+        "risk": {
+          "level": "low",
+          "requires_approval": false,
+          "triggers": []
+        },
+        "backend": "jev:typesafe/jev-1.13-20260917",
+        "jev": {
+          "model": "typesafe/jev-1.13-20260917",
+          "probabilities": {
+            "sql_analysis": 0.92,
+            "clarify": 0.08
+          },
+          "consequential": 0.01,
+          "latency_ms": 337,
+          "cost_usd": 1.9656e-05
+        },
+        "policy_version": "local-v1",
+        "latency_ms": 339.08
+      }
+    },
+    {
+      "label": "Named agent",
+      "question": "Run the Quality agent to validate null checks on transactions",
+      "decision": {
+        "route": "agent_run",
+        "label": "Multi-step agent run",
+        "target": {
+          "id": "fe118872-e500-404f-916b-8f59d6c016a0",
+          "name": "Quality",
+          "description": "Profiles data and proposes measurable quality controls."
+        },
+        "confidence": 0.97,
+        "candidates": [
+          {
+            "route": "agent_run",
+            "target": {
+              "id": "fe118872-e500-404f-916b-8f59d6c016a0",
+              "name": "Quality",
+              "description": "Profiles data and proposes measurable quality controls."
+            },
+            "score": 0.97,
+            "reasons": [
+              "names an agent or workflow",
+              "named agent 100%: Quality"
+            ],
+            "local_score": 0.4
+          },
+          {
+            "route": "agent_run",
+            "target": {
+              "id": "1fb75da3-e1d9-4ac7-bff2-ea2bf2905374",
+              "name": "Planner",
+              "description": "Decomposes requests, selects specialists, and enforces run limits."
+            },
+            "score": 0.02,
+            "reasons": [
+              "names an agent or workflow",
+              "purpose fit 14%: Planner"
+            ],
+            "local_score": 0.108
+          },
+          {
+            "route": "clarify",
+            "score": 0.01,
+            "reasons": [
+              "baseline"
+            ],
+            "local_score": 0.12
+          },
+          {
+            "route": "sql_analysis",
+            "score": 0.0,
+            "reasons": [
+              "5 catalog match(es); best mcp.sqlserver.payments.by_status",
+              "semantic metric matched",
+              "analytic intent 0.00"
+            ],
+            "local_score": 0.55
+          }
+        ],
+        "suggested_actions": [
+          {
+            "route": "agent_run",
+            "label": "Multi-step agent run",
+            "target": {
+              "id": "fe118872-e500-404f-916b-8f59d6c016a0",
+              "name": "Quality",
+              "description": "Profiles data and proposes measurable quality controls."
+            },
+            "score": 0.97,
+            "reasons": [
+              "names an agent or workflow",
+              "named agent 100%: Quality"
+            ]
+          }
+        ],
+        "risk": {
+          "level": "low",
+          "requires_approval": false,
+          "triggers": []
+        },
+        "backend": "jev:typesafe/jev-1.13-20260917",
+        "jev": {
+          "model": "typesafe/jev-1.13-20260917",
+          "probabilities": {
+            "clarify": 0.01,
+            "agent_run:Planner": 0.02,
+            "agent_run:Quality": 0.97,
+            "sql_analysis": 0.0
+          },
+          "consequential": 0.12,
+          "latency_ms": 412,
+          "cost_usd": 2.5746e-05
+        },
+        "policy_version": "local-v1",
+        "latency_ms": 414.26
+      }
+    },
+    {
+      "label": "Agent not named (Jev picks which)",
+      "question": "Validate null checks then investigate why the nightly loads failed",
+      "decision": {
+        "route": "agent_run",
+        "label": "Multi-step agent run",
+        "target": {
+          "id": "6fa0c5d4-a322-4630-a555-9e41b2a4633d",
+          "name": "Troubleshooter",
+          "description": "Explains failed jobs and recommends bounded remediation."
+        },
+        "confidence": 0.94,
+        "candidates": [
+          {
+            "route": "agent_run",
+            "target": {
+              "id": "6fa0c5d4-a322-4630-a555-9e41b2a4633d",
+              "name": "Troubleshooter",
+              "description": "Explains failed jobs and recommends bounded remediation."
+            },
+            "score": 0.94,
+            "reasons": [
+              "action verbs: investigate",
+              "purpose fit 11%: Troubleshooter"
+            ],
+            "local_score": 0.56
+          },
+          {
+            "route": "agent_run",
+            "target": {
+              "id": "1fb75da3-e1d9-4ac7-bff2-ea2bf2905374",
+              "name": "Planner",
+              "description": "Decomposes requests, selects specialists, and enforces run limits."
+            },
+            "score": 0.06,
+            "reasons": [
+              "action verbs: investigate",
+              "purpose fit 0%: Planner"
+            ],
+            "local_score": 0.1512
+          },
+          {
+            "route": "sql_analysis",
+            "score": 0.0,
+            "reasons": [
+              "5 catalog match(es); best mcp.sqlserver.payments.by_status",
+              "semantic metric matched",
+              "analytic intent 0.00"
+            ],
+            "local_score": 0.55
+          },
+          {
+            "route": "agent_run",
+            "target": {
+              "id": "1578388c-bcbb-4215-9bd9-58957dcf140f",
+              "name": "Metadata",
+              "description": "Scans catalogs, profiles assets, and retrieves grounded context."
+            },
+            "score": 0.0,
+            "reasons": [
+              "action verbs: investigate",
+              "purpose fit 0%: Metadata"
+            ],
+            "local_score": 0.1512
+          },
+          {
+            "route": "clarify",
+            "score": 0.0,
+            "reasons": [
+              "baseline"
+            ],
+            "local_score": 0.12
+          }
+        ],
+        "suggested_actions": [
+          {
+            "route": "agent_run",
+            "label": "Multi-step agent run",
+            "target": {
+              "id": "6fa0c5d4-a322-4630-a555-9e41b2a4633d",
+              "name": "Troubleshooter",
+              "description": "Explains failed jobs and recommends bounded remediation."
+            },
+            "score": 0.94,
+            "reasons": [
+              "action verbs: investigate",
+              "purpose fit 11%: Troubleshooter"
+            ]
+          }
+        ],
+        "risk": {
+          "level": "low",
+          "requires_approval": false,
+          "triggers": []
+        },
+        "backend": "jev:typesafe/jev-1.13-20260917",
+        "jev": {
+          "model": "typesafe/jev-1.13-20260917",
+          "probabilities": {
+            "sql_analysis": 0.0,
+            "agent_run:Metadata": 0.0,
+            "agent_run:Planner": 0.06,
+            "agent_run:Troubleshooter": 0.94,
+            "clarify": 0.0
+          },
+          "consequential": 0.05,
+          "latency_ms": 289,
+          "cost_usd": 2.9064e-05
+        },
+        "policy_version": "local-v1",
+        "latency_ms": 291.0
+      }
+    },
+    {
+      "label": "Vague",
+      "question": "hello",
+      "decision": {
+        "route": "clarify",
+        "label": "Ask a clarifying question",
+        "target": null,
+        "confidence": 1.0,
+        "candidates": [
+          {
+            "route": "clarify",
+            "score": 1.0,
+            "reasons": [
+              "question is short or not grounded in the catalog"
+            ],
+            "local_score": 0.3652
+          },
+          {
+            "route": "sql_analysis",
+            "score": 0.0,
+            "reasons": [
+              "5 catalog match(es); best demo.customers",
+              "analytic intent 0.00"
+            ],
+            "local_score": 0.3015
+          }
+        ],
+        "suggested_actions": [],
+        "risk": {
+          "level": "low",
+          "requires_approval": false,
+          "triggers": []
+        },
+        "backend": "jev:typesafe/jev-1.13-20260917",
+        "jev": {
+          "model": "typesafe/jev-1.13-20260917",
+          "probabilities": {
+            "clarify": 1.0,
+            "sql_analysis": 0.0
+          },
+          "consequential": 0.01,
+          "latency_ms": 308,
+          "cost_usd": 1.9278e-05
+        },
+        "policy_version": "local-v1",
+        "latency_ms": 309.25
+      }
+    },
+    {
+      "label": "Consequential",
+      "question": "Copy all customer records to the marketing shared drive",
+      "decision": {
+        "route": "clarify",
+        "label": "Ask a clarifying question",
+        "target": null,
+        "confidence": 0.99,
+        "candidates": [
+          {
+            "route": "clarify",
+            "score": 0.99,
+            "reasons": [
+              "baseline"
+            ],
+            "local_score": 0.12
+          },
+          {
+            "route": "query_tool",
+            "target": {
+              "id": "cccf87ab-2632-46c0-98a4-ea4cb463cef3",
+              "name": "customers.lookup",
+              "description": "Read one demo.customers record by customer_id.",
+              "required_parameters": [
+                "customer_id"
+              ],
+              "requires_approval": false
+            },
+            "score": 0.01,
+            "reasons": [
+              "33% of question terms match tool metadata",
+              "needs parameters: customer_id"
+            ],
+            "local_score": 0.15
+          },
+          {
+            "route": "sql_analysis",
+            "score": 0.0,
+            "reasons": [
+              "5 catalog match(es); best mcp.sqlserver.orders.by_customer",
+              "semantic metric matched",
+              "analytic intent 0.00"
+            ],
+            "local_score": 0.55
+          }
+        ],
+        "suggested_actions": [],
+        "risk": {
+          "level": "medium",
+          "requires_approval": true,
+          "triggers": [
+            "jev:consequential"
+          ],
+          "escalated_by": "jev",
+          "jev_probability": 0.89
+        },
+        "backend": "jev:typesafe/jev-1.13-20260917",
+        "jev": {
+          "model": "typesafe/jev-1.13-20260917",
+          "probabilities": {
+            "sql_analysis": 0.0,
+            "query_tool:customers.lookup": 0.01,
+            "clarify": 0.99
+          },
+          "consequential": 0.89,
+          "latency_ms": 259,
+          "cost_usd": 2.1588e-05
+        },
+        "policy_version": "local-v1",
+        "latency_ms": 261.25
+      }
+    }
+  ],
+  "escalation": {
+    "job_id": "8b0e18e5-bcd9-4da3-8363-6d6cb34c0af9",
+    "status": "WAITING_FOR_APPROVAL",
+    "plan": [
+      {
+        "agent": "Policy",
+        "action": "Review request to copy customer records externally; determine data classification and compliance constraints.",
+        "status": "pending",
+        "step_index": 0,
+        "origin": "planner"
+      },
+      {
+        "agent": "Metadata",
+        "action": "Identify PII fields and sensitivity tags in mcp.sqlserver.customers.list schema.",
+        "status": "pending",
+        "step_index": 1,
+        "origin": "planner"
+      },
+      {
+        "agent": "Quality",
+        "action": "Assess data quality and completeness of customer records prior to any proposed export.",
+        "status": "pending",
+        "step_index": 2,
+        "origin": "planner"
+      },
+      {
+        "agent": "Troubleshooter",
+        "action": "Flag that bulk customer data transfer to shared drive requires explicit approval before execution.",
+        "status": "pending",
+        "step_index": 3,
+        "origin": "planner"
+      },
+      {
+        "agent": "Planner",
+        "action": "Escalate for human approval; no copy action will proceed without authorized sign-off and access controls.",
+        "status": "pending",
+        "step_index": 4,
+        "origin": "planner"
+      }
+    ],
+    "approval_id": "536d7790-1847-42b8-bea3-2a1b2f181904",
+    "workflow_id": null,
+    "plan_hash": "c24076efee0fdd43ce98a4528dda141e8e6443b1ec92d2e2c949f03a124415d2",
+    "plan_bound": true
+  },
+  "agent_run": {
+    "decision": {
+      "route": "agent_run",
+      "label": "Multi-step agent run",
+      "target": {
+        "id": "1578388c-bcbb-4215-9bd9-58957dcf140f",
+        "name": "Metadata",
+        "description": "Scans catalogs, profiles assets, and retrieves grounded context."
+      },
+      "confidence": 0.89,
+      "candidates": [
+        {
+          "route": "agent_run",
+          "target": {
+            "id": "1578388c-bcbb-4215-9bd9-58957dcf140f",
+            "name": "Metadata",
+            "description": "Scans catalogs, profiles assets, and retrieves grounded context."
+          },
+          "score": 0.89,
+          "reasons": [
+            "action verbs: profile",
+            "purpose fit 0%: Metadata"
+          ],
+          "local_score": 0.1512
+        },
+        {
+          "route": "agent_run",
+          "target": {
+            "id": "773a6768-0829-4bb2-a29e-456c1dcd39cf",
+            "name": "Analytics",
+            "description": "Builds grounded metric and dashboard analyses from approved catalog context."
+          },
+          "score": 0.08,
+          "reasons": [
+            "action verbs: profile",
+            "purpose fit 12%: Analytics"
+          ],
+          "local_score": 0.56
+        },
+        {
+          "route": "agent_run",
+          "target": {
+            "id": "1fb75da3-e1d9-4ac7-bff2-ea2bf2905374",
+            "name": "Planner",
+            "description": "Decomposes requests, selects specialists, and enforces run limits."
+          },
+          "score": 0.02,
+          "reasons": [
+            "action verbs: profile",
+            "purpose fit 0%: Planner"
+          ],
+          "local_score": 0.1512
+        },
+        {
+          "route": "sql_analysis",
+          "score": 0.01,
+          "reasons": [
+            "5 catalog match(es); best staging.transactions",
+            "semantic metric matched",
+            "analytic intent 0.00"
+          ],
+          "local_score": 0.4492
+        },
+        {
+          "route": "clarify",
+          "score": 0.0,
+          "reasons": [
+            "baseline"
+          ],
+          "local_score": 0.1383
+        }
+      ],
+      "suggested_actions": [
+        {
+          "route": "agent_run",
+          "label": "Multi-step agent run",
+          "target": {
+            "id": "1578388c-bcbb-4215-9bd9-58957dcf140f",
+            "name": "Metadata",
+            "description": "Scans catalogs, profiles assets, and retrieves grounded context."
+          },
+          "score": 0.89,
+          "reasons": [
+            "action verbs: profile",
+            "purpose fit 0%: Metadata"
+          ]
+        }
+      ],
+      "risk": {
+        "level": "low",
+        "requires_approval": false,
+        "triggers": []
+      },
+      "backend": "jev:typesafe/jev-1.13-20260917",
+      "jev": {
+        "model": "typesafe/jev-1.13-20260917",
+        "probabilities": {
+          "sql_analysis": 0.01,
+          "agent_run:Metadata": 0.89,
+          "agent_run:Planner": 0.02,
+          "clarify": 0.0,
+          "agent_run:Analytics": 0.08
+        },
+        "consequential": 0.04,
+        "latency_ms": 278,
+        "cost_usd": 2.898e-05
+      },
+      "policy_version": "local-v1",
+      "latency_ms": 280.22
+    },
+    "run": {
+      "job_id": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1",
+      "status": "QUEUED",
+      "plan": [
+        {
+          "agent": "Planner",
+          "action": "Decompose objective and set limits",
+          "status": "waiting"
+        },
+        {
+          "agent": "Metadata",
+          "action": "Ground against catalog and semantic terms",
+          "status": "waiting"
+        },
+        {
+          "agent": "SQL Analyst",
+          "action": "Draft dialect-aware query",
+          "status": "waiting"
+        },
+        {
+          "agent": "Quality",
+          "action": "Validate assumptions and evidence",
+          "status": "waiting"
+        },
+        {
+          "agent": "Policy",
+          "action": "Confirm read-only execution",
+          "status": "complete"
+        }
+      ],
+      "approval_id": null,
+      "workflow_id": "datapilot-agent-87ac5262-4836-47df-92ba-b6a9c0f1f5b1"
+    },
+    "job": {
+      "id": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1",
+      "title": "Profile staging.transactions, then explain its lineage and the metrics it supports",
+      "job_type": "agent_run",
+      "status": "SUCCEEDED",
+      "progress": 100,
+      "plan": [
+        {
+          "agent": "Metadata",
+          "action": "Retrieve schema, column definitions, and metadata profile for staging.transactions.",
+          "status": "complete",
+          "step_index": 0,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:0",
+          "completed_at": "2026-09-24T04:10:18.285745+00:00"
+        },
+        {
+          "agent": "Quality",
+          "action": "Profile staging.transactions for null rates, distinct counts, and value distributions per column.",
+          "status": "complete",
+          "step_index": 1,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:1",
+          "completed_at": "2026-09-24T04:10:18.610812+00:00"
+        },
+        {
+          "agent": "Metadata",
+          "action": "Trace upstream and downstream lineage for staging.transactions across pipeline and warehouse layers.",
+          "status": "complete",
+          "step_index": 2,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:2",
+          "completed_at": "2026-09-24T04:10:18.983121+00:00"
+        },
+        {
+          "agent": "SQL Analyst",
+          "action": "Inspect sample rows to verify amount, txn_type, and posted_at align with semantic metric definitions.",
+          "status": "complete",
+          "step_index": 3,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:3",
+          "completed_at": "2026-09-24T04:10:19.740047+00:00"
+        },
+        {
+          "agent": "Analytics",
+          "action": "Explain how staging.transactions supports 'New deposit accounts' and 'Net transaction amount' metrics.",
+          "status": "complete",
+          "step_index": 4,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:4",
+          "completed_at": "2026-09-24T04:10:20.109379+00:00"
+        },
+        {
+          "agent": "Planner",
+          "action": "Summarize profiling, lineage, and metric support findings into a consolidated read-only report.",
+          "status": "complete",
+          "step_index": 5,
+          "origin": "planner",
+          "idempotency_key": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1:5",
+          "completed_at": "2026-09-24T04:10:20.525846+00:00"
+        }
+      ],
+      "evidence": [
+        {
+          "type": "policy",
+          "label": "Autonomy level 2",
+          "agent_runtime": true,
+          "autonomy_level": 2,
+          "objective": "Profile staging.transactions, then explain its lineage and the metrics it supports",
+          "lead_agent": "Metadata",
+          "plan_hash": "285f36e4cd291e3006b7793f2556b1c829978f32521ca401f7f800c8a0848e68",
+          "plan_bound": false,
+          "grounding": {
+            "catalog_matches": 5,
+            "vector_hits": 5,
+            "semantic_matches": 2
+          },
+          "planning_fallback": false,
+          "prepared_job_id": "87ac5262-4836-47df-92ba-b6a9c0f1f5b1",
+          "tool_calls_used": 6,
+          "review_iterations": 1
+        },
+        {
+          "type": "catalog",
+          "label": "5 grounded catalog matches retrieved"
+        },
+        {
+          "type": "vector",
+          "label": "5 vector hits retrieved"
+        },
+        {
+          "type": "semantic",
+          "label": "2 semantic metrics evaluated"
+        },
+        {
+          "type": "policy",
+          "label": "Read-only and bounded-run policies passed"
+        },
+        {
+          "type": "policy",
+          "label": "Executed plan 285f36e4cd29"
+        },
+        {
+          "type": "tool_choice",
+          "label": "Metadata: jev:typesafe/jev-1.13-20260917 chose dataset.profile (dataset.profile 100%, catalog.search 0%, lineage.query 0%, file.profile 0%)",
+          "agent": "Metadata",
+          "selected": [
+            "dataset.profile"
+          ],
+          "by": "jev",
+          "step_index": 0
+        },
+        {
+          "type": "tool",
+          "label": "Metadata used dataset.profile: 10",
+          "tool": "dataset.profile",
+          "parameters": {
+            "asset_id": "89ac6931-1903-4da5-988c-53fd98cf0e04"
+          },
+          "parameter_source": "heuristic",
+          "step_index": 0
+        },
+        {
+          "type": "tool",
+          "label": "Quality used catalog.search: 10",
+          "tool": "catalog.search",
+          "parameters": {
+            "query": "Profile staging.transactions for null rates, distinct counts, and value distributions per column.\nProfile staging.transactions, then explain its lineage and the metrics it supports",
+            "limit": 10
+          },
+          "parameter_source": "heuristic",
+          "step_index": 1
+        },
+        {
+          "type": "tool_choice",
+          "label": "Metadata: jev:typesafe/jev-1.13-20260917 chose lineage.query (lineage.query 100%, dataset.profile 0%, catalog.search 0%, file.profile 0%)",
+          "agent": "Metadata",
+          "selected": [
+            "lineage.query"
+          ],
+          "by": "jev",
+          "step_index": 2
+        },
+        {
+          "type": "tool",
+          "label": "Metadata used lineage.query: completed",
+          "tool": "lineage.query",
+          "parameters": {
+            "relation": "staging.transactions"
+          },
+          "parameter_source": "heuristic",
+          "step_index": 2
+        },
+        {
+          "type": "tool_choice",
+          "label": "SQL Analyst: jev:typesafe/jev-1.13-20260917 chose sql.generate (sql.generate 98%, catalog.search 2%)",
+          "agent": "SQL Analyst",
+          "selected": [
+            "sql.generate"
+          ],
+          "by": "jev",
+          "step_index": 3
+        },
+        {
+          "type": "tool",
+          "label": "SQL Analyst used sql.generate: completed",
+          "tool": "sql.generate",
+          "parameters": {
+            "query": "Inspect sample rows to verify amount, txn_type, and posted_at align with semantic metric definitions.\nProfile staging.transactions, then explain its lineage and the metrics it supports",
+            "dialect": "postgres"
+          },
+          "parameter_source": "heuristic",
+          "step_index": 3
+        },
+        {
+          "type": "tool_choice",
+          "label": "Analytics: jev:typesafe/jev-1.13-20260917 chose dataset.profile (dataset.profile 85%, lineage.query 13%, catalog.search 2%, sql.generate 0%)",
+          "agent": "Analytics",
+          "selected": [
+            "dataset.profile"
+          ],
+          "by": "jev",
+          "step_index": 4
+        },
+        {
+          "type": "tool",
+          "label": "Analytics used dataset.profile: 10",
+          "tool": "dataset.profile",
+          "parameters": {
+            "asset_id": "89ac6931-1903-4da5-988c-53fd98cf0e04"
+          },
+          "parameter_source": "heuristic",
+          "step_index": 4
+        },
+        {
+          "type": "tool",
+          "label": "Planner used catalog.search: 10",
+          "tool": "catalog.search",
+          "parameters": {
+            "query": "Summarize profiling, lineage, and metric support findings into a consolidated read-only report.\nProfile staging.transactions, then explain its lineage and the metrics it supports",
+            "limit": 10
+          },
+          "parameter_source": "heuristic",
+          "step_index": 5
+        }
+      ],
+      "logs": [
+        {
+          "at": "2026-09-24T04:10:12.846040+00:00",
+          "level": "info",
+          "message": "Temporal workflow datapilot-agent-87ac5262-4836-47df-92ba-b6a9c0f1f5b1 started"
+        },
+        {
+          "at": "2026-09-24T04:10:12.876727+00:00",
+          "level": "info",
+          "message": "Agent worker accepted the run"
+        },
+        {
+          "at": "2026-09-24T04:10:13.206300+00:00",
+          "level": "info",
+          "message": "Retrieved 5 catalog matches and 2 semantic metrics"
+        },
+        {
+          "at": "2026-09-24T04:10:17.928089+00:00",
+          "level": "info",
+          "message": "Plan generated by OpenRouter Claude Sonnet 5 / anthropic/claude-sonnet-5"
+        },
+        {
+          "at": "2026-09-24T04:10:18.285710+00:00",
+          "level": "info",
+          "message": "Metadata completed dataset.profile in 1 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:18.610074+00:00",
+          "level": "info",
+          "message": "Quality completed catalog.search in 299 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:18.983091+00:00",
+          "level": "info",
+          "message": "Metadata completed lineage.query in 2 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:19.740014+00:00",
+          "level": "info",
+          "message": "SQL Analyst completed sql.generate in 298 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:20.109343+00:00",
+          "level": "info",
+          "message": "Analytics completed dataset.profile in 1 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:20.525810+00:00",
+          "level": "info",
+          "message": "Planner completed catalog.search in 390 ms (1 attempt(s))"
+        },
+        {
+          "at": "2026-09-24T04:10:21.335714+00:00",
+          "level": "info",
+          "message": "Specialist plan completed"
+        }
+      ],
+      "outputs": [
+        {
+          "type": "grounding",
+          "agent": "Metadata",
+          "title": "Retrieved grounding context",
+          "summary": "5 catalog matches, 2 semantic metrics, 0 approved joins",
+          "data": {
+            "catalog_matches": [
+              {
+                "asset_id": "89ac6931-1903-4da5-988c-53fd98cf0e04",
+                "relation": "staging.transactions",
+                "asset_type": "staged_file",
+                "row_count": 10,
+                "columns": [
+                  "transaction_id",
+                  "account_id",
+                  "amount",
+                  "txn_type",
+                  "posted_at",
+                  "channel"
+                ],
+                "tags": [
+                  "local-file",
+                  "mapped",
+                  "staged",
+                  "versioned"
+                ],
+                "description": "Mapped versioned ingestion from transactions.csv",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "e5110aa3-6c5c-4048-a613-fd87328995c9",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "29b37f94-17a4-40f5-893b-0f7718a5cdd4",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "8a231b0b-4f61-4292-bf53-536bfc55543e",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "ef818c41-2955-46e9-a0c1-ce02aa1e40e3",
+                "relation": "file_profiles.transactions",
+                "asset_type": "staged_file",
+                "row_count": 10,
+                "columns": [
+                  "transaction_id",
+                  "account_id",
+                  "amount",
+                  "transaction_type",
+                  "posted_at",
+                  "channel"
+                ],
+                "tags": [
+                  "local-file",
+                  "profiled"
+                ],
+                "description": "Ingested from transactions.csv",
+                "score": 2.0,
+                "match_type": "vector"
+              }
+            ],
+            "vector_hits": [
+              {
+                "asset_id": "89ac6931-1903-4da5-988c-53fd98cf0e04",
+                "relation": "staging.transactions",
+                "asset_type": "staged_file",
+                "row_count": 10,
+                "columns": [
+                  "transaction_id",
+                  "account_id",
+                  "amount",
+                  "txn_type",
+                  "posted_at",
+                  "channel"
+                ],
+                "tags": [
+                  "local-file",
+                  "mapped",
+                  "staged",
+                  "versioned"
+                ],
+                "description": "Mapped versioned ingestion from transactions.csv",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "e5110aa3-6c5c-4048-a613-fd87328995c9",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "29b37f94-17a4-40f5-893b-0f7718a5cdd4",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "8a231b0b-4f61-4292-bf53-536bfc55543e",
+                "relation": "mcp.postgres.payments.summary",
+                "asset_type": "table",
+                "row_count": null,
+                "columns": [],
+                "tags": [
+                  "mcp-tool",
+                  "input-schema-only"
+                ],
+                "description": "Return a payment summary grouped by status and method from the PostgreSQL demo database.",
+                "score": 2.0,
+                "match_type": "vector"
+              },
+              {
+                "asset_id": "ef818c41-2955-46e9-a0c1-ce02aa1e40e3",
+                "relation": "file_profiles.transactions",
+                "asset_type": "staged_file",
+                "row_count": 10,
+                "columns": [
+                  "transaction_id",
+                  "account_id",
+                  "amount",
+                  "transaction_type",
+                  "posted_at",
+                  "channel"
+                ],
+                "tags": [
+                  "local-file",
+                  "profiled"
+                ],
+                "description": "Ingested from transactions.csv",
+                "score": 2.0,
+                "match_type": "vector"
+              }
+            ],
+            "semantic_matches": [
+              {
+                "name": "New deposit accounts",
+                "description": "New checking and savings accounts opened during a period.",
+                "formula": "COUNT(DISTINCT account_id)",
+                "grain": "opening month",
+                "dimensions": [
+                  "account_type",
+                  "status"
+                ],
+                "synonyms": [
+                  "deposit growth"
+                ],
+                "score": 2.0
+              },
+              {
+                "name": "Net transaction amount",
+                "description": "Signed transaction value for the selected period.",
+                "formula": "SUM(amount)",
+                "grain": "account, posting day",
+                "dimensions": [
+                  "transaction_type",
+                  "channel"
+                ],
+                "synonyms": [
+                  "net flow"
+                ],
+                "score": 1.0
+              }
+            ],
+            "join_matches": [],
+            "glossary_matches": []
+          },
+          "at": "2026-09-24T04:10:13.206287+00:00"
+        },
+        {
+          "type": "plan",
+          "agent": "Planner",
+          "title": "Generated specialist plan",
+          "summary": "6 steps generated by OpenRouter Claude Sonnet 5",
+          "data": [
+            {
+              "agent": "Metadata",
+              "action": "Retrieve schema, column definitions, and metadata profile for staging.transactions."
+            },
+            {
+              "agent": "Quality",
+              "action": "Profile staging.transactions for null rates, distinct counts, and value distributions per column."
+            },
+            {
+              "agent": "Metadata",
+              "action": "Trace upstream and downstream lineage for staging.transactions across pipeline and warehouse layers."
+            },
+            {
+              "agent": "SQL Analyst",
+              "action": "Inspect sample rows to verify amount, txn_type, and posted_at align with semantic metric definitions."
+            },
+            {
+              "agent": "Analytics",
+              "action": "Explain how staging.transactions supports 'New deposit accounts' and 'Net transaction amount' metrics."
+            },
+            {
+              "agent": "Planner",
+              "action": "Summarize profiling, lineage, and metric support findings into a consolidated read-only report."
+            }
+          ],
+          "at": "2026-09-24T04:10:17.928103+00:00"
+        },
+        {
+          "type": "tool_choice",
+          "agent": "Metadata",
+          "title": "Metadata chose dataset.profile",
+          "summary": "jev:typesafe/jev-1.13-20260917 over 4 eligible tools: dataset.profile 100%, catalog.search 0%, lineage.query 0%, file.profile 0%",
+          "data": {
+            "by": "jev",
+            "model": "typesafe/jev-1.13-20260917",
+            "probabilities": {
+              "dataset.profile": 1.0,
+              "catalog.search": 0.0,
+              "lineage.query": 0.0,
+              "file.profile": 0.0
+            },
+            "selected": [
+              "dataset.profile"
+            ],
+            "step": "Retrieve schema, column definitions, and metadata profile for staging.transactions.",
+            "latency_ms": 321,
+            "cost_usd": 1.7892e-05
+          },
+          "at": "2026-09-24T04:10:18.281808+00:00",
+          "step_index": 0
+        },
+        {
+          "type": "tool_result",
+          "agent": "Metadata",
+          "tool": "dataset.profile",
+          "title": "Metadata -> dataset.profile",
+          "summary": "dataset.profile completed in 1 ms",
+          "data": {
+            "columns": [
+              {
+                "name": "transaction_id",
+                "type": "integer",
+                "nullable": "False"
+              },
+              {
+                "name": "account_id",
+                "type": "integer",
+                "nullable": "False"
+              },
+              {
+                "name": "amount",
+                "type": "number",
+                "nullable": "False"
+              },
+              {
+                "name": "txn_type",
+                "type": "string",
+                "nullable": "False"
+              },
+              {
+                "name": "posted_at",
+                "type": "string",
+                "nullable": "False"
+              },
+              {
+                "truncated_items": 1
+              }
+            ],
+            "row_count": 10
+          },
+          "at": "2026-09-24T04:10:18.285726+00:00",
+          "step_index": 0
+        },
+        {
+          "type": "tool_result",
+          "agent": "Quality",
+          "tool": "catalog.search",
+          "title": "Quality -> catalog.search",
+          "summary": "catalog.search completed in 299 ms",
+          "data": {
+            "count": 10
+          },
+          "at": "2026-09-24T04:10:18.610086+00:00",
+          "step_index": 1
+        },
+        {
+          "type": "tool_choice",
+          "agent": "Metadata",
+          "title": "Metadata chose lineage.query",
+          "summary": "jev:typesafe/jev-1.13-20260917 over 4 eligible tools: lineage.query 100%, dataset.profile 0%, catalog.search 0%, file.profile 0%",
+          "data": {
+            "by": "jev",
+            "model": "typesafe/jev-1.13-20260917",
+            "probabilities": {
+              "lineage.query": 1.0,
+              "dataset.profile": 0.0,
+              "catalog.search": 0.0,
+              "file.profile": 0.0
+            },
+            "selected": [
+              "lineage.query"
+            ],
+            "step": "Trace upstream and downstream lineage for staging.transactions across pipeline and warehouse layers.",
+            "latency_ms": 323,
+            "cost_usd": 1.7934e-05
+          },
+          "at": "2026-09-24T04:10:18.975889+00:00",
+          "step_index": 2
+        },
+        {
+          "type": "tool_result",
+          "agent": "Metadata",
+          "tool": "lineage.query",
+          "title": "Metadata -> lineage.query",
+          "summary": "lineage.query completed in 2 ms",
+          "data": {
+            "relation": "staging.transactions",
+            "edges": []
+          },
+          "at": "2026-09-24T04:10:18.983103+00:00",
+          "step_index": 2
+        },
+        {
+          "type": "tool_choice",
+          "agent": "SQL Analyst",
+          "title": "SQL Analyst chose sql.generate",
+          "summary": "jev:typesafe/jev-1.13-20260917 over 2 eligible tools: sql.generate 98%, catalog.search 2%",
+          "data": {
+            "by": "jev",
+            "model": "typesafe/jev-1.13-20260917",
+            "probabilities": {
+              "sql.generate": 0.98,
+              "catalog.search": 0.02
+            },
+            "selected": [
+              "sql.generate"
+            ],
+            "step": "Inspect sample rows to verify amount, txn_type, and posted_at align with semantic metric definitions.",
+            "latency_ms": 428,
+            "cost_usd": 1.6296e-05
+          },
+          "at": "2026-09-24T04:10:19.437722+00:00",
+          "step_index": 3
+        },
+        {
+          "type": "tool_result",
+          "agent": "SQL Analyst",
+          "tool": "sql.generate",
+          "title": "SQL Analyst -> sql.generate",
+          "summary": "sql.generate completed in 298 ms",
+          "data": {
+            "question": "Inspect sample rows to verify amount, txn_type, and posted_at align with semantic metric definitions.\nProfile staging.transactions, then explain its lineage and the metrics it supports",
+            "dialect": "postgres",
+            "sql": "SELECT\n  DATE_TRUNC('month', a.opened_at) AS month_opened,\n  COUNT(DISTINCT a.account_id) AS new_deposit_accounts,\n  SUM(CASE WHEN a.status = 'active' THEN 1 ELSE 0 END) AS active_accounts\nFROM core.accounts AS a\nWHERE a.account_type IN ('checking', 'savings')\n  AND a.opened_at >= CURRENT_TIMESTAMP - INTERVAL '12 months'\nGROUP BY DATE_TRUNC('month', a.opened_at)\nLIMIT 500;",
+            "catalog_matches": 5,
+            "grounded_asset_ids": [
+              "6d4fc317-f54b-4423-bdce-3d6690924c79",
+              "ef818c41-2955-46e9-a0c1-ce02aa1e40e3",
+              "29b37f94-17a4-40f5-893b-0f7718a5cdd4",
+              "8a231b0b-4f61-4292-bf53-536bfc55543e",
+              "89ac6931-1903-4da5-988c-53fd98cf0e04"
+            ]
+          },
+          "at": "2026-09-24T04:10:19.740026+00:00",
+          "step_index": 3
+        },
+        {
+          "type": "tool_choice",
+          "agent": "Analytics",
+          "title": "Analytics chose dataset.profile",
+          "summary": "jev:typesafe/jev-1.13-20260917 over 4 eligible tools: dataset.profile 85%, lineage.query 13%, catalog.search 2%, sql.generate 0%",
+          "data": {
+            "by": "jev",
+            "model": "typesafe/jev-1.13-20260917",
+            "probabilities": {
+              "dataset.profile": 0.85,
+              "lineage.query": 0.13,
+              "catalog.search": 0.02,
+              "sql.generate": 0.0
+            },
+            "selected": [
+              "dataset.profile"
+            ],
+            "step": "Explain how staging.transactions supports 'New deposit accounts' and 'Net transaction amount' metrics.",
+            "latency_ms": 334,
+            "cost_usd": 1.8186e-05
+          },
+          "at": "2026-09-24T04:10:20.104140+00:00",
+          "step_index": 4
+        },
+        {
+          "type": "tool_result",
+          "agent": "Analytics",
+          "tool": "dataset.profile",
+          "title": "Analytics -> dataset.profile",
+          "summary": "dataset.profile completed in 1 ms",
+          "data": {
+            "columns": [
+              {
+                "name": "transaction_id",
+                "type": "integer",
+                "nullable": "False"
+              },
+              {
+                "name": "account_id",
+                "type": "integer",
+                "nullable": "False"
+              },
+              {
+                "name": "amount",
+                "type": "number",
+                "nullable": "False"
+              },
+              {
+                "name": "txn_type",
+                "type": "string",
+                "nullable": "False"
+              },
+              {
+                "name": "posted_at",
+                "type": "string",
+                "nullable": "False"
+              },
+              {
+                "truncated_items": 1
+              }
+            ],
+            "row_count": 10
+          },
+          "at": "2026-09-24T04:10:20.109360+00:00",
+          "step_index": 4
+        },
+        {
+          "type": "tool_result",
+          "agent": "Planner",
+          "tool": "catalog.search",
+          "title": "Planner -> catalog.search",
+          "summary": "catalog.search completed in 390 ms",
+          "data": {
+            "count": 10
+          },
+          "at": "2026-09-24T04:10:20.525819+00:00",
+          "step_index": 5
+        }
+      ],
+      "created_at": "2026-09-24T04:10:12.825075Z",
+      "updated_at": "2026-09-24T04:10:21.335938Z"
+    }
+  },
+  "usage": {
+    "project_id": "fb672dc4-9c75-43fb-a410-da6d948e14c1",
+    "currency": "USD",
+    "by_purpose": [
+      {
+        "purpose": "tool_selection",
+        "model": "typesafe/jev-1.13-20260917",
+        "calls": 23,
+        "failed": 0,
+        "estimated_cost_usd": 0.0003953,
+        "average_latency_ms": 369.3
+      },
+      {
+        "purpose": "decision_routing",
+        "model": "typesafe/jev-1.13-20260917",
+        "calls": 22,
+        "failed": 0,
+        "estimated_cost_usd": 0.00052025,
+        "average_latency_ms": 320.9
+      },
+      {
+        "purpose": "agent_tool_parameter_fill",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "calls": 21,
+        "failed": 21,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1957.4
+      },
+      {
+        "purpose": "sql_generation",
+        "model": "gemini-3.6-flash",
+        "calls": 16,
+        "failed": 3,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 2295.2
+      },
+      {
+        "purpose": "agent_planning",
+        "model": "anthropic/claude-sonnet-5",
+        "calls": 10,
+        "failed": 4,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 6788.5
+      },
+      {
+        "purpose": "risk_check",
+        "model": "typesafe/jev-1.13-20260917",
+        "calls": 9,
+        "failed": 0,
+        "estimated_cost_usd": 0.00011869,
+        "average_latency_ms": 325.2
+      },
+      {
+        "purpose": "agent_planning",
+        "model": "gemini-3.6-flash",
+        "calls": 5,
+        "failed": 3,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 3681.5
+      },
+      {
+        "purpose": "agent_tool_parameter_fill",
+        "model": "gemini-3.6-flash",
+        "calls": 4,
+        "failed": 4,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 2110.2
+      },
+      {
+        "purpose": "sql_generation",
+        "model": "gemini-3.5-flash",
+        "calls": 4,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1925.5
+      },
+      {
+        "purpose": "job_diagnosis",
+        "model": "gemini-3.6-flash",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 4113.0
+      },
+      {
+        "purpose": "provider_test",
+        "model": "anthropic/claude-sonnet-5",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1900.0
+      },
+      {
+        "purpose": "provider_test",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 978.0
+      },
+      {
+        "purpose": "provider_test",
+        "model": "typesafe/jev-1.13",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 383.0
+      },
+      {
+        "purpose": "provider_test",
+        "model": "gemini-3.6-flash",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1445.0
+      },
+      {
+        "purpose": "provider_test",
+        "model": "gemini-3.5-flash",
+        "calls": 1,
+        "failed": 0,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1249.0
+      }
+    ],
+    "pricing_configured": false,
+    "items": [
+      {
+        "provider_id": "d2a78b67-82c1-4a60-8be9-182ba686d095",
+        "provider_name": "OpenRouter Claude Sonnet 5",
+        "model": "anthropic/claude-sonnet-5",
+        "calls": 11,
+        "input_tokens": 8,
+        "output_tokens": 8,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 6090.1
+      },
+      {
+        "provider_id": "acc43b8c-506e-46b0-a2c1-c59837a0594b",
+        "provider_name": "Gemini 3.6 Flash",
+        "model": "gemini-3.6-flash",
+        "calls": 27,
+        "input_tokens": 4337,
+        "output_tokens": 612,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 2438.1
+      },
+      {
+        "provider_id": "1e057763-5129-4eb5-b66a-e44786fca760",
+        "provider_name": "Gemini 3.5 Flash",
+        "model": "gemini-3.5-flash",
+        "calls": 5,
+        "input_tokens": 893,
+        "output_tokens": 424,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1790.2
+      },
+      {
+        "provider_id": "48a13507-891f-4097-9603-3e7c39b81bbb",
+        "provider_name": "OpenRouter DeepSeek V4.1 Flash",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "calls": 22,
+        "input_tokens": 8,
+        "output_tokens": 8,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 1912.9
+      },
+      {
+        "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "provider_name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13-20260917",
+        "calls": 54,
+        "input_tokens": 24625,
+        "output_tokens": 2820,
+        "estimated_cost_usd": 0.00103425,
+        "average_latency_ms": 342.3
+      },
+      {
+        "provider_id": "1d445a84-b94f-493d-bfba-d1220114398b",
+        "provider_name": "Jev 1.13 (TypeSafe decision model)",
+        "model": "typesafe/jev-1.13",
+        "calls": 1,
+        "input_tokens": 8,
+        "output_tokens": 8,
+        "estimated_cost_usd": 0.0,
+        "average_latency_ms": 383.0
+      }
+    ],
+    "totals": {
+      "calls": 120,
+      "input_tokens": 29879,
+      "output_tokens": 3880,
+      "estimated_cost_usd": 0.00103425
+    }
+  }
+}

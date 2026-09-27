@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -91,6 +91,8 @@ class Project(Base):
     default_model_provider_id: Mapped[str | None] = mapped_column(
         ForeignKey("model_providers.id"), nullable=True
     )
+    # Per-project switches, e.g. {"auto_approval": {"enabled": true}}; absent keys mean defaults.
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -723,6 +725,9 @@ class ExternalClient(Base):
     default_project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Token lifecycle (Alembic 0006): NULL expires_at means the token never expires.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QueryTool(Base):
@@ -765,6 +770,8 @@ class QueryToolGrant(Base):
     query_tool_id: Mapped[str] = mapped_column(ForeignKey("query_tools.id"), index=True)
     external_client_id: Mapped[str] = mapped_column(ForeignKey("external_clients.id"), index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Max invocations of this tool by this client per UTC day; NULL = unlimited (Alembic 0006).
+    daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -777,8 +784,12 @@ class ExternalInvocation(Base):
     external_client_id: Mapped[str] = mapped_column(ForeignKey("external_clients.id"), index=True)
     query_tool_id: Mapped[str] = mapped_column(ForeignKey("query_tools.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="running")
+    # "rest" (/external/v1/.../invoke) or "mcp" (tools/call); Alembic 0007.
+    channel: Mapped[str] = mapped_column(String(16), default="rest", server_default="rest")
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Denormalised from result_metadata so history summaries can SUM it in SQL (Alembic 0007).
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -879,3 +890,88 @@ class SchemaDriftEvent(Base):
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     acknowledged_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ModelRoute(Base):
+    """Per-purpose model choice. project_id NULL = platform-wide default for that purpose."""
+
+    __tablename__ = "model_routes"
+    __table_args__ = (UniqueConstraint("project_id", "purpose", name="uq_model_route_purpose"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(64))
+    provider_id: Mapped[str] = mapped_column(ForeignKey("model_providers.id"))
+    updated_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class RouteDecision(Base):
+    """One routing decision for a chat turn, kept for audit and offline policy evaluation."""
+
+    __tablename__ = "route_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    question: Mapped[str] = mapped_column(Text)
+    route: Mapped[str] = mapped_column(String(32))
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    backend: Mapped[str] = mapped_column(String(80))
+    policy_version: Mapped[str] = mapped_column(String(80))
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    risk: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VerifiedQuery(Base):
+    """Question→SQL pairs confirmed correct (helpful feedback, evaluations, manual review).
+
+    Used as retrieved few-shot examples and, on an exact normalized-question
+    match, reused directly. Only active rows influence generation.
+    """
+
+    __tablename__ = "verified_queries"
+    __table_args__ = (Index("ix_verified_queries_project_norm", "project_id", "normalized_question"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    connector_id: Mapped[str | None] = mapped_column(ForeignKey("connectors.id"), nullable=True)
+    question: Mapped[str] = mapped_column(Text)
+    normalized_question: Mapped[str] = mapped_column(String(500))
+    sql: Mapped[str] = mapped_column(Text)
+    dialect: Mapped[str] = mapped_column(String(32), default="postgres")
+    source: Mapped[str] = mapped_column(String(32), default="feedback")
+    source_ref: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="active")
+    result_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    uses: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PromptOptimizationRun(Base):
+    """One GEPA-style optimisation of a runtime prompt (reflective mutation + Pareto selection)."""
+
+    __tablename__ = "prompt_optimization_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(64), default="sql_generation")
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    cases: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    log: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    baseline_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    iterations_done: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

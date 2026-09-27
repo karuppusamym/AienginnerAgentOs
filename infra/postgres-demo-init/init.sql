@@ -88,3 +88,40 @@ SELECT * FROM (VALUES
     (10,'2026-04-15'::date, 'debit_card',    210.30,  'pending',  'TXN-PG010')
 ) AS v(order_id, payment_date, method, amount, status, reference)
 WHERE NOT EXISTS (SELECT 1 FROM demo.payments LIMIT 1);
+
+-- ─────────────────────────────────────────
+-- VIEWS (a metadata scan records their definitions as base-table lineage)
+-- ─────────────────────────────────────────
+CREATE OR REPLACE VIEW demo.customer_order_summary AS
+SELECT c.customer_id,
+       c.first_name,
+       c.last_name,
+       c.segment,
+       COUNT(o.order_id)                AS order_count,
+       COALESCE(SUM(o.total_amount), 0) AS lifetime_value,
+       MAX(o.order_date)                AS last_order_date
+FROM demo.customers c
+LEFT JOIN demo.orders o ON o.customer_id = c.customer_id
+GROUP BY c.customer_id, c.first_name, c.last_name, c.segment;
+
+CREATE OR REPLACE VIEW demo.order_payment_status AS
+SELECT o.order_id,
+       o.customer_id,
+       o.order_date,
+       o.status       AS order_status,
+       o.total_amount,
+       p.payment_id,
+       p.method       AS payment_method,
+       p.amount       AS paid_amount,
+       p.status       AS payment_status
+FROM demo.orders o
+LEFT JOIN demo.payments p ON p.order_id = o.order_id;
+
+-- A view over a view, so the explorer shows two upstream hops.
+CREATE OR REPLACE VIEW demo.segment_revenue AS
+SELECT s.segment,
+       COUNT(*)              AS customer_count,
+       SUM(s.order_count)    AS order_count,
+       SUM(s.lifetime_value) AS revenue
+FROM demo.customer_order_summary s
+GROUP BY s.segment;
